@@ -49,7 +49,11 @@ private:
     bool isReKernelConnected = false;
     int binderEventCnt = 0;
 
-    int refreezeSecRemain = 60; //开机 一分钟时 就压一次
+    static constexpr int STARTUP_REFREEZE_AUDIT_SECONDS = 60;
+    static constexpr int STARTUP_REFREEZE_AUDIT_WINDOW_SECONDS = 15 * 60;
+    static constexpr int DISABLED_REFREEZE_AUDIT_SECONDS = 86400 * 365;
+
+    int refreezeSecRemain = STARTUP_REFREEZE_AUDIT_SECONDS; //开机 一分钟时 就压一次
     int remainTimesToRefreshTopApp = 2; //允许多线程冲突，不需要原子操作
 
     static const size_t GET_VISIBLE_BUF_SIZE = 256 * 1024;
@@ -553,12 +557,22 @@ public:
     }
 
 
-    // 临时解冻：检查已冻结应用的进程状态wchan，若有未冻结进程则临时解冻
+    // 异常解冻复查：检查已冻结应用的进程状态wchan，若有未冻结进程则重新加入待冻结队列
+    int nextRefreezeAuditSeconds() {
+        if (systemTools.runningTime < STARTUP_REFREEZE_AUDIT_WINDOW_SECONDS)
+            return STARTUP_REFREEZE_AUDIT_SECONDS;
+
+        return settings.isRefreezeEnable() ?
+            settings.getRefreezeTimeout() : DISABLED_REFREEZE_AUDIT_SECONDS;
+    }
+
     void checkUnFreeze() {
         START_TIME_COUNT;
 
-        if (--refreezeSecRemain > 0) return;
-        refreezeSecRemain = 3600;// 固定每小时检查一次
+        const bool forcedAudit = refreezeSecRemain <= 0;
+        if (!forcedAudit && !settings.isRefreezeEnable()) return;
+        if (!forcedAudit && --refreezeSecRemain > 0) return;
+        refreezeSecRemain = nextRefreezeAuditSeconds();
 
         lock_guard<mutex> lock(naughtyMutex);
 
@@ -615,12 +629,14 @@ public:
         }
 
         if (naughtyApp.size()) {
-            stackString<1024> tmp("临时解冻");
+            stackString<1024> tmp(doze.isScreenOffStandby ? "息屏压制" : "定时压制");
             for (const auto uid : naughtyApp) {
+                managedApp[uid].delayCnt = 0;
+                pendingHandleList[uid] = 1;
                 tmp.append(' ').append(managedApp[uid].label.c_str());
             }
             freezeit.log(string_view(tmp.c_str(), tmp.length));
-            unFreezerTemporary(naughtyApp);
+            updatePendingByLocalSocket();
             naughtyApp.clear();
         }
 
@@ -1582,10 +1598,10 @@ public:
                 //setWakeupLockByLocalSocket(WAKEUP_LOCK::IGNORE); //TODO xposed端改为一律禁止
             }
 
+            checkUnFreeze();// 检查进程状态，按需重新压制
             if (doze.isScreenOffStandby)continue;// 息屏状态 不用执行 以下功能
 
             systemTools.checkBattery();// 1分钟一次 电池检测
-            checkUnFreeze();// 检查进程状态，按需临时解冻
             checkWakeup();// 检查是否有定时解冻
         }
     }

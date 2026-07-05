@@ -12,7 +12,7 @@ Rust daemon and manager APK artifacts. Validate any candidate zip with
 ## Current Modern Rewrite Artifacts
 
 - Release candidate zip:
-  `freezeitRelease/freezeit_oneplus13_android16_selfuse_v3.2.1SelfUse_302001.zip`
+  `freezeitRelease/freezeit_oneplus13_android16_selfuse_v3.2.4SelfUse_302004.zip`
 - Source archive:
   `freezeitRelease/freezeit_3.2.0SelfUse_source.tar.gz`
 - Build evidence:
@@ -24,7 +24,7 @@ tasks are complete.
 
 ## Self-Use Threat Boundary
 
-`3.2.1SelfUse` is a background runtime-control build for the verified CPH2653
+`3.2.4SelfUse` is a background runtime-control build for the verified CPH2653
 Android 16 baseline. It can reduce selected third-party app background execution
 after hook/root/freezer readiness, foreground eligibility, configured delay, and
 idle checks pass.

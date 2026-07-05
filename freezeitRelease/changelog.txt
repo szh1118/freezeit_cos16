@@ -1,6 +1,8 @@
-### v3.2.1SelfUse validation notes 2026-07-05
-1. Self-use package target: OnePlus 13 Android 16 with existing Magisk module version 3.2.0SelfUse.
+### v3.2.4SelfUse validation notes 2026-07-05
+1. Self-use package target: OnePlus 13 Android 16 with existing Magisk module version 3.2.3SelfUse.
 2. Includes the updated manager APK, ARM64 native service, Magisk scripts, config seeds, and rom_baseline.prop.
-3. Manager log view auto-follows newest output; freeze-status view shows foreground/background, frozen state, and freeze time.
-4. Native freeze-status aggregation handles multi-process packages without losing frozen-process state.
-5. No compatibility promise is made for other ROMs, devices, Android versions, or public release channels.
+3. Legacy abnormal-thaw recovery now audits every 60 seconds during the first 15 minutes after daemon startup.
+4. After the startup window, abnormal-thaw audits follow the configured Regular Refreeze interval instead of a hard-coded 1 hour.
+5. Abnormal-thaw recovery runs while the device is in screen-off standby/doze.
+6. Abnormal-thaw recovery directly requeues runnable background apps for freezing without waiting for foreground refresh.
+7. No compatibility promise is made for other ROMs, devices, Android versions, or public release channels.

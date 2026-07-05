@@ -11,12 +11,28 @@ Remote: https://github.com/szh1118/freezeit_cos16
 
 ## Current Self-Use Release
 
-- Module version: `3.2.1SelfUse` / versionCode `302001`
+- Module version: `3.2.4SelfUse` / versionCode `302004`
 - Release zip:
-  `freezeitRelease/freezeit_oneplus13_android16_selfuse_v3.2.1SelfUse_302001.zip`
+  `freezeitRelease/freezeit_oneplus13_android16_selfuse_v3.2.4SelfUse_302004.zip`
 - Target device: OnePlus 13 / CPH2653 / CPH2653EEA
 - Target system: ColorOS 16 / Android 16
 - Root/Xposed: Magisk or KernelSU with LSPosed IT v2.1.0-it / Modern Xposed API 102
+
+## 3.2.4SelfUse Changes
+
+- Abnormal-thaw audits now directly requeue runnable background apps for freezing instead of marking them as temporary foreground apps.
+- This covers daemon startup and screen-off standby cases where no foreground-app refresh happens after the audit.
+
+## 3.2.3SelfUse Changes
+
+- Abnormal-thaw audits now continue while the device is in screen-off standby/doze, so boot-started background apps are requeued without opening the log page.
+- Keeps the 3.2.2 startup audit schedule: every 60 seconds during the first 15 minutes, then the configured Regular Refreeze interval.
+
+## 3.2.2SelfUse Changes
+
+- Legacy freezer now rechecks abnormal thawed background processes every 60 seconds during the first 15 minutes after daemon startup.
+- After the startup window, the same audit follows the configured Regular Refreeze interval instead of a hard-coded 1 hour.
+- Manual log-page freeze-status checks still force the next audit immediately.
 
 ## 3.2.1SelfUse Changes
 
@@ -36,7 +52,7 @@ Remote: https://github.com/szh1118/freezeit_cos16
 
 ## Install
 
-1. Flash `freezeitRelease/freezeit_oneplus13_android16_selfuse_v3.2.1SelfUse_302001.zip` in Magisk.
+1. Flash `freezeitRelease/freezeit_oneplus13_android16_selfuse_v3.2.4SelfUse_302004.zip` in Magisk.
 2. Enable the Freezeit module in LSPosed.
 3. Select at least these LSPosed scopes:
    - System framework / `system`

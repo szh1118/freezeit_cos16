@@ -1,3 +1,22 @@
+### v3.2.4SelfUse validation notes 2026-07-05
+1. Fixed abnormal-thaw recovery leaving audited apps in temporary foreground state when no foreground refresh follows.
+2. Runnable background apps found by the audit are directly requeued into the pending freeze list.
+3. Covers daemon startup and screen-off standby/doze recovery paths.
+4. No compatibility promise is made for other ROMs, devices, Android versions, or public release channels.
+
+### v3.2.3SelfUse validation notes 2026-07-05
+1. Fixed abnormal-thaw recovery being skipped during screen-off standby/doze.
+2. Boot-started background processes that become runnable are requeued without requiring a manual freeze-status/log-page check.
+3. Keeps the 3.2.2 startup audit schedule, then follows the configured Regular Refreeze interval.
+4. No compatibility promise is made for other ROMs, devices, Android versions, or public release channels.
+
+### v3.2.2SelfUse validation notes 2026-07-05
+1. Fixed legacy abnormal-thaw recovery scheduling after boot.
+2. Frozen background processes that become runnable are audited every 60 seconds during the first 15 minutes after daemon startup.
+3. After the startup window, abnormal-thaw audits follow the configured Regular Refreeze interval instead of a hard-coded 1 hour.
+4. Manual freeze-status checks still force the next recovery audit immediately.
+5. No compatibility promise is made for other ROMs, devices, Android versions, or public release channels.
+
 ### v3.2.1SelfUse validation notes 2026-07-05
 1. Manager log view now follows the newest log output at the bottom by default.
 2. Manager home freeze-status view replaces CPU-time display and shows foreground/background, frozen state, and freeze time.

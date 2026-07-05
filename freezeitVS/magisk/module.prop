@@ -1,7 +1,7 @@
 id=freezeit
 name=冻它
-version=3.2.1SelfUse
-versionCode=302001
+version=3.2.4SelfUse
+versionCode=302004
 author=JARK006
 description=实现部分墓碑机制，自动暂停后台应用运行
 updateJson=https://mirror.ghproxy.com/https://raw.githubusercontent.com/szh1118/freezeit_cos16/main/freezeitRelease/update.json
