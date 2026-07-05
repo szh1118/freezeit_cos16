@@ -145,7 +145,8 @@ public class Settings extends AppCompatActivity implements View.OnClickListener 
         new Thread(() -> {
             var recvLen = Utils.freezeitTask(ManagerCmd.getSettings, null);
             if (recvLen != 256) {
-                Toast.makeText(getBaseContext(), getString(R.string.get_settings_fail), Toast.LENGTH_LONG).show();
+                handler.post(() -> Toast.makeText(getBaseContext(),
+                        getString(R.string.get_settings_fail), Toast.LENGTH_LONG).show());
                 return;
             }
             System.arraycopy(StaticData.response, 0, settingsVar, 0, 256);

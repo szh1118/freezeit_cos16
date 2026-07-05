@@ -43,7 +43,21 @@
     <string name="clear_log_text">清空日志</string>
     <string name="clear_log_tips">已清空日志</string>
     <string name="title_activity_setting">设置</string>
-    <string name="title_activity_task_manager">CPU使用时长</string>
+    <string name="title_activity_task_manager">冻结状态</string>
+    <string name="freeze_status_foreground">前台</string>
+    <string name="freeze_status_background">后台</string>
+    <string name="freeze_state_foreground">运行中</string>
+    <string name="freeze_state_pending">待冻结</string>
+    <string name="freeze_state_frozen">已冻结</string>
+    <string name="freeze_state_terminated">已停止</string>
+    <string name="freeze_state_running">后台运行</string>
+    <string name="freeze_state_unknown">未知</string>
+    <string name="freeze_process_count">%1$d进程</string>
+    <string name="freeze_time_pending">%1$s后冻结</string>
+    <string name="freeze_time_running">运行 %1$s</string>
+    <string name="freeze_time_frozen">冻结 %1$s</string>
+    <string name="freeze_time_stopped">停止 %1$s</string>
+    <string name="freeze_time_none">无时间</string>
 
     <string name="slowly_tips">别急，慢点</string>
     <string name="help">帮助</string>
@@ -137,9 +151,10 @@
     <string name="help_logcat_check">查看冻结状态、内存占用</string>
     <string name="help_logcat_clear">清空日志</string>
     <string name="app_time_help_text">
-        统计应用的全部核心总使用时间，基本上反应该应用的耗电水平。若一个应用1秒内占用了3个核心的全部计算资源，将累计3秒。
-        \n\n应用正在运行时，并非一直在使用CPU资源运算，而是在其需要处理数据的时候才会使用，而大多数时间会在“休眠”状态。
-        \n\n注:以上数据统计属于系统默认行为，冻它只是读取进行可视化。
+        显示冻它当前管理的应用状态。
+        \n前台应用正在使用中，不会被冻结。
+        \n待冻结应用已经切到后台，正在等待超时冻结。
+        \n已冻结或已停止应用显示保持该状态的时间。
     </string>
     <string name="save">保存</string>
     <string name="convert_freezer_sigstop">反转 Freezer / SIGSTOP</string>

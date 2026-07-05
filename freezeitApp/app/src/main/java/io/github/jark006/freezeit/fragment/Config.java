@@ -161,8 +161,10 @@ public class Config extends Fragment {
     void getAppCfgTask() {
         var recvLen = Utils.freezeitTask(ManagerCmd.getAppCfg, null);
         if (recvLen == 0 || recvLen % 12 != 0) {
-            if (binding != null)
-                binding.swipeRefreshLayout.setRefreshing(false);
+            handler.post(() -> {
+                if (binding != null)
+                    binding.swipeRefreshLayout.setRefreshing(false);
+            });
             return;
         }
 
@@ -462,8 +464,9 @@ public class Config extends Fragment {
         void updateAndRefreshView() {
             uidListFilter.clear();
             for (int uid : uidList) {
-                if (AppInfoCache.get(uid).isSystemApp == showSystemApp &&
-                        (keyWord.isEmpty() || AppInfoCache.get(uid).contains(keyWord)))
+                var info = AppInfoCache.get(uid);
+                if (info != null && info.isSystemApp == showSystemApp &&
+                        (keyWord.isEmpty() || info.contains(keyWord)))
                     uidListFilter.add(uid);
             }
             notifyDataSetChanged();

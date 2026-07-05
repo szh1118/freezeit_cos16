@@ -163,8 +163,8 @@ public class Logcat extends Fragment {
             switch (msg.what) {
                 case NEW_LOG_CONTENT:
                     binding.logView.setText(new String(StaticData.response, 0, lastLogLen));
-                    binding.forBottom.requestFocus();//请求焦点，直接到日志底部
-                    binding.forBottom.clearFocus();
+                    var logScroll = binding.logScroll;
+                    logScroll.post(() -> logScroll.fullScroll(View.FOCUS_DOWN));
                     break;
 
                 case UPDATE_LABEL_SUCCESS:

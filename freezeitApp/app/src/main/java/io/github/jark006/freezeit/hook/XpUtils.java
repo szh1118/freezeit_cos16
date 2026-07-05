@@ -98,7 +98,7 @@ public class XpUtils {
         hookBackend = backend == null ? new MissingHookBackend() : backend;
     }
 
-    public static void log(final String TAG, final String content) {
+    public static synchronized void log(final String TAG, final String content) {
         if (xpLogContent.length() + TAG.length() + content.length() + 20 > maxLogLength)
             xpLogContent.setLength(0);
 

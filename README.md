@@ -9,6 +9,22 @@ ColorOS 16.
 
 Remote: https://github.com/szh1118/freezeit_cos16
 
+## Current Self-Use Release
+
+- Module version: `3.2.1SelfUse` / versionCode `302001`
+- Release zip:
+  `freezeitRelease/freezeit_oneplus13_android16_selfuse_v3.2.1SelfUse_302001.zip`
+- Target device: OnePlus 13 / CPH2653 / CPH2653EEA
+- Target system: ColorOS 16 / Android 16
+- Root/Xposed: Magisk or KernelSU with LSPosed IT v2.1.0-it / Modern Xposed API 102
+
+## 3.2.1SelfUse Changes
+
+- Manager log view follows the newest log output at the bottom by default.
+- Manager app-state page now shows foreground/background, frozen state, process count, and freeze time instead of CPU time.
+- Legacy native freeze-status aggregation keeps frozen state when an app has multiple matching processes.
+- Release metadata and packaged Magisk module are bumped to `3.2.1SelfUse`.
+
 ## Layout
 
 - `freezeitApp/`: Android manager APK and LSPosed/Xposed hook code.
@@ -17,6 +33,15 @@ Remote: https://github.com/szh1118/freezeit_cos16
 - `freezeitRelease/`: release metadata and selected packaged artifacts.
 - `specs/`: Spec Kit feature specs, tasks, and validation evidence.
 - `scripts/`: repo-level build, packaging, and validation helpers.
+
+## Install
+
+1. Flash `freezeitRelease/freezeit_oneplus13_android16_selfuse_v3.2.1SelfUse_302001.zip` in Magisk.
+2. Enable the Freezeit module in LSPosed.
+3. Select at least these LSPosed scopes:
+   - System framework / `system`
+   - Freezeit manager / `io.github.jark006.freezeit`
+4. Reboot.
 
 ## Build And Validate
 

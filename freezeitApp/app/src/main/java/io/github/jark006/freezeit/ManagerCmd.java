@@ -12,6 +12,7 @@ public class ManagerCmd {
     public final static byte getSettings = 8;     // return bytes[256]: all settings parameter
     public final static byte getUidTime = 9;      // return "uid x x x x\n..."
     public final static byte getXpLog = 10;
+    public final static byte getFreezeStatus = 11;// return int rows: uid foreground state seconds processCount
 
     // 设置 需附加数据
     public final static byte setAppCfg = 21;      // send "uid cfg isPermissive\n..." see CMD:getAppCfg

@@ -851,6 +851,186 @@ public:
         END_TIME_COUNT;
     }
 
+    int writeFreezeStatus(int* out, const int maxIntCnt) {
+        START_TIME_COUNT;
+
+        constexpr int ROW_INT_LEN = 5;
+        constexpr int STATE_RUNNING_BACKGROUND = 0;
+        constexpr int STATE_FOREGROUND = 1;
+        constexpr int STATE_PENDING = 2;
+        constexpr int STATE_FROZEN = 3;
+        constexpr int STATE_TERMINATED = 4;
+        constexpr int STATE_UNKNOWN = 5;
+
+        struct FreezeStatusRow {
+            int uid = 0;
+            int foreground = 0;
+            int state = STATE_UNKNOWN;
+            int seconds = 0;
+            int processCount = 0;
+            bool hasFrozenProcess = false;
+            bool hasRunningProcess = false;
+            bool hasUnknownProcess = false;
+        };
+
+        auto safeSeconds = [](const time_t now, const time_t timestamp) {
+            if (timestamp <= 0 || now <= timestamp) return 0;
+            return static_cast<int>(now - timestamp);
+        };
+
+        auto isFrozenWchan = [this](const char* wchan) {
+            return !strcmp(wchan, v2wchan) || !strcmp(wchan, v1wchan) ||
+                !strcmp(wchan, SIGSTOPwchan) || !strcmp(wchan, v2xwchan) ||
+                !strcmp(wchan, pStopwchan);
+        };
+
+        auto rank = [](const int state) {
+            switch (state) {
+            case STATE_FOREGROUND: return 0;
+            case STATE_PENDING: return 1;
+            case STATE_RUNNING_BACKGROUND: return 2;
+            case STATE_FROZEN: return 3;
+            case STATE_TERMINATED: return 4;
+            default: return 5;
+            }
+        };
+
+        const time_t now = time(nullptr);
+        map<int, FreezeStatusRow> rowMap;
+
+        for (const int uid : curForegroundApp) {
+            if (!managedApp.contains(uid)) continue;
+            const auto& appInfo = managedApp[uid];
+            if (appInfo.isWhitelist()) continue;
+
+            rowMap[uid] = {
+                .uid = uid,
+                .foreground = 1,
+                .state = STATE_FOREGROUND,
+                .seconds = safeSeconds(now, appInfo.startTimestamp),
+                .processCount = 0,
+            };
+        }
+
+        for (const auto& [uid, remainSec] : pendingHandleList) {
+            if (!managedApp.contains(uid)) continue;
+            const auto& appInfo = managedApp[uid];
+            if (appInfo.isWhitelist()) continue;
+
+            rowMap[uid] = {
+                .uid = uid,
+                .foreground = 0,
+                .state = STATE_PENDING,
+                .seconds = remainSec < 0 ? 0 : remainSec,
+                .processCount = 0,
+            };
+        }
+
+        DIR* dir = opendir("/proc");
+        if (dir != nullptr) {
+            struct dirent* file;
+            while ((file = readdir(dir)) != nullptr) {
+                if (file->d_type != DT_DIR) continue;
+                if (file->d_name[0] < '0' || file->d_name[0] > '9') continue;
+
+                const int pid = atoi(file->d_name);
+                if (pid <= 100) continue;
+
+                char fullPath[64];
+                snprintf(fullPath, sizeof(fullPath), "/proc/%d", pid);
+
+                struct stat statBuf;
+                if (stat(fullPath, &statBuf)) continue;
+                const int uid = statBuf.st_uid;
+                if (!managedApp.contains(uid)) continue;
+
+                auto& appInfo = managedApp[uid];
+                if (appInfo.isWhitelist()) continue;
+
+                snprintf(fullPath, sizeof(fullPath), "/proc/%d/cmdline", pid);
+                char readBuff[256];
+                if (Utils::readString(fullPath, readBuff, sizeof(readBuff)) == 0) continue;
+
+                const auto& package = appInfo.package;
+                if (strncmp(readBuff, package.c_str(), package.length())) continue;
+                const char endChar = readBuff[package.length()];
+                if (endChar != ':' && endChar != 0) continue;
+
+                auto& row = rowMap[uid];
+                if (row.uid == 0) {
+                    row.uid = uid;
+                    row.foreground = 0;
+                    row.state = STATE_RUNNING_BACKGROUND;
+                    row.seconds = safeSeconds(now, appInfo.startTimestamp);
+                    row.processCount = 0;
+                }
+                row.processCount++;
+
+                if (row.state == STATE_FOREGROUND || row.state == STATE_PENDING) continue;
+
+                snprintf(fullPath, sizeof(fullPath), "/proc/%d/wchan", pid);
+                if (Utils::readString(fullPath, readBuff, sizeof(readBuff)) == 0) {
+                    row.hasUnknownProcess = true;
+                    continue;
+                }
+
+                if (isFrozenWchan(readBuff)) {
+                    row.hasFrozenProcess = true;
+                }
+                else {
+                    row.hasRunningProcess = true;
+                }
+            }
+            closedir(dir);
+        }
+
+        vector<FreezeStatusRow> rows;
+        rows.reserve(rowMap.size());
+        for (auto& [uid, row] : rowMap) {
+            if (row.state != STATE_FOREGROUND && row.state != STATE_PENDING) {
+                const auto& appInfo = managedApp[uid];
+                if (row.hasRunningProcess) {
+                    row.state = STATE_RUNNING_BACKGROUND;
+                    row.seconds = safeSeconds(now, appInfo.startTimestamp);
+                }
+                else if (row.hasUnknownProcess) {
+                    row.state = STATE_UNKNOWN;
+                    row.seconds = 0;
+                }
+                else if (row.hasFrozenProcess) {
+                    row.state = STATE_FROZEN;
+                    row.seconds = safeSeconds(now, appInfo.stopTimestamp);
+                }
+                else {
+                    row.state = STATE_UNKNOWN;
+                    row.seconds = 0;
+                }
+            }
+            rows.emplace_back(row);
+        }
+
+        sort(rows.begin(), rows.end(), [&rank](const auto& a, const auto& b) {
+            const int rankA = rank(a.state);
+            const int rankB = rank(b.state);
+            if (rankA != rankB) return rankA < rankB;
+            return a.uid < b.uid;
+            });
+
+        const int maxRows = maxIntCnt / ROW_INT_LEN;
+        int intCnt = 0;
+        for (int i = 0; i < maxRows && i < static_cast<int>(rows.size()); i++) {
+            const auto& row = rows[i];
+            out[intCnt++] = row.uid;
+            out[intCnt++] = row.foreground;
+            out[intCnt++] = row.state;
+            out[intCnt++] = row.seconds;
+            out[intCnt++] = row.processCount;
+        }
+
+        END_TIME_COUNT;
+        return intCnt;
+    }
+
     // 解冻新APP, 旧APP加入待冻结列队
     void updateAppProcess() {
         bool isupdate = false;

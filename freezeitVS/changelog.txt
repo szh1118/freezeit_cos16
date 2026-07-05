@@ -1,6 +1,6 @@
-### v3.1.0Alpha self-use validation notes 2026-07-03
-1. Added Linux ARM64 native build and Magisk package helpers for the OnePlus 13 Android 16 self-use target.
-2. Packaged ROM baseline metadata from /home/admin/code/Rom/oneplus13.zip and log build mismatches as warnings only.
-3. Added hook-readiness gating before freeze/control operations plus manager-visible skip and failure diagnostics.
-4. Added LSPosed libxposed API 102 entry/backend while retaining the legacy Xposed entry for older runtimes.
-5. Scope remains one self-use target ROM; no support claim is made for other ROMs, devices, Android versions, or public releases.
+### v3.2.1SelfUse validation notes 2026-07-05
+1. Manager log view now follows the newest log output at the bottom by default.
+2. Manager home freeze-status view replaces CPU-time display and shows foreground/background, frozen state, and freeze time.
+3. Native freeze-status aggregation handles multi-process packages without losing frozen-process state.
+4. Release package targets the existing OnePlus 13 Android 16 self-use module installation path.
+5. No compatibility promise is made for other ROMs, devices, Android versions, or public release channels.

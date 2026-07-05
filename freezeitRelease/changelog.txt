@@ -1,6 +1,6 @@
-### v3.1.0Alpha self-use validation notes 2026-07-03
-1. Self-use package target: OnePlus 13 Android 16 ROM represented by /home/admin/code/Rom/oneplus13.zip.
-2. Includes manager APK, ARM64 native service, Magisk scripts, config seeds, and rom_baseline.prop.
-3. Manager APK includes both legacy Xposed metadata and LSPosed libxposed API 102 entry/backend metadata.
-4. Local build/package inspection passed; target-phone install, reboot, freeze/restore, protected-state, and recovery validation remain required before completion.
+### v3.2.1SelfUse validation notes 2026-07-05
+1. Self-use package target: OnePlus 13 Android 16 with existing Magisk module version 3.2.0SelfUse.
+2. Includes the updated manager APK, ARM64 native service, Magisk scripts, config seeds, and rom_baseline.prop.
+3. Manager log view auto-follows newest output; freeze-status view shows foreground/background, frozen state, and freeze time.
+4. Native freeze-status aggregation handles multi-process packages without losing frozen-process state.
 5. No compatibility promise is made for other ROMs, devices, Android versions, or public release channels.

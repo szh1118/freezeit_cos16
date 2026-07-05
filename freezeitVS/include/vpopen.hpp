@@ -122,6 +122,9 @@ namespace VPOPEN {
     }
 
     void vpopen(const char *absPath, const char *argv[], char *buf, const size_t len) {
+        if (len == 0)
+            return;
+
         auto fp = popen_noshell(absPath, (const char *const *) argv);
         if (!fp) {
             buf[0] = 0;
@@ -129,7 +132,7 @@ namespace VPOPEN {
             return;
         }
 
-        auto resLen = fread(buf, 1, len, fp);
+        auto resLen = fread(buf, 1, len - 1, fp);
         if (resLen <= 0) {
             buf[0] = 0;
         } else if (buf[resLen - 1] == '\n') {

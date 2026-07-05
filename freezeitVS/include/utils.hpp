@@ -153,6 +153,7 @@ enum class MANAGER_CMD : uint32_t {
     getSettings = 8,     // return bytes[256]: all settings parameter
     getUidTime = 9,      // return "uid last_user_time last_sys_time user_time sys_time\n..."
     getXpLog = 10,
+    getFreezeStatus = 11, // return int rows: uid foreground state seconds processCount
 
     // 设置 需附加数据
     setAppCfg = 21,      // send "package x\npackage x\npackage x\n..."
@@ -411,12 +412,15 @@ namespace Utils {
     }
 
     size_t readString(const char* path, char* buff, const size_t maxLen) {
+        if (maxLen == 0)
+            return 0;
+
         auto fd = open(path, O_RDONLY);
         if (fd <= 0) {
             buff[0] = 0;
             return 0;
         }
-        ssize_t len = read(fd, buff, maxLen);
+        ssize_t len = read(fd, buff, maxLen - 1);
         close(fd);
         if (len <= 0) {
             buff[0] = 0;

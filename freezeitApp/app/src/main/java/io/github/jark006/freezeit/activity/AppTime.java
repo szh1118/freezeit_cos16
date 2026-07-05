@@ -32,9 +32,9 @@ import io.github.jark006.freezeit.StaticData;
 import io.github.jark006.freezeit.Utils;
 
 public class AppTime extends AppCompatActivity {
-    AppTimeAdapter recycleAdapter = new AppTimeAdapter();
+    FreezeStatusAdapter recycleAdapter = new FreezeStatusAdapter();
     Timer timer;
-    int[] newUidTime;
+    int[] newStatusRows;
     final int UPDATE_DATA_SET = 1;
 
     @SuppressLint("MissingInflatedId")
@@ -88,13 +88,16 @@ public class AppTime extends AppCompatActivity {
         timer.schedule(new TimerTask() {
             @Override
             public void run() {
-                var recvLen = Utils.freezeitTask(ManagerCmd.getUidTime, null);
+                var recvLen = Utils.freezeitTask(ManagerCmd.getFreezeStatus, null);
 
-                // 每个APP时间为3个int32 [0-2]:[uid delta total], 共12字节
-                if (recvLen == 0 || recvLen % 12 != 0)
+                // 每行状态为5个int32 [0-4]:[uid foreground state seconds processCount], 共20字节
+                if (recvLen == 0 || recvLen % FreezeStatusAdapter.ROW_BYTE_LEN != 0) {
+                    newStatusRows = new int[0];
+                    handler.sendEmptyMessage(UPDATE_DATA_SET);
                     return;
-                newUidTime = new int[recvLen / 4];
-                Utils.Byte2Int(StaticData.response, 0, recvLen, newUidTime, 0);
+                }
+                newStatusRows = new int[recvLen / 4];
+                Utils.Byte2Int(StaticData.response, 0, recvLen, newStatusRows, 0);
                 handler.sendEmptyMessage(UPDATE_DATA_SET);
             }
         }, 0, 2000);
@@ -106,13 +109,21 @@ public class AppTime extends AppCompatActivity {
         public void handleMessage(@NonNull Message msg) {
             super.handleMessage(msg);
             if (msg.what == UPDATE_DATA_SET)
-                recycleAdapter.updateDataSet(newUidTime);
+                recycleAdapter.updateDataSet(newStatusRows);
         }
     };
 
 
-    static class AppTimeAdapter extends RecyclerView.Adapter<AppTimeAdapter.MyViewHolder> {
-        int[] uidTime = new int[0];
+    static class FreezeStatusAdapter extends RecyclerView.Adapter<FreezeStatusAdapter.MyViewHolder> {
+        static final int ROW_INT_LEN = 5;
+        static final int ROW_BYTE_LEN = ROW_INT_LEN * 4;
+        static final int STATE_RUNNING_BACKGROUND = 0;
+        static final int STATE_FOREGROUND = 1;
+        static final int STATE_PENDING = 2;
+        static final int STATE_FROZEN = 3;
+        static final int STATE_TERMINATED = 4;
+
+        int[] statusRows = new int[0];
         StringBuilder timeStr = new StringBuilder(32);
 
         @NonNull
@@ -127,8 +138,8 @@ public class AppTime extends AppCompatActivity {
         @Override
         public void onBindViewHolder(@NonNull MyViewHolder holder, int position) {
 
-            position *= 3;
-            final int uid = uidTime[position];
+            position *= ROW_INT_LEN;
+            final int uid = statusRows[position];
 
             if (holder.uid != uid) {
                 holder.uid = uid;
@@ -141,22 +152,76 @@ public class AppTime extends AppCompatActivity {
                 }
             }
 
-            holder.delta.setText(getTimeStr(uidTime[position + 1])); // deltaTime
-            holder.total.setText(getTimeStr(uidTime[position + 2])); // totalTime
+            final Context context = holder.itemView.getContext();
+            final int foreground = statusRows[position + 1];
+            final int state = statusRows[position + 2];
+            final int seconds = statusRows[position + 3];
+            final int processCount = statusRows[position + 4];
+            holder.state.setText(getStateText(context, foreground, state, processCount));
+            holder.time.setText(getTimeText(context, state, seconds));
         }
 
-        @SuppressLint("DefaultLocale")
-        StringBuilder getTimeStr(int time) {
-            timeStr.setLength(0);
+        String getStateText(@NonNull Context context, int foreground, int state, int processCount) {
+            int stateRes;
+            switch (state) {
+                case STATE_FOREGROUND:
+                    stateRes = R.string.freeze_state_foreground;
+                    break;
 
-            if (time <= 0) return timeStr;
-            else if (time <= 1000) {
-                timeStr.append(time).append("ms");
-                return timeStr;
+                case STATE_PENDING:
+                    stateRes = R.string.freeze_state_pending;
+                    break;
+
+                case STATE_FROZEN:
+                    stateRes = R.string.freeze_state_frozen;
+                    break;
+
+                case STATE_TERMINATED:
+                    stateRes = R.string.freeze_state_terminated;
+                    break;
+
+                case STATE_RUNNING_BACKGROUND:
+                    stateRes = R.string.freeze_state_running;
+                    break;
+
+                default:
+                    stateRes = R.string.freeze_state_unknown;
+                    break;
             }
 
-            int ms = time % 1000;
-            time /= 1000; // now Unit is second
+            var status = context.getString(foreground != 0 ?
+                    R.string.freeze_status_foreground : R.string.freeze_status_background) +
+                    " / " + context.getString(stateRes);
+            if (processCount > 0)
+                status += " / " + context.getString(R.string.freeze_process_count, processCount);
+            return status;
+        }
+
+        String getTimeText(@NonNull Context context, int state, int seconds) {
+            String duration = getTimeStr(seconds);
+            switch (state) {
+                case STATE_PENDING:
+                    return context.getString(R.string.freeze_time_pending, duration);
+
+                case STATE_FROZEN:
+                    return context.getString(R.string.freeze_time_frozen, duration);
+
+                case STATE_TERMINATED:
+                    return context.getString(R.string.freeze_time_stopped, duration);
+
+                case STATE_FOREGROUND:
+                case STATE_RUNNING_BACKGROUND:
+                    return context.getString(R.string.freeze_time_running, duration);
+
+                default:
+                    return context.getString(R.string.freeze_time_none);
+            }
+        }
+
+        String getTimeStr(int time) {
+            timeStr.setLength(0);
+
+            if (time <= 0) return "0s";
 
             if (time >= 3600) {
                 timeStr.append(time / 3600).append('h');
@@ -167,45 +232,43 @@ public class AppTime extends AppCompatActivity {
                 time %= 60;
             }
 
-            timeStr.append(time).append('.');
-
-            if (ms >= 100) timeStr.append(ms);
-            else if (ms >= 10) timeStr.append('0').append(ms);
-            else timeStr.append("00").append(ms);
-
-            timeStr.append('s');
-            return timeStr;
+            timeStr.append(time).append('s');
+            return timeStr.toString();
         }
 
         @Override
         public int getItemCount() {
-            return uidTime.length / 3;
+            return statusRows.length / ROW_INT_LEN;
         }
 
         @SuppressLint("NotifyDataSetChanged")
-        public void updateDataSet(@NonNull int[] newUidTime) {
-            if (uidTime.length != newUidTime.length) {
-                uidTime = newUidTime;
+        public void updateDataSet(@NonNull int[] newStatusRows) {
+            if (statusRows.length != newStatusRows.length) {
+                statusRows = newStatusRows;
                 notifyDataSetChanged();
                 return;
             }
 
-            for (int i = 0; i < uidTime.length; i += 3) {
-                if (uidTime[i] == newUidTime[i] &&
-                        uidTime[i + 1] == newUidTime[i + 1] &&
-                        uidTime[i + 2] == newUidTime[i + 2])
+            for (int i = 0; i < statusRows.length; i += ROW_INT_LEN) {
+                if (statusRows[i] == newStatusRows[i] &&
+                        statusRows[i + 1] == newStatusRows[i + 1] &&
+                        statusRows[i + 2] == newStatusRows[i + 2] &&
+                        statusRows[i + 3] == newStatusRows[i + 3] &&
+                        statusRows[i + 4] == newStatusRows[i + 4])
                     continue;
-                uidTime[i] = newUidTime[i];
-                uidTime[i + 1] = newUidTime[i + 1];
-                uidTime[i + 2] = newUidTime[i + 2];
-                notifyItemChanged(i / 3);
+                statusRows[i] = newStatusRows[i];
+                statusRows[i + 1] = newStatusRows[i + 1];
+                statusRows[i + 2] = newStatusRows[i + 2];
+                statusRows[i + 3] = newStatusRows[i + 3];
+                statusRows[i + 4] = newStatusRows[i + 4];
+                notifyItemChanged(i / ROW_INT_LEN);
             }
         }
 
         static class MyViewHolder extends RecyclerView.ViewHolder {
 
             ImageView app_icon;
-            TextView app_label, delta, total;
+            TextView app_label, state, time;
             int uid = 0;
 
             public MyViewHolder(View view) {
@@ -213,8 +276,8 @@ public class AppTime extends AppCompatActivity {
 
                 app_icon = view.findViewById(R.id.app_icon);
                 app_label = view.findViewById(R.id.app_label);
-                delta = view.findViewById(R.id.delta);
-                total = view.findViewById(R.id.total);
+                state = view.findViewById(R.id.state);
+                time = view.findViewById(R.id.freeze_time);
             }
         }
     }

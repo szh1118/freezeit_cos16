@@ -284,6 +284,12 @@ public:
             }
         } break;
 
+        case MANAGER_CMD::getFreezeStatus: {
+            replyPtr = replyBuf.get();
+            replyLen = freezer.writeFreezeStatus(reinterpret_cast<int*>(replyBuf.get()),
+                REPLY_BUF_SIZE / sizeof(int)) * sizeof(int);
+        } break;
+
         case MANAGER_CMD::getSettings: {
             replyPtr = settings.get();
             replyLen = settings.size();

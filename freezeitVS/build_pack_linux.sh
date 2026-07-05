@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${ROOT_DIR}/../.." && pwd)"
+REPO_ROOT="$(cd "${ROOT_DIR}/.." && pwd)"
 MAGISK_DIR="${ROOT_DIR}/magisk"
 RELEASE_DIR="${RELEASE_DIR:-${REPO_ROOT}/freezeitRelease}"
 APK_DIR="${REPO_ROOT}/freezeitApp/app/build/outputs/apk/release"

@@ -69,7 +69,21 @@
     <string name="clear_log_tips">Cleared</string>
     <string name="xposed_description">Freezeit Auxiliary Modules</string>
     <string name="title_activity_setting">Settings</string>
-    <string name="title_activity_task_manager">APP CPU Time</string>
+    <string name="title_activity_task_manager">Freeze Status</string>
+    <string name="freeze_status_foreground">Foreground</string>
+    <string name="freeze_status_background">Background</string>
+    <string name="freeze_state_foreground">Active</string>
+    <string name="freeze_state_pending">Pending</string>
+    <string name="freeze_state_frozen">Frozen</string>
+    <string name="freeze_state_terminated">Stopped</string>
+    <string name="freeze_state_running">Running</string>
+    <string name="freeze_state_unknown">Unknown</string>
+    <string name="freeze_process_count">%1$d proc</string>
+    <string name="freeze_time_pending">Freeze in %1$s</string>
+    <string name="freeze_time_running">Running %1$s</string>
+    <string name="freeze_time_frozen">Frozen %1$s</string>
+    <string name="freeze_time_stopped">Stopped %1$s</string>
+    <string name="freeze_time_none">No time</string>
     <string name="freeze_timeout_title">Freeze Timeout ⓘ</string>
     <string name="wakeup_timeout_title">Regular Wakeup ⓘ</string>
     <string name="terminate_timeout_title">Terminate Timeout ⓘ</string>
@@ -145,9 +159,10 @@
     <string name="help_logcat_check">Check freeze status, memory usage</string>
     <string name="help_logcat_clear">Clear log</string>
     <string name="app_time_help_text">
-        Statistics of CPU usage time, it can be approximated as the power consumption.
-        \nWhen the application is running, it does not use CPU resources all the time, but only when it needs to process data, and most of the time it is in the "sleep" state.
-        \nNote:The above statistics are the default behavior of the system, Freezeit only reads them out for visualization.
+        Shows the current Freezeit control state for managed apps.
+        \nForeground apps are active and will not be frozen.
+        \nPending apps have moved to the background and are waiting for the configured timeout.
+        \nFrozen or stopped apps show how long they have stayed in that state.
     </string>
     <string name="save">Save</string>
     <string name="convert_freezer_sigstop">Convert Freezer / SIGSTOP</string>
@@ -163,8 +178,8 @@
 
     <string name="website_link">https://jark006.github.io/i/freezeit/</string>
     <string name="tutorial_link">https://jark006.github.io/FreezeitIntroduction/</string>
-    <string name="update_json_link">https://raw.githubusercontent.com/jark006/freezeitRelease/main/update.json</string>
-    <string name="online_changelog_link">https://raw.githubusercontent.com/jark006/freezeitRelease/main/changelogFull.txt</string>
+    <string name="update_json_link">https://raw.githubusercontent.com/szh1118/freezeit_cos16/main/freezeitRelease/update.json</string>
+    <string name="online_changelog_link">https://raw.githubusercontent.com/szh1118/freezeit_cos16/main/freezeitRelease/changelogFull.txt</string>
     <string name="privacy_title">Privacy</string>
     <string name="reject">Reject</string>
     <string name="accept">Accept</string>
