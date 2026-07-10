@@ -1,28 +1,8 @@
-### v3.2.8SelfUse validation notes 2026-07-08
-1. Drains complete child stdout in legacy `vpopen` while preserving bounded response buffers, avoiding SIGPIPE/Broken pipe daemon exits on large `dumpsys telecom` output.
-2. Updates module and manager author metadata to `JARK006 / @szh1118`.
-3. Points visible manager About links and online update metadata at `szh1118/freezeit_cos16`.
-4. Includes the updated manager APK, ARM64 native service, Magisk scripts, config seeds, rom_baseline.prop, and update.json.
-5. No compatibility promise is made for other ROMs, devices, Android versions, or public release channels.
+### v3.3.0SelfUse
 
-### v3.2.7SelfUse validation notes 2026-07-07
-1. Adds ColorOS Athena Xposed scope and hook dispatch for `com.oplus.athena`.
-2. Short-circuits Athena external clear strategies and shared kill/force-stop utility exits to reduce ColorOS versus Freezeit cleanup fights.
-3. Logs GuardElf power policy and whitelist switch changes for diagnostics without blocking Battery UI writes.
-4. Includes the updated manager APK, ARM64 native service, Magisk scripts, config seeds, rom_baseline.prop, and update.json.
-5. No compatibility promise is made for other ROMs, devices, Android versions, or public release channels.
-
-### v3.2.6SelfUse validation notes 2026-07-06
-1. Self-use package target: OnePlus 13 Android 16 with existing Magisk module version 3.2.5SelfUse.
-2. Includes the updated manager APK, ARM64 legacy native service, Magisk scripts, config seeds, and rom_baseline.prop.
-3. Cloud drive / NAS clients matching baidu.netdisk, quark.clouddrive, com.google.android.apps.docs, pikpak, or com.trim.app are delayed from freezing while UID receive speed is above 5 MiB/s.
-4. Netstats extraction ignores Android status rows and parser behavior is covered with a realistic mAppUidStatsMap sample.
-5. No compatibility promise is made for other ROMs, devices, Android versions, or public release channels.
-
-### v3.2.5SelfUse validation notes 2026-07-06
-1. Self-use package target: OnePlus 13 Android 16 with existing Magisk module version 3.2.4SelfUse.
-2. Includes the updated manager APK, ARM64 legacy native service, Magisk scripts, config seeds, and rom_baseline.prop.
-3. Manager home status no longer calls the unsupported legacy daemon health command, fixing the visible illegal-command status.
-4. Manager log view restores bottom-sentinel focusing so new log output stays scrolled to the bottom.
-5. Release documentation now states that the current phone zip uses the legacy native daemon packaging path.
-6. No compatibility promise is made for other ROMs, devices, Android versions, or public release channels.
+1. 后台 daemon 完成 Rust-only ARM64 收敛，活动代码树不再包含旧 C++ daemon、x64 fallback 或旧构建链。
+2. 移除 F83 指纹、型号、内核与 readiness 硬编码；运行时报告区分验证目标、实际能力、控制许可和限制原因。
+3. 修复 Binder freezer UAPI、PID 身份复验、signal 事务回滚、配置原子持久化和 fail-closed 控制门禁。
+4. 将下载中延迟冻结、启动期异常解冻审计、Regular Refreeze 与大命令输出排空迁移到 Rust 并加入合同测试。
+5. 保留 Xposed API 82/102 双栈；Athena hook 使用四套已审计 ROM 的 APK SHA、ROM fingerprint 和完整方法签名，未知组合 fail-closed。
+6. 发布 ZIP 仅包含一个 ARM64 Rust ELF，并携带 GPL-3.0、对应源码说明、完整 SHA-256 和 provenance。

@@ -1,5 +1,7 @@
+pub mod command_runner;
 pub mod compatibility;
 pub mod controller;
+pub mod download_deferral;
 pub mod error;
 pub mod foreground;
 pub mod freezer_backend;

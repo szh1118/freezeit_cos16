@@ -1,5 +1,5 @@
 use freezeit_daemon::{
-    app::compatibility::CompatibilityBaseline,
+    app::compatibility::RuntimeEnvironment,
     app::controller::{
         read_only_state_with_diagnostics, startup_read_only_state_from_paths,
         sync_loaded_config_to_hook, DiagnosticState,
@@ -58,7 +58,14 @@ fn get_settings_returns_legacy_256_byte_block() {
 
 #[test]
 fn app_config_read_and_write_remain_manager_compatible() {
+    let temp = tempfile::tempdir().expect("tempdir");
     let mut state = ReadOnlyState::default();
+    state.app_config_path = Some(
+        temp.path()
+            .join("appcfg.txt")
+            .to_string_lossy()
+            .into_owned(),
+    );
     state.app_config = vec![
         freezeit_daemon::protocol::manager_v1::ManagerAppConfigRecord {
             uid: 10_000,
@@ -98,7 +105,10 @@ fn app_config_read_and_write_remain_manager_compatible() {
 
 #[test]
 fn set_app_label_logs_legacy_label_update_summary() {
+    let temp = tempfile::tempdir().expect("tempdir");
     let mut state = ReadOnlyState::default();
+    let label_path = temp.path().join("applabel.txt");
+    state.app_label_path = Some(label_path.to_string_lossy().into_owned());
     let frame = manager_frame(
         ManagerCommand::SetAppLabel,
         "10000 Example App\n10001 Other App\n".as_bytes(),
@@ -111,6 +121,69 @@ fn set_app_label_logs_legacy_label_update_summary() {
     assert!(state.log.contains("更新 2 款应用名称"));
     assert!(state.log.contains("[Example App]"));
     assert!(state.log.contains("[Other App]"));
+    assert_eq!(
+        fs::read_to_string(label_path).unwrap(),
+        "10000 Example App\n10001 Other App\n"
+    );
+}
+
+#[test]
+fn set_app_cfg_restores_file_state_and_hook_when_new_hook_sync_fails() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let app_config_path = temp.path().join("appcfg.txt");
+    fs::write(&app_config_path, "10000uid10000 20 1\n").expect("seed config");
+    let mut state = ReadOnlyState::default();
+    state.app_config_path = Some(app_config_path.to_string_lossy().into_owned());
+    state.app_config = vec![ManagerAppConfigRecord {
+        uid: 10_000,
+        mode: 20,
+        permissive: true,
+    }];
+    let frame = manager_frame(
+        ManagerCommand::SetAppCfg,
+        &encode_app_config(&[ManagerAppConfigRecord {
+            uid: 10_000,
+            mode: 30,
+            permissive: false,
+        }]),
+    );
+    let mut hook_payloads = Vec::new();
+
+    let response = handle_manager_command(&frame, &mut state, |payload| {
+        hook_payloads.push(payload.to_vec());
+        Ok(hook_payloads.len() != 1)
+    })
+    .expect("hook rejection is reported without corrupting persistence");
+
+    assert_eq!(response, b"failure");
+    assert_eq!(
+        fs::read_to_string(&app_config_path).unwrap(),
+        "10000uid10000 20 1\n"
+    );
+    assert_eq!(state.app_config[0].mode, 20);
+    assert_eq!(hook_payloads.len(), 2, "old hook config must be restored");
+    assert!(!temp.path().join(".appcfg.txt.tmp").exists());
+}
+
+#[test]
+fn write_commands_do_not_report_success_without_persistence_paths() {
+    let mut state = ReadOnlyState::default();
+    let app_cfg = manager_frame(
+        ManagerCommand::SetAppCfg,
+        &encode_app_config(&[ManagerAppConfigRecord {
+            uid: 10_000,
+            mode: 30,
+            permissive: false,
+        }]),
+    );
+    assert!(handle_manager_command(&app_cfg, &mut state, |_| Ok(true)).is_err());
+
+    let labels = manager_frame(ManagerCommand::SetAppLabel, b"10000 Example App\n");
+    assert!(handle_manager_command(&labels, &mut state, |_| Ok(true)).is_err());
+
+    let settings = manager_frame(ManagerCommand::SetSettingsVar, &[13, 0]);
+    let response = handle_manager_command(&settings, &mut state, |_| Ok(true)).unwrap();
+    assert_ne!(response, b"success");
 }
 
 #[test]
@@ -125,7 +198,14 @@ fn empty_app_config_still_returns_legacy_placeholder_record() {
 
 #[test]
 fn set_app_config_reports_failure_when_hook_rejects_payload() {
+    let temp = tempfile::tempdir().expect("tempdir");
     let mut state = ReadOnlyState::default();
+    state.app_config_path = Some(
+        temp.path()
+            .join("appcfg.txt")
+            .to_string_lossy()
+            .into_owned(),
+    );
     let payload = encode_app_config(&[ManagerAppConfigRecord {
         uid: 10_000,
         mode: 30,
@@ -141,7 +221,14 @@ fn set_app_config_reports_failure_when_hook_rejects_payload() {
 
 #[test]
 fn set_settings_var_updates_legacy_setting_byte() {
+    let temp = tempfile::tempdir().expect("tempdir");
     let mut state = ReadOnlyState::default();
+    state.settings_path = Some(
+        temp.path()
+            .join("settings.db")
+            .to_string_lossy()
+            .into_owned(),
+    );
     let frame = manager_frame(ManagerCommand::SetSettingsVar, &[13, 0]);
 
     let response = handle_manager_command(&frame, &mut state, |_| Ok(true))
@@ -625,8 +712,17 @@ fn v2_diagnostic_command_ids_match_published_contract() {
 #[test]
 fn v2_compatibility_baseline_command_returns_report_json() {
     let mut state = ReadOnlyState::default();
-    state.compatibility_report_json =
-        CompatibilityBaseline::target_cph2653_android16().compatibility_json(&[]);
+    state.compatibility_report_json = RuntimeEnvironment::new(
+        "CPH2653",
+        "16",
+        36,
+        "runtime-fingerprint",
+        "6.6.89",
+        true,
+        true,
+        true,
+    )
+    .compatibility_json(&[]);
 
     let text = String::from_utf8(
         handle_read_only_command(ManagerCommand::GetCompatibilityBaseline, &state).unwrap(),

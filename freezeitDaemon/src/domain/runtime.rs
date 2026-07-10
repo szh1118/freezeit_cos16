@@ -8,6 +8,7 @@ pub struct RuntimeProcess {
     pub control_state: ControlState,
     pub cgroup_freeze_path: Option<String>,
     pub binder_state: Option<String>,
+    pub start_time_ticks: Option<u64>,
     pub last_seen_at_ms: u128,
 }
 

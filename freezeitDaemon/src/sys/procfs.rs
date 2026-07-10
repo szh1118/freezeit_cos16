@@ -34,6 +34,32 @@ pub fn read_process_uid(proc_root: impl AsRef<Path>, pid: i32) -> Result<u32, Da
     read_uid_from_status(&status)
 }
 
+pub fn read_process_cmdline(proc_root: impl AsRef<Path>, pid: i32) -> Result<String, DaemonError> {
+    Ok(
+        fs::read_to_string(proc_root.as_ref().join(pid.to_string()).join("cmdline"))?
+            .split('\0')
+            .next()
+            .unwrap_or("")
+            .to_owned(),
+    )
+}
+
+pub fn parse_process_start_time(stat_text: &str) -> Result<u64, DaemonError> {
+    let command_end = stat_text
+        .rfind(')')
+        .ok_or_else(|| DaemonError::system("proc stat did not contain a command terminator"))?;
+    stat_text[command_end + 1..]
+        .split_whitespace()
+        .nth(19)
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| DaemonError::system("proc stat did not contain a readable start time"))
+}
+
+pub fn read_process_start_time(proc_root: impl AsRef<Path>, pid: i32) -> Result<u64, DaemonError> {
+    let stat = fs::read_to_string(proc_root.as_ref().join(pid.to_string()).join("stat"))?;
+    parse_process_start_time(&stat)
+}
+
 pub fn process_context_switch_evidence(status_text: &str) -> Option<String> {
     let voluntary = read_status_u64(status_text, "voluntary_ctxt_switches:")?;
     let nonvoluntary = read_status_u64(status_text, "nonvoluntary_ctxt_switches:")?;
@@ -51,7 +77,20 @@ pub fn recheck_process_identity(
         return Ok(false);
     }
 
-    Ok(read_process_uid(proc_root, process.pid)? == process.uid)
+    if read_process_uid(proc_root.as_ref(), process.pid)? != process.uid {
+        return Ok(false);
+    }
+    let cmdline = read_process_cmdline(proc_root.as_ref(), process.pid)?;
+    if cmdline != process.process_name
+        || !(cmdline == process.package_name
+            || cmdline.starts_with(&format!("{}:", process.package_name)))
+    {
+        return Ok(false);
+    }
+    match process.start_time_ticks {
+        Some(expected) => Ok(read_process_start_time(proc_root, process.pid)? == expected),
+        None => Ok(false),
+    }
 }
 
 pub fn discover_package_processes(
@@ -100,6 +139,7 @@ pub fn discover_package_processes(
                 control_state: crate::domain::runtime::ControlState::Unknown,
                 cgroup_freeze_path: None,
                 binder_state: process_context_switch_evidence(&status_text),
+                start_time_ticks: read_process_start_time(proc_root, pid).ok(),
                 last_seen_at_ms: 0,
             });
         }
@@ -181,6 +221,7 @@ pub fn discover_uid_processes_with_cgroup_roots(
             control_state: crate::domain::runtime::ControlState::Running,
             cgroup_freeze_path: cgroup_freeze_path(cgroup_roots, uid, pid),
             binder_state: process_context_switch_evidence(&status_text),
+            start_time_ticks: read_process_start_time(proc_root, pid).ok(),
             last_seen_at_ms: 0,
         });
     }
@@ -256,6 +297,7 @@ pub fn discover_managed_uid_processes_with_cgroup_roots(
                 control_state: crate::domain::runtime::ControlState::Running,
                 cgroup_freeze_path: cgroup_freeze_path(cgroup_roots, process_uid, pid),
                 binder_state: process_context_switch_evidence(&status_text),
+                start_time_ticks: read_process_start_time(proc_root, pid).ok(),
                 last_seen_at_ms: 0,
             });
     }

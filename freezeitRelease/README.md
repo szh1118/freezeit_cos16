@@ -1,54 +1,37 @@
 # Freezeit self-use release workspace
 
-This directory stores self-use Magisk release artifacts for the verified
-CPH2653 Android 16 target.
+This directory stores validated self-use Magisk archives and update metadata
+for the recorded OnePlus/ColorOS Android 16 baseline.
 
-The current `3.2.xSelfUse` zips package the legacy native daemon from
-`freezeitVS/magisk/freezeitARM64` through `freezeitVS/build_pack_linux.sh`.
-`freezeitDaemon/` remains a modern rewrite workspace and is not the default
-phone payload unless a candidate zip explicitly contains `freezeitRustARM64`
-and target-device validation says so.
+## Rust-Only Release Policy
 
-Validate any candidate zip with `scripts/validate-release-zip.sh`.
+Starting with planned version `3.3.0SelfUse` / `303000`, releases are ARM64-only
+and package exactly one Rust daemon as `freezeit`. The daemon source is
+`freezeitDaemon/`; the manager source is `freezeitApp/`. Legacy C++ and x64
+payloads are not release inputs, and the top-level `magisk/` template contains
+no binaries or APKs.
 
-## Current Self-Use Release Artifact
+Build with `scripts/build-release.sh`, or package verified prebuilt artifacts
+with `scripts/package-release.sh`. Every candidate must pass
+`scripts/validate-release-zip.sh`, including version consistency, unique daemon,
+AArch64 ELF, safe ZIP paths, complete payload SHA256, and provenance checks.
 
-- Release candidate zip:
-  `freezeitRelease/freezeit_oneplus13_android16_selfuse_v3.2.8SelfUse_302008.zip`
-- Build path: `freezeitVS/build_pack_linux.sh`
-- Validation path: `scripts/validate-release-zip.sh`
+## Publication Gate
 
-## Self-Use Threat Boundary
+`freezeitRelease/update.json` intentionally continues to describe the last
+validated public artifact. Update it to `3.3.0SelfUse` only after the exact
+`freezeit_oneplus13_android16_selfuse_v3.3.0SelfUse_303000.zip` candidate passes
+validation and is placed in this directory. Existing release ZIPs are retained.
+Released metadata also requires a `zipSha256` equal to that local ZIP after it
+passes `scripts/validate-release-zip.sh`; metadata cannot advertise a missing or
+unvalidated artifact. Dirty trees may produce test candidates only, with an
+embedded source snapshot and patch/state digests, and can never be published as
+`released`.
 
-`3.2.8SelfUse` is a background runtime-control build for the verified CPH2653
-Android 16 baseline. It can reduce selected third-party app background execution
-after hook/root/freezer readiness, foreground eligibility, configured delay, and
-idle checks pass.
+## GPL-3.0 Source
 
-It is not a malware scanner, sandbox, exploit mitigator, or root/system trust
-boundary. It does not prevent behavior before freeze, foreground behavior while
-the app is being used, or activity from privileged ROM/root/system components.
-
-# ❌ 本项目已停止维护 ❌
-
----
-
-# FreezeitRelease 冻它模块发布页
-
-**[面具模块]** 实现部分墓碑机制，自动暂停后台进程的运行。
-
-**[MagiskModule]** Implement a partial tombstone mechanism to automatically suspend background processes.
-
-### 相关链接
-
-1. [当前自用维护地址](https://github.com/szh1118/freezeit_cos16)
-
-1. [管理器源码目录](https://github.com/szh1118/freezeit_cos16/tree/main/freezeitApp)
-
-1. [模块包发布目录](https://github.com/szh1118/freezeit_cos16/tree/main/freezeitRelease)
-
-### 其他链接
-
-[发布说明](https://github.com/szh1118/freezeit_cos16/blob/main/README.md) |
-[问题反馈](https://github.com/szh1118/freezeit_cos16/issues) |
-[更新元数据](https://github.com/szh1118/freezeit_cos16/blob/main/freezeitRelease/update.json)
+The Rust crate declares `GPL-3.0-or-later`. Each new archive records the Git
+commit, Rust source directory, manager source directory, target triple, and
+artifact SHA256 values in `provenance.txt`. Archives also include `LICENSE` and
+`SOURCE_OFFER`, whose URL names the exact source commit. Redistributors must
+preserve the corresponding GPL-3.0 source availability and notices.

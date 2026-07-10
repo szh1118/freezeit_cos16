@@ -2,7 +2,8 @@ use freezeit_daemon::{
     app::{
         controller::{
             decide_freeze, decide_freeze_after_reconciliation, mark_frozen, mark_running,
-            run_control_pass, run_control_pass_with_settings, RuntimeControlState,
+            run_control_pass, run_control_pass_with_settings, run_control_pass_with_validation,
+            RuntimeControlState,
         },
         error::DaemonError,
         freezer_backend::{
@@ -22,6 +23,7 @@ use freezeit_daemon::{
     protocol::manager_v1::ManagerAppConfigRecord,
     sys::socket::{require_foreground_uids_for_control, should_run_control_pass},
 };
+use std::cell::RefCell;
 
 #[test]
 fn background_delay_reaches_pending_then_frozen_and_foreground_cancels() {
@@ -330,6 +332,7 @@ fn control_pass_skips_non_control_policies_and_absent_processes_without_log_spam
 fn live_control_pass_requires_active_hook_and_configured_apps() {
     let mut state = freezeit_daemon::protocol::manager_v1::ReadOnlyState {
         hook_health: "active".to_owned(),
+        control_allowed: true,
         app_config: vec![ManagerAppConfigRecord {
             uid: 10_123,
             mode: 30,
@@ -344,6 +347,10 @@ fn live_control_pass_requires_active_hook_and_configured_apps() {
     assert!(!should_run_control_pass(&state));
 
     state.hook_health = "active".to_owned();
+    state.control_allowed = false;
+    assert!(!should_run_control_pass(&state));
+
+    state.control_allowed = true;
     state.app_config.clear();
     assert!(!should_run_control_pass(&state));
 
@@ -353,6 +360,150 @@ fn live_control_pass_requires_active_hook_and_configured_apps() {
         permissive: false,
     }];
     assert!(!should_run_control_pass(&state));
+}
+
+#[test]
+fn signal_batch_rolls_back_in_reverse_and_records_failed_when_rollback_completes() {
+    let mut state = RuntimeControlState::default();
+    let config = vec![ManagerAppConfigRecord {
+        uid: 10_123,
+        mode: 30,
+        permissive: false,
+    }];
+    let mut first = process();
+    first.pid = 101;
+    first.cgroup_freeze_path = None;
+    let mut second = first.clone();
+    second.pid = 102;
+    let mut third = first.clone();
+    third.pid = 103;
+    let processes = vec![first, second, third];
+    let calls = RefCell::new(Vec::new());
+
+    run_control_pass_with_validation(
+        &mut state,
+        &config,
+        &[],
+        |_, _| Ok(processes.clone()),
+        |process| {
+            calls.borrow_mut().push(("stop", process.pid));
+            if process.pid == 103 {
+                Err(DaemonError::system("stop failed"))
+            } else {
+                Ok(())
+            }
+        },
+        |process| {
+            calls.borrow_mut().push(("cont", process.pid));
+            Ok(())
+        },
+        |_| Ok(true),
+        &[],
+        1000,
+    )
+    .expect("pass records transaction failure");
+
+    assert_eq!(
+        *calls.borrow(),
+        vec![
+            ("stop", 101),
+            ("stop", 102),
+            ("stop", 103),
+            ("cont", 102),
+            ("cont", 101)
+        ]
+    );
+    let json = state.operation_log.to_json();
+    assert!(json.contains("\"result\":\"failed\""));
+    assert!(json.contains("rolled_back=2"));
+}
+
+#[test]
+fn signal_batch_identity_drift_blocks_shared_uid_target_and_records_partial_on_rollback_failure() {
+    let mut state = RuntimeControlState::default();
+    let config = vec![ManagerAppConfigRecord {
+        uid: 10_123,
+        mode: 30,
+        permissive: false,
+    }];
+    let mut first = process();
+    first.pid = 201;
+    first.cgroup_freeze_path = None;
+    let mut shared_uid_other_package = first.clone();
+    shared_uid_other_package.pid = 202;
+    let processes = vec![first, shared_uid_other_package];
+    let calls = RefCell::new(Vec::new());
+    let validation_count = RefCell::new(0);
+
+    run_control_pass_with_validation(
+        &mut state,
+        &config,
+        &[],
+        |_, _| Ok(processes.clone()),
+        |process| {
+            calls.borrow_mut().push(("stop", process.pid));
+            Ok(())
+        },
+        |process| {
+            calls.borrow_mut().push(("cont", process.pid));
+            Err(DaemonError::system("rollback failed"))
+        },
+        |_| {
+            let mut count = validation_count.borrow_mut();
+            *count += 1;
+            Ok(*count != 4)
+        },
+        &[],
+        1000,
+    )
+    .expect("pass records identity failure");
+
+    assert_eq!(*calls.borrow(), vec![("stop", 201), ("cont", 201)]);
+    let json = state.operation_log.to_json();
+    assert!(json.contains("\"result\":\"partial\""));
+    assert!(json.contains("identity validation failed"));
+}
+
+#[test]
+fn signal_batch_rejects_shared_uid_packages_before_any_signal() {
+    let mut state = RuntimeControlState::default();
+    let config = vec![ManagerAppConfigRecord {
+        uid: 10_123,
+        mode: 30,
+        permissive: false,
+    }];
+    let mut first = process();
+    first.pid = 301;
+    first.cgroup_freeze_path = None;
+    let mut other = first.clone();
+    other.pid = 302;
+    other.package_name = "com.other.shared".to_owned();
+    other.process_name = "com.other.shared".to_owned();
+    let signals = RefCell::new(Vec::new());
+
+    run_control_pass_with_validation(
+        &mut state,
+        &config,
+        &[],
+        |_, _| Ok(vec![first.clone(), other.clone()]),
+        |process| {
+            signals.borrow_mut().push(("stop", process.pid));
+            Ok(())
+        },
+        |process| {
+            signals.borrow_mut().push(("cont", process.pid));
+            Ok(())
+        },
+        |_| Ok(true),
+        &[],
+        1000,
+    )
+    .expect("shared uid is rejected safely");
+
+    assert!(signals.borrow().is_empty());
+    let json = state.operation_log.to_json();
+    assert!(json.contains("shared uid contains multiple package identities"));
+    assert!(json.contains("\"result\":\"failed\""));
 }
 
 #[test]
@@ -387,6 +538,7 @@ fn process() -> RuntimeProcess {
         control_state: ControlState::Running,
         cgroup_freeze_path: None,
         binder_state: None,
+        start_time_ticks: Some(1),
         last_seen_at_ms: 0,
     }
 }

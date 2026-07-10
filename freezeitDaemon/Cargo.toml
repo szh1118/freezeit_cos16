@@ -72,6 +72,22 @@ path = "tests/integration/recover_after_restart.rs"
 name = "compatibility_baseline"
 path = "tests/contract/compatibility_baseline.rs"
 
+[[test]]
+name = "module_dir_resolution"
+path = "tests/contract/module_dir_resolution.rs"
+
+[[test]]
+name = "download_freeze_deferral"
+path = "tests/contract/download_freeze_deferral.rs"
+
+[[test]]
+name = "refreeze_audit"
+path = "tests/contract/refreeze_audit.rs"
+
+[[test]]
+name = "command_runner"
+path = "tests/contract/command_runner.rs"
+
 [dependencies]
 libc = "0.2"
 

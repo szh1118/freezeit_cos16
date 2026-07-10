@@ -1,11 +1,12 @@
-use std::fs;
+use std::{fs, io};
 
 use freezeit_daemon::{
     domain::capability::CapabilityStatus,
     sys::{
         binder::{
-            binder_freezer_ioctl_number, detect_binder_freezer_capability_from_candidates,
-            BinderFreezeRequest,
+            binder_freezer_ioctl_number, binder_freezer_request,
+            detect_binder_freezer_capability_from_candidates,
+            detect_binder_freezer_capability_with_probe, BinderFreezeInfo, BinderFreezeRequest,
         },
         cgroup::{
             detect_cgroup_v2_freezer_capability, read_freeze_state, write_freeze_state,
@@ -33,10 +34,24 @@ fn cgroup_freeze_state_round_trips_through_file() {
 }
 
 #[test]
-fn binder_freezer_ioctl_numbers_are_stable_and_distinct() {
-    assert_ne!(
-        binder_freezer_ioctl_number(BinderFreezeRequest::Freeze),
-        binder_freezer_ioctl_number(BinderFreezeRequest::Unfreeze)
+fn binder_freezer_abi_matches_linux_android_uapi() {
+    assert_eq!(std::mem::size_of::<BinderFreezeInfo>(), 12);
+    assert_eq!(binder_freezer_ioctl_number(), 0x400c_620e);
+    assert_eq!(
+        binder_freezer_request(123, BinderFreezeRequest::Freeze, 250),
+        BinderFreezeInfo {
+            pid: 123,
+            enable: 1,
+            timeout_ms: 250,
+        }
+    );
+    assert_eq!(
+        binder_freezer_request(123, BinderFreezeRequest::Unfreeze, 250),
+        BinderFreezeInfo {
+            pid: 123,
+            enable: 0,
+            timeout_ms: 250,
+        }
     );
 }
 
@@ -84,7 +99,7 @@ fn cgroup_v2_detection_accepts_android_freeze_files_when_root_controllers_omit_f
 }
 
 #[test]
-fn binder_device_without_verified_probe_is_reported_untested_not_available() {
+fn binder_device_rejecting_freezer_ioctl_reports_degraded_error() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binder = temp.path().join("dev/binder");
     fs::create_dir_all(binder.parent().expect("binder parent")).expect("mkdir");
@@ -93,8 +108,22 @@ fn binder_device_without_verified_probe_is_reported_untested_not_available() {
 
     let capability = detect_binder_freezer_capability_from_candidates(&candidates);
 
-    assert_eq!(capability.status, CapabilityStatus::Untested);
+    assert_eq!(capability.status, CapabilityStatus::Degraded);
     assert_eq!(capability.device_path.as_deref(), candidates[0].to_str());
-    assert!(capability.evidence.contains("BINDER_FREEZE"));
-    assert!(capability.evidence.contains("target probe required"));
+    assert!(capability.evidence.contains("ioctl probe failed"));
+}
+
+#[test]
+fn binder_probe_accepts_kernel_recognition_errors_as_available() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binder = temp.path().join("dev/binder");
+    fs::create_dir_all(binder.parent().expect("binder parent")).expect("mkdir");
+    fs::write(&binder, "").expect("binder device placeholder");
+
+    let capability = detect_binder_freezer_capability_with_probe(&[binder], |_| {
+        Err(io::Error::from_raw_os_error(libc::ESRCH))
+    });
+
+    assert_eq!(capability.status, CapabilityStatus::Available);
+    assert!(capability.evidence.contains("kernel recognized"));
 }

@@ -10,8 +10,8 @@ use std::{
 use crate::{
     app::{
         controller::{
-            is_control_policy_mode, run_control_pass_with_settings, sync_loaded_config_to_hook,
-            RuntimeControlState,
+            is_control_policy_mode, refresh_runtime_diagnostics, run_control_pass_with_sampling,
+            sync_loaded_config_to_hook, RuntimeControlState,
         },
         error::DaemonError,
     },
@@ -22,7 +22,7 @@ use crate::{
         },
         xposed::{classify_bridge_error, classify_hook_health_payload},
     },
-    sys::{cgroup, procfs, signal, xposed_bridge},
+    sys::{binder, cgroup, procfs, signal, xposed_bridge},
 };
 
 pub fn bind_manager_listener() -> Result<TcpListener, DaemonError> {
@@ -74,20 +74,37 @@ fn run_live_control_pass(
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
 
-    run_control_pass_with_settings(
+    let has_download_candidate = processes_by_uid
+        .values()
+        .flatten()
+        .any(|process| crate::app::download_deferral::is_candidate_package(&process.package_name));
+    let uid_rx_bytes = if has_download_candidate {
+        Some(crate::app::download_deferral::sample_uid_rx_bytes_map())
+    } else {
+        None
+    };
+
+    run_control_pass_with_sampling(
         control_state,
         &state.app_config,
         &state.settings,
         |_package_name, uid| Ok(processes_by_uid.get(&uid).cloned().unwrap_or_default()),
         freeze_process,
         unfreeze_process,
+        |process| procfs::recheck_process_identity(procfs::PROC_ROOT, process),
+        |uid, _| match &uid_rx_bytes {
+            Some(Ok(values)) => Ok(values.get(&uid).copied()),
+            Some(Err(error)) => Err(DaemonError::system(error.to_string())),
+            None => Ok(None),
+        },
         &foreground_uids,
         timestamp_ms,
     )
 }
 
 pub fn should_run_control_pass(state: &ReadOnlyState) -> bool {
-    state.hook_health == "active"
+    state.control_allowed
+        && state.hook_health == "active"
         && state
             .app_config
             .iter()
@@ -102,7 +119,30 @@ pub fn require_foreground_uids_for_control(
 
 fn freeze_process(process: &crate::domain::runtime::RuntimeProcess) -> Result<(), DaemonError> {
     if let Some(path) = &process.cgroup_freeze_path {
-        cgroup::write_freeze_state(path, cgroup::FreezeState::Frozen)
+        let binder_pid = u32::try_from(process.pid)
+            .map_err(|_| DaemonError::system(format!("invalid binder pid {}", process.pid)))?;
+        let binder_path = binder::discover_binder_device()
+            .ok_or_else(|| DaemonError::system("binder device disappeared before freeze"))?;
+        binder::set_binder_freeze(
+            binder_path,
+            binder_pid,
+            binder::BinderFreezeRequest::Freeze,
+            0,
+        )?;
+        if let Err(error) = cgroup::write_freeze_state(path, cgroup::FreezeState::Frozen) {
+            if let Err(cleanup_error) = binder::set_binder_freeze(
+                binder_path,
+                binder_pid,
+                binder::BinderFreezeRequest::Unfreeze,
+                0,
+            ) {
+                return Err(DaemonError::system(format!(
+                    "cgroup freeze failed: {error}; binder rollback failed: {cleanup_error}"
+                )));
+            }
+            return Err(error);
+        }
+        Ok(())
     } else {
         signal::send_signal(process.pid, signal::SignalAction::Stop)
     }
@@ -110,7 +150,18 @@ fn freeze_process(process: &crate::domain::runtime::RuntimeProcess) -> Result<()
 
 fn unfreeze_process(process: &crate::domain::runtime::RuntimeProcess) -> Result<(), DaemonError> {
     if let Some(path) = &process.cgroup_freeze_path {
-        cgroup::write_freeze_state(path, cgroup::FreezeState::Thawed)
+        let binder_pid = u32::try_from(process.pid)
+            .map_err(|_| DaemonError::system(format!("invalid binder pid {}", process.pid)))?;
+        cgroup::write_freeze_state(path, cgroup::FreezeState::Thawed)?;
+        let binder_path = binder::discover_binder_device()
+            .ok_or_else(|| DaemonError::system("binder device disappeared before unfreeze"))?;
+        binder::set_binder_freeze(
+            binder_path,
+            binder_pid,
+            binder::BinderFreezeRequest::Unfreeze,
+            0,
+        )?;
+        Ok(())
     } else {
         signal::send_signal(process.pid, signal::SignalAction::Continue)
     }
@@ -133,16 +184,7 @@ fn refresh_hook_health(state: &mut ReadOnlyState) {
             state.xp_log = format!("hook bridge {}", status.health_label());
         }
     }
-    state.health_report_json = format!(
-        "{{\"status\":\"{}\",\"daemonReady\":true,\"hookHealth\":\"{}\"}}",
-        if state.hook_health == "active" {
-            "active"
-        } else {
-            "degraded"
-        },
-        state.hook_health
-    );
-    state.self_check_json = format!("{{\"controlAllowed\":{}}}", state.hook_health == "active");
+    refresh_runtime_diagnostics(state);
 }
 
 pub fn run_manager_server_forever(state: ReadOnlyState) -> Result<(), DaemonError> {

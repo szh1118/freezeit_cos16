@@ -2,7 +2,7 @@
 set -eu
 
 SERIAL="${1:-}"
-OUT="${2:-freezeitVS/magisk/rom_baseline.prop}"
+OUT="${2:-magisk/rom_baseline.prop}"
 ADB="${ADB:-adb}"
 
 if [ -n "$SERIAL" ]; then

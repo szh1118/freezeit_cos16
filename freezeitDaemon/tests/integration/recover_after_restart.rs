@@ -17,6 +17,7 @@ fn restart_recovery_records_current_process_state_before_new_control() {
         control_state: ControlState::Frozen,
         cgroup_freeze_path: None,
         binder_state: None,
+        start_time_ticks: Some(1),
         last_seen_at_ms: 900,
     }];
 

@@ -127,6 +127,7 @@ public class Enum {
         public final static String restoreWhiteListAppsIfQuitForceIdle = "restoreWhiteListAppsIfQuitForceIdle";
         public final static String initialize = "initialize";
         public final static String oplusExternalClear = "a";
+        public final static String oplusForceStopOrKill = "e";
         public final static String oplusForceStop = "b";
         public final static String oplusForceStopWithFlag = "c";
         public final static String oplusKill = "e";

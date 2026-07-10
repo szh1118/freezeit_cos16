@@ -1,0 +1,4 @@
+# model sdk
+CPH2653 sdk=36
+PJZ110 sdk=36
+PLK110 sdk=36

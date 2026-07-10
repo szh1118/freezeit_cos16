@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::Path,
     sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
@@ -110,9 +111,12 @@ pub struct ReadOnlyState {
     pub operation_log_json: String,
     pub operation_log_text: String,
     pub self_check_json: String,
+    pub control_allowed: bool,
+    pub verified_targets: Vec<(String, u32)>,
     pub hook_config_synced: bool,
     pub settings_path: Option<String>,
     pub app_config_path: Option<String>,
+    pub app_label_path: Option<String>,
     pub uid_time_path: String,
     pub uid_time_totals: BTreeMap<u32, i32>,
 }
@@ -144,9 +148,12 @@ impl Default for ReadOnlyState {
             operation_log_json: "{\"operations\":[]}".to_owned(),
             operation_log_text: String::new(),
             self_check_json: "{\"controlAllowed\":false}".to_owned(),
+            control_allowed: false,
+            verified_targets: Vec::new(),
             hook_config_synced: false,
             settings_path: None,
             app_config_path: None,
+            app_label_path: None,
             uid_time_path: "/proc/uid_cputime/show_uid_stat".to_owned(),
             uid_time_totals: BTreeMap::new(),
         }
@@ -221,7 +228,11 @@ pub fn handle_read_only_command(
         ManagerCommand::GetXpLog => Ok(state.xp_log.as_bytes().to_vec()),
         ManagerCommand::GetAppCfg => Ok(encode_app_config_for_manager(&state.app_config)),
         ManagerCommand::GetUidTime => Ok(Vec::new()),
-        ManagerCommand::SetAppCfg => Ok(b"success".to_vec()),
+        ManagerCommand::SetAppCfg
+        | ManagerCommand::SetAppLabel
+        | ManagerCommand::SetSettingsVar => Err(DaemonError::protocol(
+            "write command requires mutable manager state",
+        )),
         ManagerCommand::GetHealthReport => Ok(state.health_report_json.as_bytes().to_vec()),
         ManagerCommand::GetCapabilityReport => Ok(state.capability_report_json.as_bytes().to_vec()),
         ManagerCommand::GetCompatibilityBaseline => {
@@ -238,28 +249,49 @@ pub fn handle_read_only_command(
 pub fn handle_manager_command(
     frame: &ManagerFrame,
     state: &mut ReadOnlyState,
-    set_app_config: impl FnOnce(&[u8]) -> Result<bool, DaemonError>,
+    mut set_app_config: impl FnMut(&[u8]) -> Result<bool, DaemonError>,
 ) -> Result<Vec<u8>, DaemonError> {
     match frame.command {
         ManagerCommand::SetAppCfg => {
             let xposed_payload = encode_xposed_config_payload(&state.settings, &frame.payload)?;
             let previous_records = state.app_config.clone();
-            if set_app_config(&xposed_payload)? {
-                let records = decode_app_config(&frame.payload)?;
-                persist_app_config(state, &records)?;
-                if let Some(message) = format_config_change_log(&previous_records, &records) {
-                    append_legacy_log_message(state, &message);
+            let previous_xposed_payload = encode_xposed_config_payload(
+                &state.settings,
+                &encode_app_config(&previous_records),
+            )?;
+            let records = decode_app_config(&frame.payload)?;
+            let previous_file = read_existing_file(state.app_config_path.as_deref())?;
+            persist_app_config(state, &records)?;
+            match set_app_config(&xposed_payload) {
+                Ok(true) => {
+                    if let Some(message) = format_config_change_log(&previous_records, &records) {
+                        append_legacy_log_message(state, &message);
+                    }
+                    state.app_config = records;
+                    state.hook_config_synced = true;
+                    Ok(b"success".to_vec())
                 }
-                state.app_config = records;
-                state.hook_config_synced = true;
-                Ok(b"success".to_vec())
-            } else {
-                append_legacy_log_message(state, "配置更新失败：Xposed拒绝新的应用配置");
-                Ok(b"failure".to_vec())
+                Ok(false) => {
+                    restore_file(state.app_config_path.as_deref(), previous_file.as_deref())?;
+                    let _ = set_app_config(&previous_xposed_payload);
+                    state.hook_config_synced = false;
+                    append_legacy_log_message(state, "配置更新失败：Xposed拒绝新的应用配置");
+                    Ok(b"failure".to_vec())
+                }
+                Err(error) => {
+                    restore_file(state.app_config_path.as_deref(), previous_file.as_deref())?;
+                    let _ = set_app_config(&previous_xposed_payload);
+                    state.hook_config_synced = false;
+                    Err(error)
+                }
             }
         }
         ManagerCommand::SetAppLabel => {
             let labels = decode_app_label_payload(&frame.payload);
+            let path = state.app_label_path.as_ref().ok_or_else(|| {
+                DaemonError::config("app label persistence path is not configured")
+            })?;
+            atomic_write(path, &frame.payload)?;
             append_legacy_log_message(state, &format_label_update_log(&labels));
             Ok(b"success".to_vec())
         }
@@ -484,10 +516,13 @@ fn set_settings_var(state: &mut ReadOnlyState, payload: &[u8]) -> Result<Vec<u8>
         state.settings = normalize_settings(Some(state.settings.clone()));
     }
     state.settings[idx] = val;
-    if let Some(path) = &state.settings_path {
-        if let Err(error) = fs::write(path, &state.settings) {
-            return Ok(format!("写入设置文件失败, [{idx}]:{val}: {error}").into_bytes());
-        }
+    let Some(path) = &state.settings_path else {
+        return Ok(
+            format!("写入设置文件失败, [{idx}]:{val}: persistence path missing").into_bytes(),
+        );
+    };
+    if let Err(error) = fs::write(path, &state.settings) {
+        return Ok(format!("写入设置文件失败, [{idx}]:{val}: {error}").into_bytes());
     }
 
     Ok(b"success".to_vec())
@@ -498,7 +533,9 @@ fn persist_app_config(
     records: &[ManagerAppConfigRecord],
 ) -> Result<(), DaemonError> {
     let Some(path) = &state.app_config_path else {
-        return Ok(());
+        return Err(DaemonError::config(
+            "app config persistence path is not configured",
+        ));
     };
     let text = records
         .iter()
@@ -514,14 +551,60 @@ fn persist_app_config(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    fs::write(
-        path,
-        if text.is_empty() {
-            text
-        } else {
-            format!("{text}\n")
+    let payload = if text.is_empty() {
+        text
+    } else {
+        format!("{text}\n")
+    };
+    atomic_write(path, payload.as_bytes())?;
+    Ok(())
+}
+
+fn read_existing_file(path: Option<&str>) -> Result<Option<Vec<u8>>, DaemonError> {
+    let path = path.ok_or_else(|| DaemonError::config("persistence path is not configured"))?;
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn restore_file(path: Option<&str>, previous: Option<&[u8]>) -> Result<(), DaemonError> {
+    let path = path.ok_or_else(|| DaemonError::config("persistence path is not configured"))?;
+    match previous {
+        Some(bytes) => atomic_write(path, bytes),
+        None => match fs::remove_file(path) {
+            Ok(()) => sync_parent(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
         },
-    )?;
+    }
+}
+
+fn atomic_write(path: impl AsRef<Path>, payload: &[u8]) -> Result<(), DaemonError> {
+    let path = path.as_ref();
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| DaemonError::config("persistence path has no valid file name"))?;
+    let temp_path = path.with_file_name(format!(".{file_name}.tmp"));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temp_path)?;
+    file.write_all(payload)?;
+    file.sync_all()?;
+    fs::rename(&temp_path, path)?;
+    sync_parent(path)
+}
+
+fn sync_parent(path: impl AsRef<Path>) -> Result<(), DaemonError> {
+    let parent = path
+        .as_ref()
+        .parent()
+        .ok_or_else(|| DaemonError::config("persistence path has no parent directory"))?;
+    OpenOptions::new().read(true).open(parent)?.sync_all()?;
     Ok(())
 }
 

@@ -11,42 +11,86 @@ public class LegacyXposedBackend implements XpUtils.HookBackend {
     @Override
     public boolean hookMethod(String TAG, ClassLoader classLoader, XpUtils.MethodHook callback,
                               String className, String methodName, Object... parameterTypes) {
-        Class<?> clazz = XposedHelpers.findClassIfExists(className, classLoader);
-        if (clazz == null) {
+        String hookId = hookId(className, methodName, parameterTypes);
+        Class<?> clazz;
+        try {
+            clazz = XposedHelpers.findClass(className, classLoader);
+            HookHealthRegistry.recordClassResolved(hookId);
+        } catch (Throwable error) {
+            HookHealthRegistry.recordClassResolutionFailure(hookId, error);
             XpUtils.log(TAG, "Cannot hookMethod: " + methodName + ", cannot find " + className);
             return false;
         }
-        Method method = XposedHelpers.findMethodExactIfExists(clazz, methodName, parameterTypes);
+        Method method;
+        try {
+            method = XposedHelpers.findMethodExactIfExists(clazz, methodName, parameterTypes);
+        } catch (Throwable error) {
+            HookHealthRegistry.recordMethodMatchFailure(hookId, error);
+            XpUtils.log(TAG, "Cannot hookMethod: " + methodName + " (" + error + ")");
+            return false;
+        }
         if (method == null) {
+            HookHealthRegistry.recordMethodMatchFailure(hookId,
+                    new NoSuchMethodException(className + "#" + methodName));
             XpUtils.log(TAG, "Cannot hookMethod: " + methodName);
             return false;
         }
-        XposedBridge.hookMethod(method, adapt(callback));
-        XpUtils.log(TAG, "Success hookMethod: " + methodName);
-        return true;
+        HookHealthRegistry.recordMethodMatched(hookId);
+        try {
+            XposedBridge.hookMethod(method, adapt(callback, hookId));
+            HookHealthRegistry.recordRegistered(hookId);
+            XpUtils.log(TAG, "Success hookMethod: " + methodName);
+            return true;
+        } catch (Throwable error) {
+            HookHealthRegistry.recordRegistrationFailure(hookId, error);
+            XpUtils.log(TAG, "Cannot register hookMethod: " + hookId + " (" + error + ")");
+            return false;
+        }
     }
 
     @Override
     public void hookConstructor(String TAG, ClassLoader classLoader, XpUtils.MethodHook callback,
                                 String className, Object... parameterTypes) {
-        Class<?> clazz = XposedHelpers.findClassIfExists(className, classLoader);
-        if (clazz == null) {
+        String hookId = hookId(className, "<init>", parameterTypes);
+        Class<?> clazz;
+        try {
+            clazz = XposedHelpers.findClass(className, classLoader);
+            HookHealthRegistry.recordClassResolved(hookId);
+        } catch (Throwable error) {
+            HookHealthRegistry.recordClassResolutionFailure(hookId, error);
             XpUtils.log(TAG, "Cannot hookConstructor, cannot find " + className);
             return;
         }
-        Constructor<?> constructor = XposedHelpers.findConstructorExact(clazz, parameterTypes);
+        Constructor<?> constructor;
+        try {
+            constructor = XposedHelpers.findConstructorExactIfExists(clazz, parameterTypes);
+        } catch (Throwable error) {
+            HookHealthRegistry.recordMethodMatchFailure(hookId, error);
+            XpUtils.log(TAG, "Cannot hookConstructor: " + className + " (" + error + ")");
+            return;
+        }
         if (constructor == null) {
+            HookHealthRegistry.recordMethodMatchFailure(hookId,
+                    new NoSuchMethodException(className + "#<init>"));
             XpUtils.log(TAG, "Cannot hookConstructor: " + className);
             return;
         }
-        XposedBridge.hookMethod(constructor, adapt(callback));
-        XpUtils.log(TAG, "Success hookConstructor: " + className);
+        HookHealthRegistry.recordMethodMatched(hookId);
+        try {
+            XposedBridge.hookMethod(constructor, adapt(callback, hookId));
+            HookHealthRegistry.recordRegistered(hookId);
+            XpUtils.log(TAG, "Success hookConstructor: " + className);
+        } catch (Throwable error) {
+            HookHealthRegistry.recordRegistrationFailure(hookId, error);
+            XpUtils.log(TAG, "Cannot register hookConstructor: " + hookId + " (" + error + ")");
+        }
     }
 
-    private XC_MethodHook adapt(final XpUtils.MethodHook callback) {
+    private XC_MethodHook adapt(final XpUtils.MethodHook callback, final String hookId) {
         return new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                HookHealthRegistry.recordRuntimeInvocation(hookId);
                 XpUtils.MethodHookParam freezeitParam =
                         new XpUtils.MethodHookParam(param.thisObject, param.args);
                 callback.beforeHookedMethod(freezeitParam);
@@ -74,5 +118,16 @@ public class LegacyXposedBackend implements XpUtils.HookBackend {
                 }
             }
         };
+    }
+
+    private static String hookId(String className, String methodName, Object[] parameterTypes) {
+        StringBuilder builder = new StringBuilder(className).append('#').append(methodName).append('(');
+        for (int index = 0; index < parameterTypes.length; index++) {
+            if (index > 0) builder.append(',');
+            Object parameterType = parameterTypes[index];
+            builder.append(parameterType instanceof Class
+                    ? ((Class<?>) parameterType).getName() : String.valueOf(parameterType));
+        }
+        return builder.append(')').toString();
     }
 }

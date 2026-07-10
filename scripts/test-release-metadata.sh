@@ -1,53 +1,61 @@
-#!/usr/bin/env sh
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
 
-repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-version="3.2.8SelfUse"
-version_code="302008"
-release_zip="freezeit_oneplus13_android16_selfuse_v${version}_${version_code}.zip"
-repo_url="https://github.com/szh1118/freezeit_cos16"
-raw_url="https://raw.githubusercontent.com/szh1118/freezeit_cos16/main"
-mirror_raw_url="https://mirror.ghproxy.com/${raw_url}"
-author="JARK006 / @szh1118"
+root="$(cd "$(dirname "$0")/.." && pwd)"
+update_json="${UPDATE_JSON:-$root/freezeitRelease/update.json}"
+release_dir="${RELEASE_DIR:-$root/freezeitRelease}"
+mode="${1:-planned}"
+planned_version="${2:-3.3.0SelfUse}"
+planned_code="${3:-303000}"
+
+fail() { echo "release metadata test failed: $*" >&2; exit 1; }
+[[ "$mode" == planned || "$mode" == released ]] || fail "mode must be planned or released"
+[[ "$planned_version" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$ ]] || fail "invalid version"
+[[ "$planned_code" =~ ^[0-9]{1,10}$ ]] || fail "invalid versionCode"
 
 require_text() {
-    file="$1"
-    text="$2"
-    if ! grep -F "$text" "$repo_root/$file" >/dev/null; then
-        echo "missing expected text in $file: $text" >&2
-        exit 1
-    fi
+  grep -F "$2" "$root/$1" >/dev/null || fail "missing expected text in $1: $2"
 }
 
-require_text freezeitApp/app/build.gradle "versionCode ${version_code}"
-require_text freezeitApp/app/build.gradle "versionName \"${version}\""
+require_text magisk/module.prop "version=$planned_version"
+require_text magisk/module.prop "versionCode=$planned_code"
+require_text README.md "Planned module version: \`$planned_version\` / versionCode \`$planned_code\`"
+require_text freezeitRelease/README.md "planned version \`$planned_version\` / \`$planned_code\`"
+require_text README.md 'GPL-3.0-or-later'
+require_text freezeitRelease/README.md 'GPL-3.0-or-later'
 
-require_text freezeitVS/magisk/module.prop "version=${version}"
-require_text freezeitVS/magisk/module.prop "versionCode=${version_code}"
-require_text freezeitVS/magisk/module.prop "author=${author}"
-require_text freezeitVS/src/main.cpp "By ${author}"
+mapfile -t published < <(python3 - "$update_json" <<'PY'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        data = json.load(stream)
+except (OSError, json.JSONDecodeError) as error:
+    raise SystemExit(f"invalid update metadata JSON: {error}")
+for key in ("version", "versionCode", "zipUrl", "changelog"):
+    if key not in data:
+        raise SystemExit(f"missing update metadata key: {key}")
+print(data["version"])
+print(data["versionCode"])
+print(data["zipUrl"])
+print(data.get("zipSha256", ""))
+PY
+)
+[[ ${#published[@]} -eq 4 ]] || fail "cannot parse update metadata"
 
-require_text freezeitRelease/update.json "\"version\": \"${version}\""
-require_text freezeitRelease/update.json "\"versionCode\": ${version_code}"
-require_text freezeitRelease/update.json "${mirror_raw_url}/freezeitRelease/${release_zip}"
-require_text freezeitRelease/update.json "${mirror_raw_url}/freezeitRelease/changelog.txt"
+if [[ "$mode" == planned ]]; then
+  [[ "${published[0]}" != "$planned_version" || "${published[1]}" != "$planned_code" ]] \
+    || fail "planned version must not be advertised before artifact validation"
+else
+  [[ "${published[0]}" == "$planned_version" ]] || fail "released version mismatch"
+  [[ "${published[1]}" == "$planned_code" ]] || fail "released versionCode mismatch"
+  expected_zip="freezeit_oneplus13_android16_selfuse_v${planned_version}_${planned_code}.zip"
+  [[ "${published[2]}" == *"/$expected_zip" ]] || fail "released zipUrl does not match version"
+  local_zip="$release_dir/$expected_zip"
+  [[ -f "$local_zip" ]] || fail "released metadata requires local ZIP: $local_zip"
+  "$root/scripts/validate-release-zip.sh" "$local_zip" "$planned_version" "$planned_code" >/dev/null
+  actual_sha="$(sha256sum "$local_zip" | awk '{print $1}')"
+  [[ "${published[3]}" == "$actual_sha" ]] || fail "released zipSha256 mismatch"
+fi
 
-require_text freezeitApp/app/src/main/res/values/strings.xml "<string name=\"github_link\" translatable=\"false\">https://github.com/szh1118</string>"
-require_text freezeitApp/app/src/main/res/values/strings.xml "<string name=\"github_project_link\" translatable=\"false\">${repo_url}</string>"
-require_text freezeitApp/app/src/main/res/values/strings.xml "<string name=\"github_app_link\" translatable=\"false\">${repo_url}/tree/main/freezeitApp</string>"
-require_text freezeitApp/app/src/main/res/values/strings.xml "<string name=\"developer\">Developer ${author}</string>"
-require_text freezeitApp/app/src/main/res/values/strings.xml "https://github.com/szh1118/freezeit_cos16/issues"
-
-require_text freezeitApp/app/src/main/res/values-zh/strings.xml "<string name=\"developer\">开发者 ${author}</string>"
-require_text freezeitApp/app/src/main/res/values-zh/strings.xml "${mirror_raw_url}/freezeitRelease/update.json"
-require_text freezeitApp/app/src/main/res/values-zh/strings.xml "${mirror_raw_url}/freezeitRelease/changelogFull.txt"
-
-require_text README.md "Module version: \`${version}\` / versionCode \`${version_code}\`"
-require_text README.md "freezeitRelease/${release_zip}"
-require_text README.md "## ${version} Changes"
-
-require_text freezeitRelease/README.md "freezeitRelease/${release_zip}"
-require_text freezeitRelease/README.md "\`${version}\` is a background runtime-control build"
-require_text freezeitRelease/changelog.txt "### v${version} validation notes 2026-07-08"
-require_text freezeitRelease/changelogFull.txt "### v${version} 更新日志 2026-07-08"
-require_text freezeitVS/changelog.txt "### v${version} validation notes 2026-07-08"
+echo "release metadata $mode: pass"

@@ -47,6 +47,20 @@ impl Default for BackendEnvironment {
     }
 }
 
+impl BackendEnvironment {
+    pub fn detect() -> Self {
+        Self {
+            cgroup_available: std::path::Path::new("/sys/fs/cgroup").exists(),
+            binder_available: binder::detect_binder_freezer_capability().status
+                == CapabilityStatus::Available,
+            network_available: false,
+            wakelock_available: false,
+            screen_state_available: false,
+            hook_fresh: false,
+        }
+    }
+}
+
 pub struct SystemAwareCgroupBinderBackend {
     environment: BackendEnvironment,
 }
@@ -92,6 +106,11 @@ impl SystemAwareCgroupBinderBackend {
                 binder_capability.status,
                 binder_capability.evidence,
                 binder_risk,
+            ),
+            capability(
+                CapabilityName::SignalControl,
+                true,
+                "kill(2) SIGSTOP/SIGCONT fallback backend",
             ),
             capability(
                 CapabilityName::NetworkBreak,
@@ -152,10 +171,14 @@ impl SystemAwareCgroupBinderBackend {
             };
         }
 
-        if self.environment.cgroup_available && self.environment.binder_available {
+        if self.environment.cgroup_available {
             return FreezeDecision {
                 action: DecisionAction::Freeze,
-                reason: "cgroup and binder freezer available".to_owned(),
+                reason: if self.environment.binder_available {
+                    "cgroup and binder freezer available".to_owned()
+                } else {
+                    "cgroup freezer available; binder freezer unavailable".to_owned()
+                },
             };
         }
 

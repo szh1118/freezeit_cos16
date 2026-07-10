@@ -31,6 +31,13 @@ freezeitRelease/*.tar.gz
 # Magisk package staging binaries are produced by build scripts.
 freezeitVS/magisk/freezeit*
 freezeitVS/.gitignore.legacy-source
+magisk/freezeit
+magisk/*.apk
+magisk/SHA256SUMS
+magisk/provenance.txt
+
+# Temporary release staging is always disposable.
+.release-staging/
 
 # codebase-memory source artifact is tracked, but raw DBs are local.
 .codebase-memory/*.db

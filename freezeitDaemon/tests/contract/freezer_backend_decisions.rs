@@ -136,6 +136,7 @@ fn process() -> RuntimeProcess {
         control_state: ControlState::Running,
         cgroup_freeze_path: None,
         binder_state: None,
+        start_time_ticks: Some(1),
         last_seen_at_ms: 0,
     }
 }

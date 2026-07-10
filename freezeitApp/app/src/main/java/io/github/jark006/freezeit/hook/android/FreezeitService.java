@@ -20,6 +20,8 @@ import io.github.jark006.freezeit.Utils;
 import io.github.jark006.freezeit.hook.Config;
 import io.github.jark006.freezeit.hook.Enum;
 import io.github.jark006.freezeit.hook.XpUtils;
+import io.github.jark006.freezeit.hook.HookHealthRegistry;
+import io.github.jark006.freezeit.hook.ScopedHealthReport;
 import io.github.jark006.freezeit.hook.XpUtils.MethodHook;
 import io.github.jark006.freezeit.hook.XpUtils.MethodHookParam;
 
@@ -358,16 +360,8 @@ public class FreezeitService {
             boolean wakeLockReady = setUidModeMethod != null && appOpsService != null;
             boolean networkReady = mNetdService != null && UidRangeParcelClazz != null;
             boolean configReady = config != null && config.isCurProcStateInitialized();
-            String status = systemServerReady && configReady ? "active" : "degraded";
-
-            String json = "{"
-                    + "\"status\":\"" + status + "\","
-                    + "\"system_server_ready\":" + systemServerReady + ","
-                    + "\"config_ready\":" + configReady + ","
-                    + "\"screen_ready\":" + screenReady + ","
-                    + "\"wakelock_ready\":" + wakeLockReady + ","
-                    + "\"network_ready\":" + networkReady
-                    + "}";
+            String json = ScopedHealthReport.systemServer(systemServerReady, configReady,
+                    screenReady, wakeLockReady, networkReady, HookHealthRegistry.toJson());
 
             os.write(json.getBytes());
             os.close();

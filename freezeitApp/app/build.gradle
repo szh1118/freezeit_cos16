@@ -34,8 +34,8 @@ android {
         applicationId "io.github.jark006.freezeit"
         minSdk 31
         targetSdk 34
-        versionCode 302008
-        versionName "3.2.8SelfUse"
+        versionCode 303000
+        versionName "3.3.0SelfUse"
 
         resValue "string", "versionName", "${versionName}"
         signingConfig signingConfigs.release
@@ -86,4 +86,6 @@ dependencies {
     implementation 'androidx.recyclerview:recyclerview:1.3.2'
     implementation 'androidx.swiperefreshlayout:swiperefreshlayout:1.1.0'
     implementation 'com.google.android.material:material:1.11.0'
+
+    testImplementation 'junit:junit:4.13.2'
 }

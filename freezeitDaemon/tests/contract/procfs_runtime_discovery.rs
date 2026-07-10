@@ -3,6 +3,7 @@ use std::{fs, os::unix::fs::PermissionsExt};
 use freezeit_daemon::sys::procfs::{
     discover_managed_uid_processes_with_cgroup_roots, discover_package_processes,
     discover_uid_processes_with_cgroup_root, discover_uid_processes_with_cgroup_roots,
+    recheck_process_identity,
 };
 
 #[test]
@@ -145,6 +146,25 @@ fn discovers_multiple_managed_uid_processes_with_one_procfs_scan() {
     assert!(!processes.contains_key(&10_789));
 }
 
+#[test]
+fn process_identity_recheck_requires_uid_cmdline_package_and_start_time() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let proc_root = temp.path().join("proc");
+    write_proc_entry(&proc_root, 123, 10_123, "com.example.app:remote");
+    let process = discover_package_processes(&proc_root, "com.example.app", 10_123)
+        .expect("discover")
+        .remove(0);
+
+    assert!(recheck_process_identity(&proc_root, &process).expect("identity matches"));
+
+    fs::write(proc_root.join("123/cmdline"), "com.other.shared\0").expect("replace cmdline");
+    assert!(!recheck_process_identity(&proc_root, &process).expect("cmdline mismatch"));
+
+    fs::write(proc_root.join("123/cmdline"), "com.example.app:remote\0").expect("restore cmdline");
+    write_stat(&proc_root.join("123/stat"), 9999);
+    assert!(!recheck_process_identity(&proc_root, &process).expect("start time mismatch"));
+}
+
 fn write_proc_entry(proc_root: &std::path::Path, pid: i32, uid: u32, cmdline: &str) {
     let pid_dir = proc_root.join(pid.to_string());
     fs::create_dir_all(&pid_dir).expect("pid dir");
@@ -154,4 +174,13 @@ fn write_proc_entry(proc_root: &std::path::Path, pid: i32, uid: u32, cmdline: &s
     )
     .expect("status");
     fs::write(pid_dir.join("cmdline"), format!("{cmdline}\0")).expect("cmdline");
+    write_stat(&pid_dir.join("stat"), 4242);
+}
+
+fn write_stat(path: &std::path::Path, start_time: u64) {
+    let mut fields = vec!["0"; 20];
+    fields[0] = "S";
+    let start_time = start_time.to_string();
+    fields[19] = &start_time;
+    fs::write(path, format!("123 (example worker) {}\n", fields.join(" "))).expect("stat");
 }

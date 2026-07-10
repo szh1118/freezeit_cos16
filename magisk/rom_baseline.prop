@@ -1,0 +1,9 @@
+rom.android.version=16
+rom.sdk=36
+rom.product=CPH2653
+rom.device=OP5D55L1
+rom.build.id=BP2A.250605.015
+rom.build.incremental=V.R4T3.1338e95_e24685_de185d
+rom.build.fingerprint=OnePlus/CPH2653EEA/OP5D55L1:16/BP2A.250605.015/V.R4T3.1338e95_e24685_de185d:user/release-keys
+rom.security_patch=2025-12-01
+rom.version_name=CPH2653_16.0.2.402(EX01)

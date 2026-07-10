@@ -1,6 +1,6 @@
 use crate::{
     app::{
-        compatibility::CompatibilityBaseline,
+        compatibility::RuntimeEnvironment,
         health::{HealthStatus, ModuleHealth},
         operation_log::OperationLog,
     },
@@ -59,8 +59,9 @@ pub fn operation_log_json(log: &OperationLog) -> String {
 pub fn self_check_json(health: &ModuleHealth, capabilities: &[ControlCapability]) -> String {
     let control_allowed = health.is_safe_for_control()
         && capabilities.iter().all(|capability| {
-            capability.status == CapabilityStatus::Available
-                && capability.risk_level != RiskLevel::Disabled
+            capability.name != CapabilityName::CgroupV2Freezer
+                || (capability.status == CapabilityStatus::Available
+                    && capability.risk_level != RiskLevel::Disabled)
         });
     format!(
         "{{\"controlAllowed\":{},\"health\":{},\"capabilities\":{}}}",
@@ -71,10 +72,10 @@ pub fn self_check_json(health: &ModuleHealth, capabilities: &[ControlCapability]
 }
 
 pub fn compatibility_report_json(
-    baseline: &CompatibilityBaseline,
+    environment: &RuntimeEnvironment,
     capabilities: &[ControlCapability],
 ) -> String {
-    baseline.compatibility_json(capabilities)
+    environment.compatibility_json(capabilities)
 }
 
 fn health_status_name(status: HealthStatus) -> &'static str {

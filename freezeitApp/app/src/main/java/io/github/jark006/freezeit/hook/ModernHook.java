@@ -13,17 +13,21 @@ public class ModernHook extends XposedModule {
                 && !Enum.Package.oplusAthena.equals(packageName)) {
             return;
         }
+        HookHealthRegistry.beginScope("package:" + packageName, packageName);
         ModernXposedBackend backend = new ModernXposedBackend(this);
         XpUtils.setHookBackend(backend);
         backend.logFramework("Freezeit modern package hook: " + packageName);
         FreezeitHookEntry.handlePackage(packageName, param.getClassLoader());
+        backend.logFramework("Freezeit hook health: " + HookHealthRegistry.toJson());
     }
 
     @Override
     public void onSystemServerStarting(@NonNull SystemServerStartingParam param) {
+        HookHealthRegistry.beginScope("system_server", "system_server");
         ModernXposedBackend backend = new ModernXposedBackend(this);
         XpUtils.setHookBackend(backend);
         backend.logFramework("Freezeit modern system_server hook");
         FreezeitHookEntry.hookAndroid(param.getClassLoader());
+        backend.logFramework("Freezeit hook health: " + HookHealthRegistry.toJson());
     }
 }

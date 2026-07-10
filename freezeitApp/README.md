@@ -10,7 +10,8 @@
 
 ### 相关链接
 
-1. [项目开源地址](https://github.com/jark006/freezeitVS)
+1. [当前维护仓库](https://github.com/szh1118/freezeit_cos16)
+2. [原始项目](https://github.com/jark006/freezeitVS)
 
 1. [管理器开源地址](https://github.com/jark006/freezeitapp)
 

@@ -1,0 +1,8 @@
+### v3.3.0SelfUse planned release structure
+
+- Use the top-level `magisk/` directory as a source-only module template.
+- Package exactly one Rust `aarch64-linux-android` daemon as `freezeit`.
+- Reject x64 and legacy C++ daemon payload names.
+- Build and package through disposable staging with version, ELF, SHA256, and
+  provenance validation.
+- Do not publish update metadata until the final archive validates.

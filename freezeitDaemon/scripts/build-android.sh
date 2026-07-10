@@ -37,5 +37,21 @@ fi
 if command -v cargo-ndk >/dev/null 2>&1; then
     cargo ndk --target arm64-v8a --platform 31 build --release
 else
+    if [ -z "${ANDROID_NDK_HOME:-}" ]; then
+        echo "ANDROID_NDK_HOME is required when cargo-ndk is unavailable" >&2
+        exit 1
+    fi
+    NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+    ANDROID_LINKER="$NDK_BIN/aarch64-linux-android31-clang"
+    if [ ! -x "$ANDROID_LINKER" ]; then
+        echo "Android linker not found: $ANDROID_LINKER" >&2
+        exit 1
+    fi
+    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ANDROID_LINKER"
+    CC_aarch64_linux_android="$ANDROID_LINKER"
+    AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
+    export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER
+    export CC_aarch64_linux_android
+    export AR_aarch64_linux_android
     cargo build --release --target aarch64-linux-android
 fi
