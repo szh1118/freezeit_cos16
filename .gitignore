@@ -1,5 +1,9 @@
-# Local agent/editor state
+# 本地代理、编辑器与规格工具状态
 .codex/
+.codebase-memory/
+.specify/
+specs/
+AGENTS.md
 
 # Build outputs
 **/target/
@@ -18,10 +22,8 @@ local.properties
 *.jks
 *key_about*.txt
 
-# Generated/reverse-engineering workspaces
+# 生成文件与逆向工作区
 apktool_mcp_server_workspace/
-specs/**/validation/rom-extract/
-specs/**/validation/tmp/
 
 # Release artifacts: keep source, scripts, metadata, and any already tracked
 # release archive from the remote baseline; do not auto-add newly generated zips.
@@ -31,6 +33,7 @@ freezeitRelease/*.tar.gz
 # Magisk package staging binaries are produced by build scripts.
 freezeitVS/magisk/freezeit*
 freezeitVS/.gitignore.legacy-source
+freezeitVS/
 magisk/freezeit
 magisk/*.apk
 magisk/SHA256SUMS
@@ -38,7 +41,3 @@ magisk/provenance.txt
 
 # Temporary release staging is always disposable.
 .release-staging/
-
-# codebase-memory source artifact is tracked, but raw DBs are local.
-.codebase-memory/*.db
-.codebase-memory/*.db-*

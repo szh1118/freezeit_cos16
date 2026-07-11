@@ -1,36 +1,32 @@
-# Freezeit CPH2653 Android 16 Self-Use
+# Freezeit CPH2653 Android 16 自用版
 
-This workspace maintains a device-scoped Freezeit build for the recorded
-OnePlus/ColorOS Android 16 baseline. It is not a generic Android release.
+本仓库维护面向 OnePlus 13（CPH2653）与 ColorOS/OxygenOS Android 16 的 Freezeit 自用版本，不是通用 Android 发行版。运行时会检查实际系统能力；未经验证的环境默认谨慎降级，而不是仅凭机型字符串宣称兼容。
 
-## Release Model
+## 当前版本
 
-- Current module version: `3.3.1SelfUse` / versionCode `303001`.
-- Published metadata in `freezeitRelease/update.json` points to the validated
-  `v3.3.1SelfUse` Rust-only hotfix archive.
-- New releases are Rust-only and ARM64-only. The package contains exactly one
-  daemon named `freezeit`, built from `freezeitDaemon/` for
-  `aarch64-linux-android`.
-- `freezeitARM64`, `freezeitX64`, `freezeitRustARM64`, and `freezeitRustX64`
-  payloads are rejected. There is no C++ or x64 fallback.
-- The source template is `magisk/`; it must not contain binaries or APKs.
-- The active tree contains no legacy C++ daemon or legacy native build chain.
+- 模块版本：`3.3.1SelfUse`，版本号：`303001`。
+- `freezeitRelease/update.json` 指向已验证的 `v3.3.1SelfUse` Rust-only 修复包。
+- 新版本仅支持 ARM64，且只包含一个由 `freezeitDaemon/` 为 `aarch64-linux-android` 构建的 Rust 守护进程 `freezeit`。
+- 不提供 C++、x64 或旧守护进程回退。
+- Magisk 源模板位于 `magisk/`，仓库中的模板不保存 daemon、APK 等构建产物。
 
-## Build And Package
+`3.3.1SelfUse` 修复了 signal fallback 冻结应用后，前台恢复流程未发送 `SIGCONT` 的问题。
 
-Run the unified release entry point:
+## 构建与打包
+
+统一发布入口：
 
 ```sh
 scripts/build-release.sh
 ```
 
-It builds the Rust ARM64 daemon and release APK, verifies both use
-`3.3.1SelfUse` / `303001`, and delegates to `scripts/package-release.sh`.
-Packaging happens in disposable `.release-staging/` storage and emits
-`freezeitRelease/freezeit_oneplus13_android16_selfuse_v3.3.1SelfUse_303001.zip`.
+脚本会构建 ARM64 Rust 守护进程与正式版 Manager，核对二者版本，随后调用 `scripts/package-release.sh`。打包在临时的 `.release-staging/` 中进行，输出：
 
-For prebuilt artifacts, set `DAEMON`, `APK`, and the matching Gradle
-`output-metadata.json` explicitly:
+```text
+freezeitRelease/freezeit_oneplus13_android16_selfuse_v3.3.1SelfUse_303001.zip
+```
+
+也可以显式提供已构建并核验的文件：
 
 ```sh
 DAEMON=/path/to/aarch64/freezeit \
@@ -39,19 +35,17 @@ APK_METADATA=/path/to/output-metadata.json \
 scripts/package-release.sh
 ```
 
-The packager and validator enforce version consistency, one daemon, one APK,
-AArch64 ELF identity, complete payload SHA256 checks, safe ZIP paths, and
-`provenance.txt` source records. Every archive includes `LICENSE` and an exact
-commit URL in `SOURCE_OFFER`.
+发布脚本会检查：
 
-Packaging rejects a dirty Git tree by default. Dirty builds are allowed only
-as explicit test candidates with `RELEASE_KIND=candidate ALLOW_DIRTY=1`; those
-ZIPs embed `source.patch`, `source-state.txt`, and `source-snapshot.tar.gz`, all
-bound by SHA-256 values in `provenance.txt`. Final `released` packages must be
-clean. Released update metadata must name a local ZIP that passes the validator
-and must bind its exact digest through `zipSha256`.
+- APK、模块与更新元数据版本一致。
+- ZIP 中恰好包含一个 ARM64 ELF 守护进程和一个 APK。
+- ZIP 路径安全，载荷 SHA-256 完整。
+- `provenance.txt` 记录源码提交、目标架构和构建产物摘要。
+- `SOURCE_OFFER` 指向对应提交的完整源码。
 
-## Validation
+正式发布包要求 Git 工作树干净。仅测试候选包可以设置 `RELEASE_KIND=candidate ALLOW_DIRTY=1`；候选包会额外保存源码补丁、状态和快照，不能作为正式更新发布。
+
+## 验证
 
 ```sh
 scripts/test-release-pipeline.sh
@@ -59,32 +53,30 @@ scripts/test-release-metadata.sh planned
 scripts/validate-release-zip.sh /path/to/release.zip 3.3.1SelfUse 303001
 ```
 
-`freezeitRelease/update.json` must be changed only after the final command
-passes for the exact archive that will be published. Then validate published
-metadata with `scripts/test-release-metadata.sh released 3.3.1SelfUse 303001`.
+只有待发布 ZIP 通过完整校验后，才能修改 `freezeitRelease/update.json`。发布后再执行：
 
-## Source And License
+```sh
+scripts/test-release-metadata.sh released 3.3.1SelfUse 303001
+```
 
-The Rust daemon source is in `freezeitDaemon/`, and the Android manager source
-is in `freezeitApp/`. The Rust crate declares `GPL-3.0-or-later`; release
-provenance identifies those source directories and the Git commit used for the
-package. Preserve the corresponding GPL-3.0 source offer and license notices
-when redistributing binaries.
+## 项目来源
 
-## 来源
+基于 [jark006/freezeitVS](https://github.com/jark006/freezeitVS)（已停止维护，原仓库采用 GPL-3.0）。
 
-基于 [jark006/freezeitVS](https://github.com/jark006/freezeitVS)（已停更，仓库实际采用 GPL-3.0）。
+原作者曾公开鼓励继续维护、修改与再分发，该回复作为项目历史背景保留。本仓库继续遵守 GPL-3.0，不将该回复解释为对既有代码的 MIT 重新许可。
 
-原作者公开鼓励继续维护、修改与再分发；相关公开回复作为项目历史背景保留。本仓库继续遵守现有 GPL-3.0 许可，不将该回复解释为对既有代码的 MIT 重新许可。
+## 本仓库的改动
 
-## 本仓库做了什么
+- 适配 ColorOS 16 / OxygenOS 16、Android 16 与 Xposed API 102。
+- 核心守护进程由 C++ 重构为 Rust。
+- 使用运行时能力探测替代仅依赖机型、指纹和版本号的硬编码判断。
+- 建立 Rust-only ARM64 构建、验证和发布链。
+- 维护面向自用场景的 SelfUse 修复版本线。
 
-- 适配 ColorOS 16 / Android 16 / Xposed API 102
-- 核心从 C++ 重构为 Rust
-- 面向自用的 hotfix 版本线（SelfUse）
+## 源码与许可证
 
-## Safety Boundary
+Rust 守护进程位于 `freezeitDaemon/`，Android Manager 位于 `freezeitApp/`。Rust crate 声明 `GPL-3.0-or-later`；仓库根目录和发布包均保留许可证及对应源码说明。重新分发二进制文件时，必须继续提供相应源码并保留许可证声明。
 
-This self-use module controls selected background application runtime after
-root, hook, freezer, foreground, delay, and idle checks pass. It is not a
-malware scanner, sandbox, exploit mitigator, or system trust boundary.
+## 安全边界
+
+本模块只有在 root、hook、freezer、前台状态、延迟与 idle 等检查通过后，才控制选定后台应用。它不是恶意软件扫描器、应用沙箱、漏洞缓解工具或系统信任边界。启用前请确保具备 Magisk 模块禁用、卸载与救援能力。

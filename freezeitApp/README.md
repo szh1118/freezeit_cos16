@@ -1,30 +1,19 @@
-# ❌ 本项目已停止维护 ❌
+# Freezeit Manager（冻它管理器）
 
----
+本目录是 Freezeit Android Manager 的源码，当前由 [szh1118/freezeit_cos16](https://github.com/szh1118/freezeit_cos16) 继续维护。
 
-# FreezeitManager 冻它管理器
+Manager 用于配置 Freezeit 模块、展示运行状态，并通过受限的本地协议与 Rust 守护进程交互。当前自用版本面向 ColorOS/OxygenOS Android 16、Xposed API 82/102 与 ARM64 发布链。
 
-**[面具模块]** 实现部分墓碑机制，自动暂停后台进程的运行。
+## 相关链接
 
-**[MagiskModule]** Implement a partial tombstone mechanism to automatically suspend background processes.
+- [当前维护仓库](https://github.com/szh1118/freezeit_cos16)
+- [原始项目](https://github.com/jark006/freezeitVS)
+- [原始 Manager 仓库](https://github.com/jark006/freezeitapp)
+- [原始发布仓库](https://github.com/jark006/freezeitRelease)
+- [原版使用教程](https://jark006.github.io/FreezeitIntroduction/)
 
-### 相关链接
+## 许可证
 
-1. [当前维护仓库](https://github.com/szh1118/freezeit_cos16)
-2. [原始项目](https://github.com/jark006/freezeitVS)
+本目录保留原项目的 GPL-3.0 许可证。修改和重新分发时请继续遵守相应许可证义务。
 
-1. [管理器开源地址](https://github.com/jark006/freezeitapp)
-
-1. [模块包发布地址](https://github.com/jark006/freezeitRelease)
-
-### 其他链接
-
-[教程 Tutorials](https://jark006.github.io/FreezeitIntroduction/) |
-[酷安 @JARK006](https://www.coolapk.com/u/1212220) |
-[QQ频道 冻它模块](https://qun.qq.com/qqweb/qunpro/share?_wv=3&_wwv=128&appChannel=share&inviteCode=1W6opB7&appChannel=share&businessType=9&from=246610&biz=ka) |
-[Telegram Group](https://t.me/+sjDX1oTk31ZmYjY1) |
-[蓝奏云 密码: dy6i](https://jark006.lanzout.com/b017oz9if) 
-
----
-
-![预览](preview/p0.png)
+![应用预览](preview/p0.png)

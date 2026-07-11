@@ -1,38 +1,28 @@
-# Freezeit self-use release workspace
+# Freezeit 自用版发布目录
 
-This directory stores validated self-use Magisk archives and update metadata
-for the recorded OnePlus/ColorOS Android 16 baseline.
+本目录保存已验证的 Magisk 发布包与更新元数据，目标环境为 OnePlus 13（CPH2653）的 ColorOS/OxygenOS Android 16。
 
-## Rust-Only Release Policy
+## Rust-only 发布规则
 
-Starting with version `3.3.0SelfUse` / `303000`, releases are ARM64-only
-and package exactly one Rust daemon as `freezeit`. The daemon source is
-`freezeitDaemon/`; the manager source is `freezeitApp/`. Legacy C++ and x64
-payloads are not release inputs, and the top-level `magisk/` template contains
-no binaries or APKs.
+从 `3.3.0SelfUse`（`303000`）开始，正式版本仅支持 ARM64，并且只打包一个名为 `freezeit` 的 Rust 守护进程。守护进程源码位于 `freezeitDaemon/`，Manager 源码位于 `freezeitApp/`。旧 C++、x64 载荷和其他守护进程名称均不能作为发布输入，顶层 `magisk/` 模板也不保存二进制文件或 APK。
 
-Version `3.3.1SelfUse` / `303001` is the foreground-resume hotfix release.
+`3.3.1SelfUse`（`303001`）是前台恢复修复版本。
 
-Build with `scripts/build-release.sh`, or package verified prebuilt artifacts
-with `scripts/package-release.sh`. Every candidate must pass
-`scripts/validate-release-zip.sh`, including version consistency, unique daemon,
-AArch64 ELF, safe ZIP paths, complete payload SHA256, and provenance checks.
+使用 `scripts/build-release.sh` 完成构建，或通过 `scripts/package-release.sh` 打包已核验的预构建文件。所有候选包都必须通过 `scripts/validate-release-zip.sh`，包括版本一致性、唯一 daemon、AArch64 ELF、ZIP 路径安全、完整载荷 SHA-256 和 provenance 检查。
 
-## Publication Gate
+## 发布门禁
 
-`freezeitRelease/update.json` describes the validated
-`freezeit_oneplus13_android16_selfuse_v3.3.1SelfUse_303001.zip` hotfix release.
-Existing release ZIPs are retained.
-Released metadata also requires a `zipSha256` equal to that local ZIP after it
-passes `scripts/validate-release-zip.sh`; metadata cannot advertise a missing or
-unvalidated artifact. Dirty trees may produce test candidates only, with an
-embedded source snapshot and patch/state digests, and can never be published as
-`released`.
+`freezeitRelease/update.json` 描述已验证的 `freezeit_oneplus13_android16_selfuse_v3.3.1SelfUse_303001.zip`。
 
-## GPL-3.0 Source
+正式更新元数据必须满足：
 
-The Rust crate declares `GPL-3.0-or-later`. Each new archive records the Git
-commit, Rust source directory, manager source directory, target triple, and
-artifact SHA256 values in `provenance.txt`. Archives also include `LICENSE` and
-`SOURCE_OFFER`, whose URL names the exact source commit. Redistributors must
-preserve the corresponding GPL-3.0 source availability and notices.
+- 对应的本地 ZIP 存在且通过完整校验。
+- `zipSha256` 与最终发布文件完全一致。
+- Git 工作树干净，provenance 指向准确提交。
+- APK、模块和更新元数据版本一致。
+
+脏工作树只能生成带源码快照、补丁和状态摘要的测试候选包，不能标记为 `released`。
+
+## GPL-3.0 源码说明
+
+Rust crate 声明 `GPL-3.0-or-later`。每个新发布包都会在 `provenance.txt` 中记录源码提交、Rust 源码目录、Manager 源码目录、目标三元组和构建产物 SHA-256，并包含 `LICENSE` 与指向准确源码提交的 `SOURCE_OFFER`。重新分发时必须保留对应源码可用性和许可证声明。
