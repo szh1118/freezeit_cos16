@@ -66,10 +66,17 @@
     <string name="update_fail">Update fail</string>
     <string name="update_start">Updating AppLabel</string>
     <string name="clear_log_text">Clear</string>
+    <string name="clear_log_confirm">This permanently clears the current work log. Continue?</string>
     <string name="clear_log_tips">Cleared</string>
     <string name="xposed_description">Freezeit Auxiliary Modules</string>
     <string name="title_activity_setting">Settings</string>
     <string name="title_activity_task_manager">Freeze Status</string>
+    <string name="realtime_loading">Loading real-time data…</string>
+    <string name="health_status_format">Daemon %1$s / Hook %2$s</string>
+    <string name="health_status_active">active</string>
+    <string name="health_status_degraded">degraded</string>
+    <string name="health_status_inactive">inactive</string>
+    <string name="health_status_unknown">unknown</string>
     <string name="freeze_status_foreground">Foreground</string>
     <string name="freeze_status_background">Background</string>
     <string name="freeze_state_foreground">Active</string>
@@ -143,7 +150,7 @@
     <string name="current_version">Current Version</string>
     <string name="online_changelog">History Changelog</string>
     <string name="title_activity_about">About</string>
-    <string name="debug_title">Debug Log ⓘ</string>
+    <string name="log_level_title">Log Level ⓘ</string>
     <string name="config_help_text">
         \n[Terminate]:Use SIGKILL signal to terminate app, instead of freezing.
         \n[SIGSTOP]:Use SIGSTOP signal to freeze.
@@ -195,7 +202,7 @@
     <string name="appFailTips">Failed to get the application list, please grant the relevant permission</string>
     <string name="ok" translatable="false">OK</string>
     <string name="xposed_log">Xposed Log</string>
-    <string name="debug_tips">Enable Debug log</string>
+    <string name="log_level_tips">INFO keeps the original Freezeit log style. WARN, ERROR and CRITICAL show only matching fault severity. DEBUG includes all operation and Rust diagnostic logs.</string>
     <string name="switch_xposed_log">Switch to XposedLog</string>
     <string name="sys_warn_title">Attention</string>
     <string name="sys_warn_info">System applications are quite special, and many of them need to reside in the background to provide various services to the system at any time. \n\n

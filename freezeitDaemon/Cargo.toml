@@ -88,6 +88,10 @@ path = "tests/contract/refreeze_audit.rs"
 name = "command_runner"
 path = "tests/contract/command_runner.rs"
 
+[[test]]
+name = "log_level_filtering"
+path = "tests/contract/log_level_filtering.rs"
+
 [dependencies]
 libc = "0.2"
 

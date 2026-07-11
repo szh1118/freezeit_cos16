@@ -11,13 +11,31 @@ done
 if find "$ROOT/magisk" -maxdepth 1 -type f -name '*.apk' -print -quit | grep -q .; then
   fail "template contains APK"
 fi
-grep -Fx 'version=3.3.1SelfUse' "$ROOT/magisk/module.prop" >/dev/null || fail "planned version missing"
-grep -Fx 'versionCode=303001' "$ROOT/magisk/module.prop" >/dev/null || fail "planned versionCode missing"
+grep -Fx 'version=3.3.2SelfUse' "$ROOT/magisk/module.prop" >/dev/null || fail "planned version missing"
+grep -Fx 'versionCode=303002' "$ROOT/magisk/module.prop" >/dev/null || fail "planned versionCode missing"
 grep -F '仅支持 ARM64' "$ROOT/magisk/customize.sh" >/dev/null || fail "installer does not reject non-ARM64"
 grep -F 'freezeitARM64 freezeitX64' "$ROOT/magisk/customize.sh" >/dev/null || fail "legacy daemon rejection missing"
+grep -F '检测到 [NoANR]' "$ROOT/magisk/customize.sh" >/dev/null || fail "NoANR conflict warning missing"
+if grep -F 'pm uninstall cn.myflv.android.noanr' "$ROOT/magisk/customize.sh" >/dev/null; then
+  fail "installer still uninstalls NoANR"
+fi
+grep -F 'expected exactly one APK named freezeit.apk' "$ROOT/magisk/customize.sh" >/dev/null \
+  || fail "installer APK uniqueness gate missing"
+grep -F 'abort "- 🚫 冻它APP 覆盖安装失败' "$ROOT/magisk/customize.sh" >/dev/null \
+  || fail "installer does not abort after preserving a failed APK update"
+grep -F 'RELEASE_KIND=released requires FREEZEIT_KEYSTORE' "$ROOT/freezeitApp/app/build.gradle" >/dev/null \
+  || fail "Gradle released-signing gate missing"
+grep -F 'initWith signingConfigs.debug' "$ROOT/freezeitApp/app/build.gradle" >/dev/null \
+  || fail "candidate debug-signing fallback missing"
+grep -F 'FREEZEIT_BUILD_SESSION_FILE="$session_file"' "$ROOT/scripts/build-release.sh" >/dev/null \
+  || fail "build-release does not pass its build session to the packager"
 grep -F 'freezeitVS/magisk' "$ROOT/scripts/package-release.sh" >/dev/null && fail "packager still uses legacy template"
 grep -F 'freezeitARM64' "$ROOT/scripts/package-release.sh" >/dev/null || fail "packager does not reject legacy daemon names"
 grep -F 'working tree is dirty' "$ROOT/scripts/package-release.sh" >/dev/null || fail "packager does not reject dirty trees by default"
+grep -F 'FREEZEIT_BUILD_SESSION_FILE' "$ROOT/scripts/package-release.sh" >/dev/null \
+  || fail "released build-session gate missing"
+grep -F 'FREEZEIT_EXPECTED_APK_SIGNER_SHA256 is required' "$ROOT/scripts/package-release.sh" >/dev/null \
+  || fail "released APK signer gate missing"
 grep -F 'source-snapshot.tar.gz' "$ROOT/scripts/package-release.sh" >/dev/null || fail "dirty candidate source snapshot is missing"
 grep -F '[[ -e "$ROOT/$path" || -L "$ROOT/$path" ]]' "$ROOT/scripts/package-release.sh" >/dev/null || fail "dirty candidate snapshot does not skip deleted paths"
 grep -F 'sourcePatchSha256' "$ROOT/scripts/package-release.sh" >/dev/null || fail "dirty candidate patch digest is missing"
@@ -39,17 +57,20 @@ cp "$ROOT/LICENSE" "$tmp/LICENSE"
 daemon_sha="$(sha256sum "$tmp/freezeit" | awk '{print $1}')"
 apk_sha="$(sha256sum "$tmp/freezeit.apk" | awk '{print $1}')"
 cat >"$tmp/provenance.txt" <<EOF
-format=freezeit-release-provenance-v1
-version=3.3.1SelfUse
-versionCode=303001
+format=freezeit-release-provenance-v2
+version=3.3.2SelfUse
+versionCode=303002
 gitCommit=0000000000000000000000000000000000000000
 releaseKind=released
 dirty=false
+buildSessionId=0123456789abcdef0123456789abcdef
+buildSessionManifestSha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 daemonSource=freezeitDaemon
 managerSource=freezeitApp
 daemonTarget=aarch64-linux-android
 daemonSha256=$daemon_sha
 apkSha256=$apk_sha
+apkSignerSha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 sourcePatchSha256=none
 sourceSnapshotSha256=none
 sourceStateSha256=none
@@ -65,6 +86,10 @@ EOF
   bsdtar --format zip -cf "$tmp/release.zip" $(find . -mindepth 1 -maxdepth 1 ! -name release.zip -printf '%P\n' | LC_ALL=C sort)
 )
 "$ROOT/scripts/validate-release-zip.sh" "$tmp/release.zip" >/dev/null
+if FREEZEIT_EXPECTED_APK_SIGNER_SHA256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+  "$ROOT/scripts/validate-release-zip.sh" "$tmp/release.zip" >/dev/null 2>&1; then
+  fail "validator accepted mismatched expected signer provenance"
+fi
 
 cp "$tmp/freezeit" "$tmp/freezeitARM64"
 (
@@ -74,6 +99,19 @@ cp "$tmp/freezeit" "$tmp/freezeitARM64"
 if "$ROOT/scripts/validate-release-zip.sh" "$tmp/legacy.zip" >/dev/null 2>&1; then
   fail "validator accepted a forbidden legacy daemon"
 fi
+rm -f "$tmp/freezeitARM64"
+
+cp "$tmp/freezeit.apk" "$tmp/second.apk"
+(
+  cd "$tmp"
+  find . -mindepth 1 -maxdepth 1 -type f ! -name SHA256SUMS ! -name '*.zip' -printf '%P\0' \
+    | LC_ALL=C sort -z | xargs -0 sha256sum >SHA256SUMS
+  bsdtar --format zip -cf "$tmp/two-apk.zip" $(find . -mindepth 1 -maxdepth 1 -type f ! -name '*.zip' -printf '%P\n' | LC_ALL=C sort)
+)
+if "$ROOT/scripts/validate-release-zip.sh" "$tmp/two-apk.zip" >/dev/null 2>&1; then
+  fail "validator accepted a second APK"
+fi
+rm -f "$tmp/second.apk"
 
 cp "$tmp/freezeit" "$tmp/second-daemon"
 (
@@ -138,25 +176,60 @@ sed -i 's/^daemonSha256=.*/daemonSha256=0000000000000000000000000000000000000000
 if "$ROOT/scripts/validate-release-zip.sh" "$tmp/bad-provenance.zip" >/dev/null 2>&1; then
   fail "validator accepted mismatched provenance digest"
 fi
+sed -i "s/^daemonSha256=.*/daemonSha256=$daemon_sha/" "$tmp/provenance.txt"
+sed -i 's/^apkSignerSha256=.*/apkSignerSha256=unverified/' "$tmp/provenance.txt"
+(
+  cd "$tmp"
+  find . -mindepth 1 -maxdepth 1 -type f ! -name SHA256SUMS ! -name '*.zip' -printf '%P\0' | LC_ALL=C sort -z | xargs -0 sha256sum >SHA256SUMS
+  bsdtar --format zip -cf "$tmp/unverified-release-signer.zip" $(find . -mindepth 1 -maxdepth 1 -type f ! -name '*.zip' -printf '%P\n' | LC_ALL=C sort)
+)
+if "$ROOT/scripts/validate-release-zip.sh" "$tmp/unverified-release-signer.zip" >/dev/null 2>&1; then
+  fail "validator accepted an unverified released APK signer"
+fi
+sed -i 's/^apkSignerSha256=.*/apkSignerSha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/' "$tmp/provenance.txt"
 
 if [[ -n "$(git -C "$ROOT" status --short -- freezeitRelease/update.json)" ]]; then
-  "$ROOT/scripts/test-release-metadata.sh" released 3.3.1SelfUse 303001 >/dev/null \
+  "$ROOT/scripts/test-release-metadata.sh" released 3.3.2SelfUse 303002 >/dev/null \
     || fail "changed update.json does not describe a validated release"
 fi
 
 cat >"$tmp/released-update.json" <<'EOF'
 {
-  "version": "3.3.1SelfUse",
-  "versionCode": 303001,
-  "zipUrl": "https://example.invalid/freezeit_oneplus13_android16_selfuse_v3.3.1SelfUse_303001.zip",
+  "version": "3.3.2SelfUse",
+  "versionCode": 303002,
+  "zipUrl": "https://example.invalid/freezeit_oneplus13_android16_selfuse_v3.3.2SelfUse_303002.zip",
   "zipSha256": "PLACEHOLDER",
   "changelog": "https://example.invalid/changelog.txt"
 }
 EOF
-cp "$tmp/release.zip" "$tmp/freezeit_oneplus13_android16_selfuse_v3.3.1SelfUse_303001.zip"
-release_sha="$(sha256sum "$tmp/freezeit_oneplus13_android16_selfuse_v3.3.1SelfUse_303001.zip" | awk '{print $1}')"
+cp "$tmp/release.zip" "$tmp/freezeit_oneplus13_android16_selfuse_v3.3.2SelfUse_303002.zip"
+release_sha="$(sha256sum "$tmp/freezeit_oneplus13_android16_selfuse_v3.3.2SelfUse_303002.zip" | awk '{print $1}')"
 sed -i "s/PLACEHOLDER/$release_sha/" "$tmp/released-update.json"
 UPDATE_JSON="$tmp/released-update.json" RELEASE_DIR="$tmp" "$ROOT/scripts/test-release-metadata.sh" released >/dev/null
+cat >"$tmp/planned-version-only.json" <<'EOF'
+{
+  "version": "3.3.2SelfUse",
+  "versionCode": 303001,
+  "zipUrl": "https://example.invalid/old.zip",
+  "zipSha256": "",
+  "changelog": "https://example.invalid/changelog.txt"
+}
+EOF
+if UPDATE_JSON="$tmp/planned-version-only.json" "$ROOT/scripts/test-release-metadata.sh" planned >/dev/null 2>&1; then
+  fail "metadata test accepted an early planned version"
+fi
+cat >"$tmp/planned-code-only.json" <<'EOF'
+{
+  "version": "3.3.1SelfUse",
+  "versionCode": 303002,
+  "zipUrl": "https://example.invalid/old.zip",
+  "zipSha256": "",
+  "changelog": "https://example.invalid/changelog.txt"
+}
+EOF
+if UPDATE_JSON="$tmp/planned-code-only.json" "$ROOT/scripts/test-release-metadata.sh" planned >/dev/null 2>&1; then
+  fail "metadata test accepted an early planned versionCode"
+fi
 if "$ROOT/scripts/test-release-metadata.sh" planned '3.3.0;touch-pwned' 303000 >/dev/null 2>&1; then
   fail "metadata test accepted unsafe version input"
 fi

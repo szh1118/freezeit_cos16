@@ -1,3 +1,5 @@
+#![allow(clippy::field_reassign_with_default)]
+
 use freezeit_daemon::{
     app::compatibility::RuntimeEnvironment,
     app::controller::{
@@ -6,6 +8,7 @@ use freezeit_daemon::{
     },
     app::error::DaemonError,
     app::health::{HealthStatus, ModuleHealth},
+    app::logging::{LogLevel, LogRecord, LogView},
     app::operation_log::OperationLog,
     config::loader::DaemonPaths,
     domain::capability::{CapabilityName, ControlCapability},
@@ -17,6 +20,8 @@ use freezeit_daemon::{
     protocol::xposed::{classify_bridge_error, HookBridgeStatus},
 };
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 fn manager_frame(
     command: ManagerCommand,
@@ -98,9 +103,10 @@ fn app_config_read_and_write_remain_manager_compatible() {
             permissive: false,
         }]
     );
-    assert!(state.log.contains("配置变化"));
-    assert!(state.log.contains("10000uid10000"));
-    assert!(state.log.contains("20->30"));
+    let info = state.manager_log.render(LogView::Info);
+    assert!(info.contains("配置变化"));
+    assert!(info.contains("10000uid10000"));
+    assert!(info.contains("20->30"));
 }
 
 #[test]
@@ -118,9 +124,10 @@ fn set_app_label_logs_legacy_label_update_summary() {
         handle_manager_command(&frame, &mut state, |_| Ok(true)).expect("set app label succeeds");
 
     assert_eq!(response, b"success");
-    assert!(state.log.contains("更新 2 款应用名称"));
-    assert!(state.log.contains("[Example App]"));
-    assert!(state.log.contains("[Other App]"));
+    let info = state.manager_log.render(LogView::Info);
+    assert!(info.contains("更新 2 款应用名称"));
+    assert!(info.contains("[Example App]"));
+    assert!(info.contains("[Other App]"));
     assert_eq!(
         fs::read_to_string(label_path).unwrap(),
         "10000 Example App\n10001 Other App\n"
@@ -163,6 +170,123 @@ fn set_app_cfg_restores_file_state_and_hook_when_new_hook_sync_fails() {
     assert_eq!(state.app_config[0].mode, 20);
     assert_eq!(hook_payloads.len(), 2, "old hook config must be restored");
     assert!(!temp.path().join(".appcfg.txt.tmp").exists());
+}
+
+#[test]
+fn set_app_cfg_noop_preserves_package_names_and_file_bytes() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let app_config_path = temp.path().join("appcfg.txt");
+    let original = "com.example.first 30 1\ncom.example.second 40 0\n";
+    fs::write(&app_config_path, original).expect("seed config");
+    let mut state = ReadOnlyState::default();
+    state.app_config_path = Some(app_config_path.to_string_lossy().into_owned());
+    state.app_config = vec![
+        ManagerAppConfigRecord {
+            uid: 10_001,
+            mode: 30,
+            permissive: true,
+        },
+        ManagerAppConfigRecord {
+            uid: 10_002,
+            mode: 40,
+            permissive: false,
+        },
+    ];
+    let frame = manager_frame(
+        ManagerCommand::SetAppCfg,
+        &encode_app_config(&state.app_config),
+    );
+
+    let response = handle_manager_command(&frame, &mut state, |_| Ok(true))
+        .expect("no-op config save succeeds");
+
+    assert_eq!(response, b"success");
+    assert_eq!(fs::read_to_string(&app_config_path).unwrap(), original);
+}
+
+#[test]
+fn set_app_cfg_change_preserves_existing_package_token() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let app_config_path = temp.path().join("appcfg.txt");
+    fs::write(&app_config_path, "com.example.first 30 1\n").expect("seed config");
+    let mut state = ReadOnlyState::default();
+    state.app_config_path = Some(app_config_path.to_string_lossy().into_owned());
+    state.app_config = vec![ManagerAppConfigRecord {
+        uid: 10_001,
+        mode: 30,
+        permissive: true,
+    }];
+    let frame = manager_frame(
+        ManagerCommand::SetAppCfg,
+        &encode_app_config(&[ManagerAppConfigRecord {
+            uid: 10_001,
+            mode: 20,
+            permissive: false,
+        }]),
+    );
+
+    let response = handle_manager_command(&frame, &mut state, |_| Ok(true))
+        .expect("changed config save succeeds");
+
+    assert_eq!(response, b"success");
+    assert_eq!(
+        fs::read_to_string(app_config_path).unwrap(),
+        "com.example.first 20 0\n"
+    );
+}
+
+#[test]
+fn set_app_cfg_noop_preserves_comments_blank_lines_and_spacing() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let app_config_path = temp.path().join("appcfg.txt");
+    let original = "# user note\n\ncom.example.first   30   1\n";
+    fs::write(&app_config_path, original).expect("seed config");
+    let mut state = ReadOnlyState::default();
+    state.app_config_path = Some(app_config_path.to_string_lossy().into_owned());
+    state.app_config = vec![ManagerAppConfigRecord {
+        uid: 10_001,
+        mode: 30,
+        permissive: true,
+    }];
+    let frame = manager_frame(
+        ManagerCommand::SetAppCfg,
+        &encode_app_config(&state.app_config),
+    );
+    #[cfg(unix)]
+    let original_inode = fs::metadata(&app_config_path).unwrap().ino();
+
+    handle_manager_command(&frame, &mut state, |_| Ok(true)).expect("no-op config save succeeds");
+
+    assert_eq!(fs::read_to_string(&app_config_path).unwrap(), original);
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(&app_config_path).unwrap().ino(),
+        original_inode
+    );
+}
+
+#[test]
+fn set_app_cfg_rebuilds_existing_records_when_config_file_is_missing() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let app_config_path = temp.path().join("appcfg.txt");
+    let mut state = ReadOnlyState::default();
+    state.app_config_path = Some(app_config_path.to_string_lossy().into_owned());
+    state.app_config = vec![ManagerAppConfigRecord {
+        uid: 10_001,
+        mode: 30,
+        permissive: true,
+    }];
+    let frame = manager_frame(
+        ManagerCommand::SetAppCfg,
+        &encode_app_config(&state.app_config),
+    );
+
+    handle_manager_command(&frame, &mut state, |_| Ok(true)).expect("missing config is rebuilt");
+
+    assert_eq!(
+        fs::read_to_string(app_config_path).unwrap(),
+        "10001uid10001 30 1\n"
+    );
 }
 
 #[test]
@@ -236,6 +360,9 @@ fn set_settings_var_updates_legacy_setting_byte() {
 
     assert_eq!(response, b"success");
     assert_eq!(state.settings[13], 0);
+    let info = state.manager_log.render(LogView::Info);
+    assert!(info.ends_with("]  ⚙️设置成功\n"));
+    assert!(!info.contains("[13]:0"));
 }
 
 #[test]
@@ -250,6 +377,65 @@ fn set_settings_var_rejects_invalid_switch_value() {
     let text = String::from_utf8(response).expect("response text");
     assert!(text.contains("开关值错误"));
     assert_eq!(state.settings[13], original);
+}
+
+#[test]
+fn get_log_filters_in_daemon_using_setting_byte_30() {
+    let mut state = ReadOnlyState::default();
+    state.manager_log.clear();
+    state
+        .manager_log
+        .push(LogRecord::legacy_text(1_000, "🧊冻结 demo"));
+    state.manager_log.push(LogRecord::diagnostic(
+        LogLevel::Debug,
+        2_000,
+        "daemon active: apps=1",
+    ));
+
+    state.settings[30] = 0;
+    let info = handle_read_only_command(ManagerCommand::GetLog, &state).unwrap();
+    assert_eq!(
+        String::from_utf8(info).unwrap(),
+        "[08:00:01]  🧊冻结 demo\n"
+    );
+
+    state.settings[30] = 1;
+    let debug = handle_read_only_command(ManagerCommand::GetLog, &state).unwrap();
+    assert!(String::from_utf8(debug)
+        .unwrap()
+        .contains("daemon active: apps=1"));
+}
+
+#[test]
+fn setting_index_30_accepts_only_log_view_values() {
+    for value in 0..=4 {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut state = ReadOnlyState::default();
+        state.settings_path = Some(
+            temp.path()
+                .join("settings.db")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let response = handle_manager_command(
+            &manager_frame(ManagerCommand::SetSettingsVar, &[30, value]),
+            &mut state,
+            |_| Ok(true),
+        )
+        .expect("log level setting is handled");
+        assert_eq!(response, b"success", "value {value} must be accepted");
+        assert_eq!(state.settings[30], value);
+    }
+
+    let mut state = ReadOnlyState::default();
+    let response = handle_manager_command(
+        &manager_frame(ManagerCommand::SetSettingsVar, &[30, 5]),
+        &mut state,
+        |_| Ok(true),
+    )
+    .expect("invalid log level is handled");
+    assert_ne!(response, b"success");
+    assert_eq!(state.settings[30], 0);
 }
 
 #[test]
@@ -339,7 +525,6 @@ fn realtime_info_returns_legacy_image_and_23_int_payload() {
 #[test]
 fn remaining_legacy_commands_return_compatibility_payloads() {
     let mut state = ReadOnlyState::default();
-    state.log = "daemon starting\noperation log line\n".to_owned();
     state.changelog = "### local changelog\ncompatibility fixes".to_owned();
     state.operation_log_json = "{\"operations\":[{\"action\":\"freeze\"}]}".to_owned();
 
@@ -378,8 +563,8 @@ fn remaining_legacy_commands_return_compatibility_payloads() {
         |_| Ok(true),
     )
     .expect("clear log succeeds");
-    assert_eq!(cleared, b"\n");
-    assert_eq!(state.log, "\n");
+    assert!(cleared.is_empty());
+    assert!(state.manager_log.is_empty());
 
     let diagnostics = handle_manager_command(
         &manager_frame(ManagerCommand::GetOperationLogJson, &[]),
@@ -391,32 +576,67 @@ fn remaining_legacy_commands_return_compatibility_payloads() {
 }
 
 #[test]
+fn get_freeze_status_returns_manager_five_int_rows() {
+    let mut state = ReadOnlyState::default();
+    state.freeze_status = vec![
+        freezeit_daemon::protocol::manager_v1::ManagerFreezeStatusRecord {
+            uid: 10_042,
+            foreground: true,
+            state: 1,
+            seconds: 12,
+            process_count: 2,
+        },
+        freezeit_daemon::protocol::manager_v1::ManagerFreezeStatusRecord {
+            uid: 10_043,
+            foreground: false,
+            state: 3,
+            seconds: 34,
+            process_count: 1,
+        },
+    ];
+
+    let payload = handle_manager_command(
+        &manager_frame(ManagerCommand::GetFreezeStatus, &[]),
+        &mut state,
+        |_| Ok(true),
+    )
+    .expect("freeze status succeeds");
+
+    assert_eq!(payload.len(), 40);
+    let values = payload
+        .chunks_exact(4)
+        .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(values, vec![10_042, 1, 1, 12, 2, 10_043, 0, 3, 34, 1]);
+}
+
+#[test]
 fn get_log_includes_original_emoji_operation_entries() {
     let mut state = ReadOnlyState::default();
-    state.log = "daemon starting\n".to_owned();
-    let mut operation_log = OperationLog::new(2);
-    operation_log.push(freezeit_daemon::domain::operation::ControlOperation {
-        operation_id: 7,
-        timestamp_ms: 42,
-        package_name: "com.example.app".to_owned(),
-        uid: 10_123,
-        pid_list: vec![123, 124],
-        action: freezeit_daemon::domain::operation::ControlAction::Freeze,
-        backend: "cgroup.freeze".to_owned(),
-        reason: "delay elapsed".to_owned(),
-        result: freezeit_daemon::domain::operation::OperationResult::Success,
-        details: "process_count=2".to_owned(),
-    });
-    state.operation_log_text = operation_log.to_legacy_text();
+    state.manager_log.push(LogRecord::operation(
+        freezeit_daemon::domain::operation::ControlOperation {
+            operation_id: 7,
+            timestamp_ms: 42,
+            package_name: "com.example.app".to_owned(),
+            uid: 10_123,
+            pid_list: vec![123, 124],
+            action: freezeit_daemon::domain::operation::ControlAction::Freeze,
+            backend: "cgroup.freeze".to_owned(),
+            reason: "delay elapsed".to_owned(),
+            result: freezeit_daemon::domain::operation::OperationResult::Success,
+            details: "process_count=2".to_owned(),
+        },
+    ));
 
     let payload = handle_read_only_command(ManagerCommand::GetLog, &state).expect("log succeeds");
     let text = String::from_utf8(payload).expect("log is utf-8");
 
-    assert!(text.contains("daemon starting"));
-    assert!(text.contains("❄️冻结 com.example.app 2进程"));
-    assert!(text.contains("UID:10123"));
-    assert!(text.contains("结果:成功"));
-    assert!(text.contains("原因:delay elapsed"));
+    assert_eq!(text, "[08:00:00]  ❄️冻结 com.example.app 2进程\n");
+    assert!(!text.contains("UID:"));
+    assert!(!text.contains("PID:"));
+    assert!(!text.contains("方式:"));
+    assert!(!text.contains("结果:"));
+    assert!(!text.contains("原因:"));
     assert!(!text.contains("backend="));
     assert!(!text.contains("result="));
     assert!(!text.contains("reason="));
@@ -470,13 +690,48 @@ fn startup_state_loads_legacy_module_files() {
             permissive: false,
         }]
     );
-    assert!(state.log.contains("启动冻它"));
-    assert!(state.log.contains("loaded config"));
-    assert!(state.log.contains("daemon active"));
-    assert!(!state.log.contains("ROM fingerprint mismatch"));
+    let debug = state.manager_log.render(LogView::Debug);
+    assert!(debug.contains("启动冻它"));
+    assert!(debug.contains("loaded config"));
+    assert!(debug.contains("daemon active"));
+    assert!(!debug.contains("ROM fingerprint mismatch"));
     assert!(state.changelog.contains("local changelog"));
     assert_ne!(state.android_version, "Unknown");
     assert_ne!(state.kernel_version, "Unknown");
+}
+
+#[test]
+fn startup_log_keeps_verified_cpp_lines_in_info_and_diagnostics_in_debug() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    fs::write(
+        temp.path().join("boot.log"),
+        "[12:34:56]  ⚙️设置成功\n\
+         daemon active: apps=1\n\
+         hook config synced: managed_apps=1 settings=256\n",
+    )
+    .expect("write boot log");
+    let mut state = startup_read_only_state_from_paths(&DaemonPaths::from_module_dir(
+        temp.path().display().to_string(),
+    ));
+
+    state.settings[30] = 0;
+    let info = String::from_utf8(
+        handle_read_only_command(ManagerCommand::GetLog, &state).expect("INFO log"),
+    )
+    .expect("INFO is UTF-8");
+    assert_eq!(info, "[12:34:56]  ⚙️设置成功\n");
+    assert!(!info.contains("daemon active:"));
+    assert!(!info.contains("hook config synced:"));
+    assert!(!info.contains("[INFO]"));
+
+    state.settings[30] = 1;
+    let debug = String::from_utf8(
+        handle_read_only_command(ManagerCommand::GetLog, &state).expect("DEBUG log"),
+    )
+    .expect("DEBUG is UTF-8");
+    assert!(debug.contains("[12:34:56]  ⚙️设置成功"));
+    assert!(debug.contains("daemon active: apps=1"));
+    assert!(debug.contains("hook config synced: managed_apps=1 settings=256"));
 }
 
 #[test]
@@ -492,6 +747,73 @@ fn home_status_card_does_not_call_unsupported_legacy_health_command() {
     assert!(
         home.contains("hasHealthStatus") && home.contains("StaticData.workMode"),
         "home status must keep a legacy fallback when getPropInfo has no daemon health fields"
+    );
+}
+
+#[test]
+fn home_realtime_card_shows_loading_state_before_first_sample() {
+    let layout = include_str!("../../../freezeitApp/app/src/main/res/layout/fragment_home.xml");
+    let strings = include_str!("../../../freezeitApp/app/src/main/res/values-zh/strings.xml");
+    let cpu_id = layout
+        .find("android:id=\"@+id/cpu\"")
+        .expect("realtime CPU status text exists");
+    let cpu_tail = &layout[cpu_id..cpu_id + 500.min(layout.len() - cpu_id)];
+
+    assert!(
+        cpu_tail.contains("android:text=\"@string/realtime_loading\""),
+        "home realtime card must explain the initial empty state while the first sample loads"
+    );
+    assert!(
+        strings.contains("<string name=\"realtime_loading\">"),
+        "Chinese resources must provide the realtime loading message"
+    );
+}
+
+#[test]
+fn home_health_status_uses_localized_resources() {
+    let home = include_str!(
+        "../../../freezeitApp/app/src/main/java/io/github/jark006/freezeit/fragment/Home.java"
+    );
+    let strings = include_str!("../../../freezeitApp/app/src/main/res/values-zh/strings.xml");
+
+    assert!(
+        !home.contains("setText(\"Daemon \" +"),
+        "home health status must not hard-code English text in the Chinese UI"
+    );
+    assert!(
+        home.contains("localizedHealthStatus")
+            && home.contains("R.string.health_status_format")
+            && home.contains("R.string.health_status_active")
+            && home.contains("R.string.health_status_degraded")
+            && home.contains("R.string.health_status_inactive")
+            && home.contains("R.string.health_status_unknown"),
+        "home health values must map daemon status tokens through localized resources"
+    );
+    for resource in [
+        "health_status_format",
+        "health_status_active",
+        "health_status_degraded",
+        "health_status_inactive",
+        "health_status_unknown",
+    ] {
+        assert!(
+            strings.contains(&format!("<string name=\"{resource}\">")),
+            "Chinese resources must define {resource}"
+        );
+    }
+}
+
+#[test]
+fn home_realtime_initialization_handles_already_laid_out_image() {
+    let home = include_str!(
+        "../../../freezeitApp/app/src/main/java/io/github/jark006/freezeit/fragment/Home.java"
+    );
+
+    assert!(
+        home.contains("binding.cpuImg.getWidth() > 0")
+            && home.contains("binding.cpuImg.getHeight() > 0")
+            && home.contains("initializeRealTimeDimensions()"),
+        "home must initialize realtime dimensions immediately when the image is already laid out"
     );
 }
 
@@ -531,6 +853,30 @@ fn logcat_display_scroll_area_fills_viewport() {
     assert!(
         !logcat.contains("fullScroll(View.FOCUS_DOWN)"),
         "outer ScrollView fullScroll does not reach the TextView's internal scroll position"
+    );
+}
+
+#[test]
+fn logcat_clear_requires_explicit_confirmation() {
+    let logcat = include_str!(
+        "../../../freezeitApp/app/src/main/java/io/github/jark006/freezeit/fragment/Logcat.java"
+    );
+    let clear_listener = logcat
+        .find("binding.fabClear.setOnClickListener")
+        .expect("clear listener exists");
+    let clear_listener = &logcat[clear_listener..];
+
+    assert!(
+        clear_listener.contains("new AlertDialog.Builder(requireContext())"),
+        "clear log must show an in-app confirmation dialog"
+    );
+    assert!(
+        clear_listener.contains("setNegativeButton(android.R.string.cancel, null)"),
+        "clear log confirmation must provide a non-destructive cancel action"
+    );
+    assert!(
+        clear_listener.contains("setPositiveButton(R.string.clear_log_text"),
+        "clear command must only run from the explicit confirmation action"
     );
 }
 
@@ -752,5 +1098,87 @@ fn startup_loaded_config_can_be_synchronized_to_hook_without_manager_save() {
     .expect("startup sync succeeds");
 
     assert!(response);
-    assert!(state.log.contains("hook config synced"));
+    assert!(state
+        .manager_log
+        .render(LogView::Debug)
+        .contains("hook config synced"));
+}
+
+#[test]
+fn settings_log_level_selector_replaces_debug_switch_without_initial_write() {
+    let settings = include_str!(
+        "../../../freezeitApp/app/src/main/java/io/github/jark006/freezeit/activity/Settings.java"
+    );
+    let layout = include_str!("../../../freezeitApp/app/src/main/res/layout/activity_settings.xml");
+    let arrays = include_str!("../../../freezeitApp/app/src/main/res/values/arrays.xml");
+
+    assert!(layout.contains("android:id=\"@+id/log_level_title\""));
+    assert!(layout.contains("android:id=\"@+id/log_level_spinner\""));
+    assert!(layout.contains("android:entries=\"@array/log_levels\""));
+    assert!(!layout.contains("android:id=\"@+id/switch_debug\""));
+    assert!(arrays.contains(
+        "<string-array name=\"log_levels\">\n        <item>INFO</item>\n        <item>WARN</item>\n        <item>ERROR</item>\n        <item>CRITICAL</item>\n        <item>DEBUG</item>"
+    ));
+
+    assert!(settings.contains("logLevelSpinner;"));
+    assert!(settings.contains("void InitLogLevelSpinner()"));
+    assert!(settings.contains("LogLevelCodec.toSpinnerPosition"));
+    assert!(settings.contains("LogLevelCodec.toStorageValue"));
+    assert!(settings.contains("InitLogLevelSpinner();"));
+    assert!(!settings.contains("debugSwitch"));
+
+    let init = settings
+        .split("void InitLogLevelSpinner()")
+        .nth(1)
+        .expect("log level initializer exists");
+    assert!(
+        init.find("setSelection").unwrap() < init.find("setOnItemSelectedListener").unwrap(),
+        "the current value must be selected before the listener is attached"
+    );
+}
+
+#[test]
+fn failed_log_level_write_restores_persisted_selection() {
+    let settings = include_str!(
+        "../../../freezeitApp/app/src/main/java/io/github/jark006/freezeit/activity/Settings.java"
+    );
+    let failure_handler = settings
+        .split("case SET_VAR_FAIL:")
+        .nth(1)
+        .expect("failure handler exists");
+
+    assert!(failure_handler.contains("msg.arg1 == debugIdx"));
+    assert!(failure_handler.contains("logLevelSpinner.setSelection"));
+    assert!(failure_handler.contains("LogLevelCodec.toSpinnerPosition"));
+}
+
+#[test]
+fn settings_write_completion_keeps_its_own_index_and_value() {
+    let settings = include_str!(
+        "../../../freezeitApp/app/src/main/java/io/github/jark006/freezeit/activity/Settings.java"
+    );
+
+    assert!(settings.contains("void setVarTask(int index, int value)"));
+    assert!(settings.contains("msg.arg1 = index"));
+    assert!(settings.contains("msg.arg2 = value"));
+    assert!(settings.contains("settingsVar[msg.arg1] = (byte) msg.arg2"));
+    assert!(!settings.contains("varIndexForHandle"));
+    assert!(!settings.contains("newValueForHandle"));
+}
+
+#[test]
+fn module_upgrade_never_uninstalls_manager_or_clears_app_data() {
+    let customize = include_str!("../../../magisk/customize.sh");
+
+    assert!(customize.contains("pm install -r -f \"$apkPath\""));
+    assert!(!customize.contains("pm uninstall io.github.jark006.freezeit"));
+    assert!(!customize.contains("pm clear io.github.jark006.freezeit"));
+}
+
+#[test]
+fn control_loop_merges_operations_without_replacing_manager_log_snapshot() {
+    let socket_source = include_str!("../../src/sys/socket.rs");
+
+    assert!(!socket_source.contains("state.manager_log = state_snapshot.manager_log"));
+    assert!(socket_source.contains("state.manager_log.push(LogRecord::operation(operation))"));
 }

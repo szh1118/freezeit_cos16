@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fs};
+use std::{
+    collections::BTreeMap,
+    fs,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::{
     app::{
@@ -14,6 +18,7 @@ use crate::{
             FreezeDecision, SystemAwareCgroupBinderBackend,
         },
         health::ModuleHealth,
+        logging::{LogLevel, LogRecord},
         operation_log::OperationLog,
         package_inventory::{parse_cmd_package_list, reconcile_uid, PackageRecord},
     },
@@ -30,7 +35,8 @@ use crate::{
     protocol::{
         manager_v1::{
             encode_app_config, encode_xposed_config_payload, handle_read_only_command,
-            normalize_settings, ManagerAppConfigRecord, ManagerCommand, ReadOnlyState,
+            normalize_settings, ManagerAppConfigRecord, ManagerCommand, ManagerFreezeStatusRecord,
+            ReadOnlyState,
         },
         manager_v2::{
             capability_report_json, compatibility_report_json, health_report_json,
@@ -50,10 +56,11 @@ pub fn run() -> Result<(), DaemonError> {
 pub fn run_with_paths(paths: &DaemonPaths) -> Result<(), DaemonError> {
     let mut state = startup_read_only_state_from_paths(paths);
     if let Err(error) = sync_loaded_config_to_hook(&mut state, xposed_bridge::set_config) {
-        append_log_once(
-            &mut state.log,
-            &format!("hook config sync failed: {error}\n"),
-        );
+        state.manager_log.push_once(LogRecord::fault(
+            LogLevel::Error,
+            current_timestamp_ms(),
+            format!("hook config sync failed: {error}"),
+        ));
     }
     socket::run_manager_server_forever(state)
 }
@@ -65,10 +72,12 @@ pub fn startup_read_only_state() -> ReadOnlyState {
 }
 
 pub fn startup_read_only_state_from_paths(paths: &DaemonPaths) -> ReadOnlyState {
-    let mut state = ReadOnlyState::default();
-    state.settings_path = Some(paths.settings_db.clone());
-    state.app_config_path = Some(paths.app_config.clone());
-    state.app_label_path = Some(paths.app_label.clone());
+    let mut state = ReadOnlyState {
+        settings_path: Some(paths.settings_db.clone()),
+        app_config_path: Some(paths.app_config.clone()),
+        app_label_path: Some(paths.app_label.clone()),
+        ..ReadOnlyState::default()
+    };
     apply_module_prop(&mut state, &format!("{}/module.prop", paths.module_dir));
     state.changelog = read_first_existing_text(&[
         format!("{}/CHANGELOG.md", paths.module_dir),
@@ -81,10 +90,7 @@ pub fn startup_read_only_state_from_paths(paths: &DaemonPaths) -> ReadOnlyState 
         format!("{}/freezeit.log", paths.module_dir),
         format!("{}/daemon.log", paths.module_dir),
     ]) {
-        state.log = sanitize_startup_log(&log);
-        if !state.log.ends_with('\n') {
-            state.log.push('\n');
-        }
+        import_startup_log(&mut state, &sanitize_startup_log(&log));
     }
     let policy = load_policy_files_recovering(paths);
     let policy_ready = policy.is_available();
@@ -141,18 +147,36 @@ pub fn sync_loaded_config_to_hook(
     let synced = set_app_config(&xposed_payload)?;
     state.hook_config_synced = synced;
     if synced {
-        append_log_once(
-            &mut state.log,
-            &format!(
-                "hook config synced: managed_apps={} settings={}\n",
+        state.manager_log.push_once(LogRecord::diagnostic(
+            LogLevel::Debug,
+            current_timestamp_ms(),
+            format!(
+                "hook config synced: managed_apps={} settings={}",
                 state.app_config.len(),
                 state.settings.len()
             ),
-        );
+        ));
     } else {
-        append_log_once(&mut state.log, "hook config sync rejected\n");
+        state.manager_log.push_once(LogRecord::fault(
+            LogLevel::Warn,
+            current_timestamp_ms(),
+            "hook config sync rejected",
+        ));
     }
     Ok(synced)
+}
+
+fn import_startup_log(state: &mut ReadOnlyState, log: &str) {
+    let timestamp_ms = current_timestamp_ms();
+    for line in log.lines().filter(|line| !line.trim().is_empty()) {
+        if let Some(record) = LogRecord::verified_legacy_line(line) {
+            state.manager_log.push(record);
+        } else {
+            state
+                .manager_log
+                .push(LogRecord::diagnostic(LogLevel::Debug, timestamp_ms, line));
+        }
+    }
 }
 
 fn sanitize_startup_log(log: &str) -> String {
@@ -179,23 +203,24 @@ fn sanitize_startup_log(log: &str) -> String {
 }
 
 fn append_daemon_status_log(state: &mut ReadOnlyState) {
-    state.log.push_str(&format!(
-        "daemon active: apps={} settings={} android={} kernel={}\n",
-        state.app_config.len(),
-        state.settings.len(),
-        state.android_version,
-        state.kernel_version
+    state.manager_log.push_once(LogRecord::diagnostic(
+        LogLevel::Debug,
+        current_timestamp_ms(),
+        format!(
+            "daemon active: apps={} settings={} android={} kernel={}",
+            state.app_config.len(),
+            state.settings.len(),
+            state.android_version,
+            state.kernel_version
+        ),
     ));
 }
 
-fn append_log_once(log: &mut String, line: &str) {
-    let trimmed = line.trim_end();
-    if !log.lines().any(|existing| existing == trimmed) {
-        log.push_str(line);
-        if !line.ends_with('\n') {
-            log.push('\n');
-        }
-    }
+fn current_timestamp_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
 }
 
 fn apply_module_prop(state: &mut ReadOnlyState, path: &str) {
@@ -413,15 +438,21 @@ pub struct DiagnosticState {
 }
 
 pub fn read_only_state_with_diagnostics(diagnostics: &DiagnosticState) -> ReadOnlyState {
-    let mut state = ReadOnlyState::default();
-    state.health_report_json = health_report_json(&diagnostics.health);
-    state.capability_report_json = capability_report_json(&diagnostics.capabilities);
-    state.compatibility_report_json = compatibility_report_json(
-        &RuntimeEnvironment::new("unknown", "unknown", 0, "", "unknown", false, false, false),
-        &diagnostics.capabilities,
-    );
-    state.operation_log_json = operation_log_json(&diagnostics.operation_log);
-    state.operation_log_text = diagnostics.operation_log.to_legacy_text();
+    let mut state = ReadOnlyState {
+        health_report_json: health_report_json(&diagnostics.health),
+        capability_report_json: capability_report_json(&diagnostics.capabilities),
+        compatibility_report_json: compatibility_report_json(
+            &RuntimeEnvironment::new("unknown", "unknown", 0, "", "unknown", false, false, false),
+            &diagnostics.capabilities,
+        ),
+        operation_log_json: operation_log_json(&diagnostics.operation_log),
+        ..ReadOnlyState::default()
+    };
+    for operation in diagnostics.operation_log.records() {
+        state
+            .manager_log
+            .push(LogRecord::operation(operation.clone()));
+    }
     state.self_check_json = self_check_json(&diagnostics.health, &diagnostics.capabilities);
     state
 }
@@ -432,10 +463,15 @@ pub struct RuntimeControlState {
     frozen_apps: std::collections::BTreeSet<(String, u32)>,
     pending_freezes: BTreeMap<(String, u32), u128>,
     next_operation_id: u64,
+    status_since_ms: BTreeMap<u32, (i32, u128)>,
+    blocked_process_signatures: BTreeMap<RuntimeIdentity, ProcessSignature>,
     download_deferral: DownloadDeferral,
     audit_started_at_ms: Option<u128>,
     next_refreeze_audit_at_ms: Option<u128>,
 }
+
+type RuntimeIdentity = (String, u32);
+type ProcessSignature = Vec<(i32, String, Option<u64>)>;
 
 impl Default for RuntimeControlState {
     fn default() -> Self {
@@ -444,10 +480,112 @@ impl Default for RuntimeControlState {
             frozen_apps: std::collections::BTreeSet::new(),
             pending_freezes: BTreeMap::new(),
             next_operation_id: 1,
+            status_since_ms: BTreeMap::new(),
+            blocked_process_signatures: BTreeMap::new(),
             download_deferral: DownloadDeferral::default(),
             audit_started_at_ms: None,
             next_refreeze_audit_at_ms: None,
         }
+    }
+}
+
+impl RuntimeControlState {
+    pub fn freeze_status_records(
+        &mut self,
+        app_config: &[ManagerAppConfigRecord],
+        processes_by_uid: &BTreeMap<u32, Vec<RuntimeProcess>>,
+        foreground_uids: &[u32],
+        timestamp_ms: u128,
+    ) -> Vec<ManagerFreezeStatusRecord> {
+        const STATE_RUNNING_BACKGROUND: i32 = 0;
+        const STATE_FOREGROUND: i32 = 1;
+        const STATE_PENDING: i32 = 2;
+        const STATE_FROZEN: i32 = 3;
+
+        let mut records = Vec::new();
+        let mut visible_uids = std::collections::BTreeSet::new();
+        let foreground_uids = foreground_uids
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let pending_by_uid =
+            self.pending_freezes
+                .iter()
+                .fold(BTreeMap::new(), |mut pending, ((_, uid), due)| {
+                    pending
+                        .entry(*uid)
+                        .and_modify(|current: &mut u128| *current = (*current).min(*due))
+                        .or_insert(*due);
+                    pending
+                });
+        let frozen_uids = self
+            .frozen_apps
+            .iter()
+            .map(|(_, uid)| *uid)
+            .collect::<std::collections::BTreeSet<_>>();
+        for config in app_config
+            .iter()
+            .filter(|record| is_control_policy_mode(record.mode))
+        {
+            let processes = processes_by_uid
+                .get(&config.uid)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let is_foreground = foreground_uids.contains(&config.uid);
+            let pending_due = pending_by_uid.get(&config.uid).copied();
+            let is_frozen = frozen_uids.contains(&config.uid);
+            if processes.is_empty() && !is_foreground && pending_due.is_none() && !is_frozen {
+                continue;
+            }
+
+            let state = if is_foreground {
+                STATE_FOREGROUND
+            } else if pending_due.is_some() {
+                STATE_PENDING
+            } else if is_frozen {
+                STATE_FROZEN
+            } else {
+                STATE_RUNNING_BACKGROUND
+            };
+            visible_uids.insert(config.uid);
+            let seconds = if let Some(due_at_ms) = pending_due {
+                due_at_ms
+                    .saturating_sub(timestamp_ms)
+                    .div_ceil(1_000)
+                    .min(i32::MAX as u128) as i32
+            } else {
+                let since = match self.status_since_ms.get(&config.uid).copied() {
+                    Some((previous_state, since)) if previous_state == state => since,
+                    _ => timestamp_ms,
+                };
+                self.status_since_ms.insert(config.uid, (state, since));
+                timestamp_ms
+                    .saturating_sub(since)
+                    .checked_div(1_000)
+                    .unwrap_or(0)
+                    .min(i32::MAX as u128) as i32
+            };
+            records.push(ManagerFreezeStatusRecord {
+                uid: config.uid,
+                foreground: is_foreground,
+                state,
+                seconds,
+                process_count: processes.len().min(i32::MAX as usize) as i32,
+            });
+        }
+        self.status_since_ms
+            .retain(|uid, _| visible_uids.contains(uid));
+        records.sort_by_key(|record| {
+            let rank = match record.state {
+                STATE_FOREGROUND => 0,
+                STATE_PENDING => 1,
+                STATE_RUNNING_BACKGROUND => 2,
+                STATE_FROZEN => 3,
+                _ => 4,
+            };
+            (rank, record.uid)
+        });
+        records
     }
 }
 
@@ -472,6 +610,7 @@ pub fn run_control_pass(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_control_pass_with_settings(
     state: &mut RuntimeControlState,
     app_config: &[ManagerAppConfigRecord],
@@ -495,6 +634,7 @@ pub fn run_control_pass_with_settings(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_control_pass_with_validation(
     state: &mut RuntimeControlState,
     app_config: &[ManagerAppConfigRecord],
@@ -520,6 +660,7 @@ pub fn run_control_pass_with_validation(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_control_pass_with_sampling(
     state: &mut RuntimeControlState,
     app_config: &[ManagerAppConfigRecord],
@@ -540,15 +681,44 @@ pub fn run_control_pass_with_sampling(
         let fallback_package_name = format!("uid{}", record.uid);
         let processes = discover_processes(&fallback_package_name, record.uid)?;
         if processes.is_empty() {
+            state
+                .pending_freezes
+                .retain(|(_, uid), _| *uid != record.uid);
+            state.frozen_apps.retain(|(_, uid)| *uid != record.uid);
+            state
+                .blocked_process_signatures
+                .retain(|(_, uid), _| *uid != record.uid);
+            state.download_deferral.clear_uid(record.uid);
+            state.status_since_ms.remove(&record.uid);
             continue;
         }
         let package_name = processes
-            .first()
-            .map(|process| process.package_name.clone())
+            .iter()
+            .map(|process| process.package_name.as_str())
+            .min()
+            .map(ToOwned::to_owned)
             .unwrap_or_else(|| fallback_package_name.clone());
         let app = managed_app_from_record(&package_name, record.uid);
         let policy = policy_from_record(record);
         let identity = (package_name.clone(), record.uid);
+        let mut process_signature = processes
+            .iter()
+            .map(|process| {
+                (
+                    process.pid,
+                    process.package_name.clone(),
+                    process.start_time_ticks,
+                )
+            })
+            .collect::<Vec<_>>();
+        process_signature.sort();
+        match state.blocked_process_signatures.get(&identity) {
+            Some(blocked_signature) if blocked_signature == &process_signature => continue,
+            Some(_) => {
+                state.blocked_process_signatures.remove(&identity);
+            }
+            None => {}
+        }
 
         if foreground_uids.contains(&record.uid) {
             state.pending_freezes.remove(&identity);
@@ -679,27 +849,29 @@ pub fn run_control_pass_with_sampling(
                 } else {
                     DOWNLOAD_RETRY_DELAY_MS
                 };
-                state
+                let previous_due = state
                     .pending_freezes
                     .insert(identity.clone(), timestamp_ms + u128::from(retry_ms));
-                let mut operation = ControlOperation {
-                    operation_id: 0,
-                    timestamp_ms: 0,
-                    package_name,
-                    uid: record.uid,
-                    pid_list: processes.iter().map(|process| process.pid).collect(),
-                    action: ControlAction::Postpone,
-                    backend: backend_name(&processes).to_owned(),
-                    reason: if sample.is_ok() {
-                        "download activity sampling/threshold".to_owned()
-                    } else {
-                        "download sampling failed; fail-safe postpone".to_owned()
-                    },
-                    result: OperationResult::Postponed,
-                    details: operation_details(&processes),
-                };
-                stamp_operation(&mut operation, state, timestamp_ms);
-                state.operation_log.push(operation);
+                if previous_due.is_none() {
+                    let mut operation = ControlOperation {
+                        operation_id: 0,
+                        timestamp_ms: 0,
+                        package_name,
+                        uid: record.uid,
+                        pid_list: processes.iter().map(|process| process.pid).collect(),
+                        action: ControlAction::Postpone,
+                        backend: backend_name(&processes).to_owned(),
+                        reason: if sample.is_ok() {
+                            "download activity sampling/threshold".to_owned()
+                        } else {
+                            "download sampling failed; fail-safe postpone".to_owned()
+                        },
+                        result: OperationResult::Postponed,
+                        details: operation_details(&processes),
+                    };
+                    stamp_operation(&mut operation, state, timestamp_ms);
+                    state.operation_log.push(operation);
+                }
                 continue;
             }
         }
@@ -719,6 +891,11 @@ pub fn run_control_pass_with_sampling(
                     &mut unfreeze_process,
                 );
                 if let Some(failure) = freeze_outcome.failure {
+                    if failure.contains("shared uid contains multiple package identities") {
+                        state
+                            .blocked_process_signatures
+                            .insert(identity.clone(), process_signature.clone());
+                    }
                     if freeze_outcome.residual_possible {
                         state.frozen_apps.insert(identity.clone());
                     }
@@ -783,6 +960,7 @@ pub fn run_control_pass_with_sampling(
                             )
                         }
                     };
+                    state.pending_freezes.remove(&identity);
                     let mut operation = ControlOperation {
                         operation_id: 0,
                         timestamp_ms: 0,
@@ -871,6 +1049,11 @@ pub fn run_control_pass_with_sampling(
                     &mut unfreeze_process,
                 );
                 if let Some(failure) = outcome.failure {
+                    if failure.contains("shared uid contains multiple package identities") {
+                        state
+                            .blocked_process_signatures
+                            .insert(identity.clone(), process_signature.clone());
+                    }
                     if outcome.rollback_failures > 0 {
                         state.frozen_apps.insert(identity.clone());
                     }
@@ -1048,7 +1231,10 @@ fn apply_freeze_transaction(
             }
         }
         if let Err(error) = freeze_process(process) {
-            failure = Some(format!("signal failed for pid {}: {error}", process.pid));
+            failure = Some(format!(
+                "control apply failed for pid {}: {error}",
+                process.pid
+            ));
             break;
         }
         signaled.push(process);

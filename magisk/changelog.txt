@@ -1,15 +1,30 @@
-### v3.3.1SelfUse foreground resume hotfix
+### v3.3.2SelfUse
 
-- Always send `SIGCONT` after cgroup/Binder unfreeze so a process previously
-  stopped by the signal fallback cannot remain suspended when it returns to
-  the foreground.
-- Add a regression test for cgroup/Binder plus signal-fallback recovery.
+- 修复 Manager 无操作保存时写入展示默认项的问题。
+- 保留 `appcfg.txt` 原有包名、顺序、注释、空行与未修改内容。
+- 修复冻结状态页因 daemon 缺少命令 11 而始终空白的问题。
+- 相同共享 UID 进程集合的安全拒绝只记录一次，避免每秒刷屏。
+- 下载延迟持续续期时只记录首次事件，避免重复刷屏。
+- 将通用控制失败文案从误导性的 signal 失败改为控制应用失败。
+- 清空工作日志前增加确认框，避免误触丢失日志。
+- 设置页新增 INFO、WARN、ERROR、CRITICAL、DEBUG 五档日志等级。
+- INFO 保持旧 C++ 管理器样式，详细 Rust 诊断仅在 DEBUG 显示。
+- 清空日志后不再从运行时缓冲恢复旧记录。
+- 修复设置写入和多个页面并发请求的响应串线。
+- 修复配置页重建时的空配置保存风险和非法模式归一化。
+- 修复共享 UID 枚举顺序变化、进程退出后的幽灵等待状态与并发日志覆盖。
+- 安装器不再卸载 NoANR；管理器覆盖失败会中止模块升级。
+- 正式发布增加同次构建会话、APK 签名证书和来源证明门禁。
 
-### v3.3.0SelfUse release structure
+### v3.3.1SelfUse
 
-- Use the top-level `magisk/` directory as a source-only module template.
-- Package exactly one Rust `aarch64-linux-android` daemon as `freezeit`.
-- Reject x64 and legacy C++ daemon payload names.
-- Build and package through disposable staging with version, ELF, SHA256, and
-  provenance validation.
-- Do not publish update metadata until the final archive validates.
+- cgroup/Binder 解冻流程结束时始终发送 `SIGCONT`，避免 signal 降级冻结过的应用回到前台后仍保持暂停。
+- 增加 cgroup/Binder 与 signal 降级恢复的回归测试。
+
+### v3.3.0SelfUse
+
+- 顶层 `magisk/` 作为不含构建产物的模块模板。
+- 发布包只包含一个由 Rust 构建的 ARM64 守护进程 `freezeit`。
+- 拒绝 x64、旧 C++ 守护进程名称和多个 daemon。
+- 使用临时 staging 完成版本、ELF、SHA-256 与来源校验。
+- 最终压缩包验证前不更新在线更新元数据。

@@ -1,6 +1,7 @@
 package io.github.jark006.freezeit.fragment;
 
 import android.annotation.SuppressLint;
+import android.app.AlertDialog;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -25,7 +26,6 @@ import java.util.TimerTask;
 import io.github.jark006.freezeit.AppInfoCache;
 import io.github.jark006.freezeit.ManagerCmd;
 import io.github.jark006.freezeit.R;
-import io.github.jark006.freezeit.StaticData;
 import io.github.jark006.freezeit.Utils;
 import io.github.jark006.freezeit.databinding.FragmentLogcatBinding;
 
@@ -39,6 +39,7 @@ public class Logcat extends Fragment {
     int lastLogLen = 0;
     long lastTimestamp = 0;
     boolean isGetWorkLog = true;
+    AlertDialog clearDialog;
 
     public View onCreateView(@NonNull LayoutInflater inflater,
                              ViewGroup container, Bundle savedInstanceState) {
@@ -71,10 +72,12 @@ public class Logcat extends Fragment {
                 } else if (id == R.id.update_label) {
                     Toast.makeText(requireContext(), R.string.update_start, Toast.LENGTH_SHORT).show();
                     new Thread(() -> {
-                        var recvLen = Utils.freezeitTask(ManagerCmd.setAppLabel, AppInfoCache.getAppLabelBytes());
+                        Utils.TaskResult result = Utils.freezeitTaskResult(
+                                ManagerCmd.setAppLabel,
+                                AppInfoCache.getAppLabelBytes());
 
-                        handler.sendEmptyMessage((recvLen == 7 &&
-                                new String(StaticData.response, 0, 7).equals("success")) ?
+                        handler.sendEmptyMessage((result.length() == 7 &&
+                                new String(result.payload()).equals("success")) ?
                                 UPDATE_LABEL_SUCCESS : UPDATE_LABEL_FAIL);
                     }).start();
                 }
@@ -102,8 +105,17 @@ public class Logcat extends Fragment {
             }
             lastTimestamp = now;
 
-            isGetWorkLog = true;
-            new Thread(() -> logTask(ManagerCmd.clearLog)).start();
+            clearDialog = new AlertDialog.Builder(requireContext())
+                    .setTitle(R.string.clear_log_text)
+                    .setMessage(R.string.clear_log_confirm)
+                    .setNegativeButton(android.R.string.cancel, null)
+                    .setPositiveButton(R.string.clear_log_text, (dialog, which) -> {
+                        isGetWorkLog = true;
+                        new Thread(() -> logTask(ManagerCmd.clearLog)).start();
+                    })
+                    .create();
+            clearDialog.setOnDismissListener(dialog -> clearDialog = null);
+            clearDialog.show();
         });
 
         return binding.getRoot();
@@ -111,6 +123,12 @@ public class Logcat extends Fragment {
 
     @Override
     public void onDestroyView() {
+        cancelTimer();
+        handler.removeCallbacksAndMessages(null);
+        if (clearDialog != null) {
+            clearDialog.dismiss();
+            clearDialog = null;
+        }
         super.onDestroyView();
         binding = null;
     }
@@ -135,6 +153,7 @@ public class Logcat extends Fragment {
     }
 
     void resetTimer() {
+        cancelTimer();
         lastLogLen = 0;
         timer = new Timer();
         timer.schedule(new TimerTask() {
@@ -146,11 +165,11 @@ public class Logcat extends Fragment {
     }
 
     void logTask(byte cmd) {
-        var recvLen = Utils.freezeitTask(cmd, null);
-        if (recvLen == 0 || recvLen == lastLogLen)
+        Utils.TaskResult result = Utils.freezeitTaskResult(cmd, null);
+        if (result.length() == 0 || result.length() == lastLogLen)
             return;
-        lastLogLen = recvLen;
-        handler.sendEmptyMessage(NEW_LOG_CONTENT);
+        lastLogLen = result.length();
+        handler.sendMessage(Message.obtain(handler, NEW_LOG_CONTENT, result.payload()));
     }
 
     void scrollLogToBottom() {
@@ -176,7 +195,7 @@ public class Logcat extends Fragment {
 
             switch (msg.what) {
                 case NEW_LOG_CONTENT:
-                    binding.logView.setText(new String(StaticData.response, 0, lastLogLen));
+                    binding.logView.setText(new String((byte[]) msg.obj));
                     binding.logView.post(Logcat.this::scrollLogToBottom);
                     break;
 

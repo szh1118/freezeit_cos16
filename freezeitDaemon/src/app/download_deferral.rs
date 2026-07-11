@@ -31,6 +31,10 @@ pub struct DownloadDeferral {
 }
 
 impl DownloadDeferral {
+    pub fn clear_uid(&mut self, uid: u32) {
+        self.samples.remove(&uid);
+    }
+
     pub fn evaluate(
         &mut self,
         uid: u32,

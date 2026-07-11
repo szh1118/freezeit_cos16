@@ -1,12 +1,29 @@
+### v3.3.2SelfUse
+
+1. 修复 Manager 无操作保存时把展示默认项写入配置的问题。
+2. 保留 `appcfg.txt` 原有包名、顺序、注释、空行与未修改字节；文件缺失时安全重建。
+3. 实现 daemon 命令 11 的冻结状态快照，恢复 Manager 冻结状态页。
+4. 对相同共享 UID 进程集合的安全拒绝去重，避免日志每秒刷屏。
+5. 下载延迟持续续期时只记录首次事件，避免同一下载状态反复刷屏。
+6. 修正控制事务错误文案，不再把 Binder/cgroup 失败统一写成 signal 失败。
+7. 清空工作日志前增加明确确认框，取消操作不会改动日志。
+8. 用五档日志等级替代“调试日志”开关：INFO、WARN、ERROR、CRITICAL、DEBUG。
+9. INFO 严格恢复旧 C++ 管理器格式；Rust 运行时、UID/PID、后端、结果和原因仅在 DEBUG 中显示。
+10. 修复清空日志后旧操作从运行时环形缓冲再次出现的问题。
+11. 修复设置页异步响应串线、普通控件写入失败不回滚，以及多个页面共享响应缓冲导致的内容覆盖。
+12. 修复配置页重建后可能发送空或残缺配置、非法冻结模式未归一化的问题。
+13. 修复控制线程快照覆盖并发日志、共享 UID 枚举顺序变化重复告警、进程退出后残留幽灵等待状态。
+14. 安装器不再静默卸载 NoANR；管理器覆盖失败时中止模块升级，避免新守护进程与旧管理器混用。
+15. 正式发布增加同次构建会话、APK 签名证书和 provenance v2 门禁。
+
 ### v3.3.1SelfUse
 
-- Fix foreground apps remaining `SIGSTOP`-suspended after a previous signal
-  fallback freeze.
-- Ensure every unfreeze sequence ends with `SIGCONT`.
+- 修复应用经 signal 降级冻结后，回到前台仍保持 `SIGSTOP` 暂停的问题。
+- 确保每条解冻序列最终都会发送 `SIGCONT`。
 
 ### v3.3.0SelfUse
 
-1. 后台 daemon 完成 Rust-only ARM64 收敛，活动代码树不再包含旧 C++ daemon、x64 fallback 或旧构建链。
+1. 后台守护进程完成仅 Rust 的 ARM64 收敛，活动代码树不再包含旧 C++ 守护进程、x64 降级载荷或旧构建链。
 2. 移除 F83 指纹、型号、内核与 readiness 硬编码；运行时报告区分验证目标、实际能力、控制许可和限制原因。
 3. 修复 Binder freezer UAPI、PID 身份复验、signal 事务回滚、配置原子持久化和 fail-closed 控制门禁。
 4. 将下载中延迟冻结、启动期异常解冻审计、Regular Refreeze 与大命令输出排空迁移到 Rust 并加入合同测试。

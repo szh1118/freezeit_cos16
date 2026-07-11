@@ -34,13 +34,13 @@ import io.github.jark006.freezeit.Utils;
 public class Settings extends AppCompatActivity implements View.OnClickListener {
     final int INIT_UI = 1, SET_VAR_SUCCESS = 2, SET_VAR_FAIL = 3;
 
-    Spinner freezeModeSpinner, reFreezeTimeoutSpinner, wakeupTimeoutSpinner;
+    Spinner freezeModeSpinner, reFreezeTimeoutSpinner, wakeupTimeoutSpinner, logLevelSpinner;
     SeekBar freezeTimeoutSeekbar, terminateTimeoutSeekbar;
     TextView freezeTimeoutValueText, terminateTimeoutValueText;
 
     @SuppressLint("UseSwitchCompatOrMaterialCode")
     Switch batterySwitch, currentSwitch,  doubleCellSwitch,
-            lmkSwitch, dozeSwitch, debugSwitch;
+            lmkSwitch, dozeSwitch;
 
     final int freezeTimeoutIdx = 2;
     final int wakeupTimeoutIdx = 3;
@@ -59,9 +59,6 @@ public class Settings extends AppCompatActivity implements View.OnClickListener 
     byte[] settingsVar = new byte[256];
     long lastTimestamp = 0;
 
-    int varIndexForHandle = 0;
-    int newValueForHandle = 0;
-
     ActivityResultLauncher<Intent> pickPicture;
 
     @Override
@@ -79,13 +76,14 @@ public class Settings extends AppCompatActivity implements View.OnClickListener 
         findViewById(R.id.double_cell_title).setOnClickListener(this);
         findViewById(R.id.lmk_title).setOnClickListener(this);
         findViewById(R.id.doze_title).setOnClickListener(this);
-        findViewById(R.id.debug_title).setOnClickListener(this);
+        findViewById(R.id.log_level_title).setOnClickListener(this);
 
         findViewById(R.id.set_bg).setOnClickListener(this);
 
         freezeModeSpinner = findViewById(R.id.freeze_mode_spinner);
         reFreezeTimeoutSpinner = findViewById(R.id.refreeze_timeout_spinner);
         wakeupTimeoutSpinner = findViewById(R.id.wakeup_timeout_spinner);
+        logLevelSpinner = findViewById(R.id.log_level_spinner);
 
         freezeTimeoutValueText = findViewById(R.id.freeze_timeout_value_text);
         terminateTimeoutValueText = findViewById(R.id.terminate_timeout_value_text);
@@ -98,7 +96,6 @@ public class Settings extends AppCompatActivity implements View.OnClickListener 
         doubleCellSwitch = findViewById(R.id.switch_double_cell);
         lmkSwitch = findViewById(R.id.switch_lmk);
         dozeSwitch = findViewById(R.id.switch_doze);
-        debugSwitch = findViewById(R.id.switch_debug);
 
         if (this.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) !=
                 PackageManager.PERMISSION_GRANTED) {
@@ -143,14 +140,13 @@ public class Settings extends AppCompatActivity implements View.OnClickListener 
         super.onResume();
         findViewById(R.id.container).setBackground(StaticData.getBackgroundDrawable(this));
         new Thread(() -> {
-            var recvLen = Utils.freezeitTask(ManagerCmd.getSettings, null);
-            if (recvLen != 256) {
+            Utils.TaskResult result = Utils.freezeitTaskResult(ManagerCmd.getSettings, null);
+            if (result.length() != 256) {
                 handler.post(() -> Toast.makeText(getBaseContext(),
                         getString(R.string.get_settings_fail), Toast.LENGTH_LONG).show());
                 return;
             }
-            System.arraycopy(StaticData.response, 0, settingsVar, 0, 256);
-            handler.sendEmptyMessage(INIT_UI);
+            handler.sendMessage(Message.obtain(handler, INIT_UI, result.payload()));
         }
         ).start();
     }
@@ -173,9 +169,36 @@ public class Settings extends AppCompatActivity implements View.OnClickListener 
                 }
                 lastTimestamp = now;
 
-                varIndexForHandle = idx;
-                newValueForHandle = spinnerPosition;
-                setVarTask();
+                setVarTask(idx, spinnerPosition);
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {
+            }
+        });
+    }
+
+    void InitLogLevelSpinner() {
+        logLevelSpinner.setSelection(
+                LogLevelCodec.toSpinnerPosition(Byte.toUnsignedInt(settingsVar[debugIdx])));
+
+        logLevelSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int spinnerPosition, long id) {
+                int storageValue = LogLevelCodec.toStorageValue(spinnerPosition);
+                if (Byte.toUnsignedInt(settingsVar[debugIdx]) == storageValue)
+                    return;
+
+                var now = System.currentTimeMillis();
+                if ((now - lastTimestamp) < 1000) {
+                    Toast.makeText(getBaseContext(), getString(R.string.slowly_tips), Toast.LENGTH_LONG).show();
+                    logLevelSpinner.setSelection(
+                            LogLevelCodec.toSpinnerPosition(Byte.toUnsignedInt(settingsVar[debugIdx])));
+                    return;
+                }
+                lastTimestamp = now;
+
+                setVarTask(debugIdx, storageValue);
             }
 
             @Override
@@ -212,9 +235,7 @@ public class Settings extends AppCompatActivity implements View.OnClickListener 
                 }
                 lastTimestamp = now;
 
-                varIndexForHandle = idx;
-                newValueForHandle = seekBar.getProgress();
-                setVarTask();
+                setVarTask(idx, seekBar.getProgress());
             }
         });
     }
@@ -234,23 +255,23 @@ public class Settings extends AppCompatActivity implements View.OnClickListener 
             }
             lastTimestamp = now;
 
-            varIndexForHandle = idx;
-            newValueForHandle = isChecked ? 1 : 0;
-            setVarTask();
+            setVarTask(idx, isChecked ? 1 : 0);
         });
     }
 
-    void setVarTask() {
+    void setVarTask(int index, int value) {
         new Thread(() -> {
-            byte[] request = {(byte) varIndexForHandle, (byte) newValueForHandle};
-            var recvLen = Utils.freezeitTask(ManagerCmd.setSettingsVar, request);
+            byte[] request = {(byte) index, (byte) value};
+            Utils.TaskResult result = Utils.freezeitTaskResult(ManagerCmd.setSettingsVar, request);
 
             Message msg = Message.obtain();
-            if (recvLen == 0) {
+            msg.arg1 = index;
+            msg.arg2 = value;
+            if (result.length() == 0) {
                 msg.what = SET_VAR_FAIL;
                 msg.obj = "UnknownError";
             } else {
-                String res = new String(StaticData.response, 0, recvLen);
+                String res = new String(result.payload());
                 if (res.equals("success")) {
                     msg.what = SET_VAR_SUCCESS;
                 } else {
@@ -268,6 +289,7 @@ public class Settings extends AppCompatActivity implements View.OnClickListener 
         public void handleMessage(Message msg) {
             switch (msg.what) {
                 case INIT_UI:
+                    System.arraycopy((byte[]) msg.obj, 0, settingsVar, 0, settingsVar.length);
                     InitSpinner(freezeModeSpinner, freezeModeIdx);
                     InitSpinner(reFreezeTimeoutSpinner, reFreezeTimeoutIdx);
                     InitSpinner(wakeupTimeoutSpinner, wakeupTimeoutIdx);
@@ -280,19 +302,66 @@ public class Settings extends AppCompatActivity implements View.OnClickListener 
                     InitSwitch(doubleCellSwitch, doubleCellIdx);
                     InitSwitch(lmkSwitch, lmkIdx);
                     InitSwitch(dozeSwitch, dozeIdx);
-                    InitSwitch(debugSwitch, debugIdx);
+                    InitLogLevelSpinner();
                     break;
 
                 case SET_VAR_SUCCESS:
-                    settingsVar[varIndexForHandle] = (byte) newValueForHandle;
+                    settingsVar[msg.arg1] = (byte) msg.arg2;
                     break;
 
                 case SET_VAR_FAIL:
+                    if (msg.arg1 == debugIdx) {
+                        logLevelSpinner.setSelection(
+                                LogLevelCodec.toSpinnerPosition(Byte.toUnsignedInt(settingsVar[debugIdx])));
+                    } else {
+                        restoreSettingControl(msg.arg1);
+                    }
                     Toast.makeText(getBaseContext(), getString(R.string.setup_failed) + ": " + msg.obj, Toast.LENGTH_LONG).show();
                     break;
             }
         }
     };
+
+    private void restoreSettingControl(int index) {
+        switch (index) {
+            case freezeModeIdx:
+                freezeModeSpinner.setSelection(Byte.toUnsignedInt(settingsVar[index]));
+                break;
+            case reFreezeTimeoutIdx:
+                reFreezeTimeoutSpinner.setSelection(Byte.toUnsignedInt(settingsVar[index]));
+                break;
+            case wakeupTimeoutIdx:
+                wakeupTimeoutSpinner.setSelection(Byte.toUnsignedInt(settingsVar[index]));
+                break;
+            case freezeTimeoutIdx:
+                freezeTimeoutSeekbar.setProgress(Byte.toUnsignedInt(settingsVar[index]));
+                freezeTimeoutValueText.setText(String.valueOf(Byte.toUnsignedInt(settingsVar[index])));
+                break;
+            case terminateTimeoutIdx:
+                terminateTimeoutSeekbar.setProgress(Byte.toUnsignedInt(settingsVar[index]));
+                terminateTimeoutValueText.setText(String.valueOf(Byte.toUnsignedInt(settingsVar[index])));
+                break;
+            case batteryIdx:
+                batterySwitch.setChecked(settingsVar[index] != 0);
+                break;
+            case currentIdx:
+                currentSwitch.setChecked(settingsVar[index] != 0);
+                break;
+            case doubleCellIdx:
+                doubleCellSwitch.setChecked(settingsVar[index] != 0);
+                break;
+            case lmkIdx:
+                lmkSwitch.setChecked(settingsVar[index] != 0);
+                break;
+            case dozeIdx:
+                dozeSwitch.setChecked(settingsVar[index] != 0);
+                break;
+            case debugIdx:
+                logLevelSpinner.setSelection(
+                        LogLevelCodec.toSpinnerPosition(Byte.toUnsignedInt(settingsVar[index])));
+                break;
+        }
+    }
 
     @Override
     public void onClick(View v) {
@@ -317,8 +386,8 @@ public class Settings extends AppCompatActivity implements View.OnClickListener 
             Utils.textDialog(this, R.string.lmk_title, R.string.lmk_tips);
         } else if (id == R.id.doze_title) {
             Utils.textDialog(this, R.string.doze_title, R.string.doze_tips);
-        } else if (id == R.id.debug_title) {
-            Utils.textDialog(this, R.string.debug_title, R.string.debug_tips);
+        } else if (id == R.id.log_level_title) {
+            Utils.textDialog(this, R.string.log_level_title, R.string.log_level_tips);
         } else if (id == R.id.set_bg) {
             Intent intent = new Intent("android.intent.action.GET_CONTENT");
             intent.setType("image/*");

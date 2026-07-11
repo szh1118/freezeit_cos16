@@ -23,7 +23,7 @@ use freezeit_daemon::{
     protocol::manager_v1::ManagerAppConfigRecord,
     sys::socket::{require_foreground_uids_for_control, should_run_control_pass},
 };
-use std::cell::RefCell;
+use std::{cell::RefCell, collections::BTreeMap};
 
 #[test]
 fn background_delay_reaches_pending_then_frozen_and_foreground_cancels() {
@@ -87,6 +87,43 @@ fn controller_rejects_stale_uid_before_freeze_control() {
         .expect_err("stale uid must block control");
 
     assert!(error.to_string().contains("uid changed"));
+}
+
+#[test]
+fn runtime_status_snapshot_reports_frozen_and_foreground_rows() {
+    let mut state = RuntimeControlState::default();
+    let config = vec![ManagerAppConfigRecord {
+        uid: 10_123,
+        mode: 30,
+        permissive: false,
+    }];
+    let processes = vec![process()];
+
+    run_control_pass(
+        &mut state,
+        &config,
+        |_, _| Ok(processes.clone()),
+        |_| Ok(()),
+        |_| Ok(()),
+        &[],
+        1_000,
+    )
+    .expect("freeze succeeds");
+
+    let processes_by_uid = BTreeMap::from([(10_123, processes.clone())]);
+    let frozen = state.freeze_status_records(&config, &processes_by_uid, &[], 4_000);
+    assert_eq!(frozen.len(), 1);
+    assert_eq!(frozen[0].uid, 10_123);
+    assert!(!frozen[0].foreground);
+    assert_eq!(frozen[0].state, 3);
+    assert_eq!(frozen[0].seconds, 0);
+    assert_eq!(frozen[0].process_count, 1);
+
+    let foreground = state.freeze_status_records(&config, &processes_by_uid, &[10_123], 5_000);
+    assert_eq!(foreground.len(), 1);
+    assert!(foreground[0].foreground);
+    assert_eq!(foreground[0].state, 1);
+    assert_eq!(foreground[0].seconds, 0);
 }
 
 #[test]
@@ -416,6 +453,8 @@ fn signal_batch_rolls_back_in_reverse_and_records_failed_when_rollback_completes
     let json = state.operation_log.to_json();
     assert!(json.contains("\"result\":\"failed\""));
     assert!(json.contains("rolled_back=2"));
+    assert!(json.contains("control apply failed for pid 103"));
+    assert!(!json.contains("signal failed for pid 103"));
 }
 
 #[test]
@@ -500,10 +539,155 @@ fn signal_batch_rejects_shared_uid_packages_before_any_signal() {
     )
     .expect("shared uid is rejected safely");
 
+    run_control_pass_with_validation(
+        &mut state,
+        &config,
+        &[],
+        |_, _| Ok(vec![first.clone(), other.clone()]),
+        |process| {
+            signals.borrow_mut().push(("stop", process.pid));
+            Ok(())
+        },
+        |process| {
+            signals.borrow_mut().push(("cont", process.pid));
+            Ok(())
+        },
+        |_| Ok(true),
+        &[],
+        2_000,
+    )
+    .expect("unchanged shared uid rejection is suppressed");
+
     assert!(signals.borrow().is_empty());
+    assert_eq!(state.operation_log.records().count(), 1);
     let json = state.operation_log.to_json();
     assert!(json.contains("shared uid contains multiple package identities"));
     assert!(json.contains("\"result\":\"failed\""));
+}
+
+#[test]
+fn shared_uid_rejection_is_deduplicated_when_proc_order_changes() {
+    let mut state = RuntimeControlState::default();
+    let config = vec![ManagerAppConfigRecord {
+        uid: 10_123,
+        mode: 30,
+        permissive: false,
+    }];
+    let mut first = process();
+    first.pid = 301;
+    first.cgroup_freeze_path = None;
+    let mut other = first.clone();
+    other.pid = 302;
+    other.package_name = "com.other.shared".to_owned();
+    other.process_name = "com.other.shared".to_owned();
+
+    for processes in [
+        vec![first.clone(), other.clone()],
+        vec![other.clone(), first.clone()],
+    ] {
+        run_control_pass_with_validation(
+            &mut state,
+            &config,
+            &[],
+            |_, _| Ok(processes.clone()),
+            |_| Ok(()),
+            |_| Ok(()),
+            |_| Ok(true),
+            &[],
+            1_000,
+        )
+        .expect("shared uid rejection remains safe");
+    }
+
+    assert_eq!(state.operation_log.records().count(), 1);
+}
+
+#[test]
+fn process_exit_clears_pending_freeze_status() {
+    let mut state = RuntimeControlState::default();
+    let config = vec![ManagerAppConfigRecord {
+        uid: 10_123,
+        mode: 30,
+        permissive: false,
+    }];
+    let mut settings = freezeit_daemon::protocol::manager_v1::legacy_default_settings();
+    settings[2] = 3;
+
+    run_control_pass_with_settings(
+        &mut state,
+        &config,
+        &settings,
+        |_, _| Ok(vec![process()]),
+        |_| Ok(()),
+        |_| Ok(()),
+        &[],
+        0,
+    )
+    .expect("first pass schedules pending freeze");
+
+    run_control_pass_with_settings(
+        &mut state,
+        &config,
+        &settings,
+        |_, _| Ok(Vec::new()),
+        |_| Ok(()),
+        |_| Ok(()),
+        &[],
+        1_000,
+    )
+    .expect("empty process pass clears stale state");
+
+    let rows = state.freeze_status_records(&config, &BTreeMap::new(), &[], 1_000);
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn terminal_shared_uid_failure_clears_expired_pending_status() {
+    let mut state = RuntimeControlState::default();
+    let config = vec![ManagerAppConfigRecord {
+        uid: 10_123,
+        mode: 30,
+        permissive: false,
+    }];
+    let mut settings = vec![0_u8; 256];
+    settings[2] = 1;
+    let mut first = process();
+    first.cgroup_freeze_path = Some("/sys/fs/cgroup/uid_10123/cgroup.freeze".to_owned());
+    let mut other = first.clone();
+    other.pid = 302;
+    other.package_name = "com.other.shared".to_owned();
+    other.process_name = "com.other.shared".to_owned();
+    let processes = vec![first, other];
+
+    run_control_pass_with_validation(
+        &mut state,
+        &config,
+        &settings,
+        |_, _| Ok(processes.clone()),
+        |_| Ok(()),
+        |_| Ok(()),
+        |_| Ok(true),
+        &[],
+        0,
+    )
+    .expect("first pass schedules freeze");
+    run_control_pass_with_validation(
+        &mut state,
+        &config,
+        &settings,
+        |_, _| Ok(processes.clone()),
+        |_| Ok(()),
+        |_| Ok(()),
+        |_| Ok(true),
+        &[],
+        2_000,
+    )
+    .expect("expired pending freeze is rejected safely");
+
+    let rows =
+        state.freeze_status_records(&config, &BTreeMap::from([(10_123, processes)]), &[], 2_000);
+    assert_eq!(rows.len(), 1);
+    assert_ne!(rows[0].state, 2);
 }
 
 #[test]

@@ -3,13 +3,20 @@ plugins {
     id 'org.jetbrains.kotlin.android' version '1.8.0' apply false
 }
 
+def requestedReleaseKind = providers.environmentVariable('RELEASE_KIND')
+        .orElse('candidate')
+        .get()
+if (!(requestedReleaseKind in ['candidate', 'released'])) {
+    throw new GradleException("RELEASE_KIND must be candidate or released")
+}
+
 android {
     signingConfigs {
         release {
             def localStore = providers.gradleProperty('FREEZEIT_KEYSTORE')
                     .orElse(providers.environmentVariable('FREEZEIT_KEYSTORE'))
                     .orNull
-            if (localStore != null && file(localStore).exists()) {
+            if (localStore != null && file(localStore).isFile()) {
                 storeFile file(localStore)
                 storePassword providers.gradleProperty('FREEZEIT_KEYSTORE_PASSWORD')
                         .orElse(providers.environmentVariable('FREEZEIT_KEYSTORE_PASSWORD'))
@@ -24,6 +31,9 @@ android {
                         .orElse(storePassword)
                         .get()
             } else {
+                if (requestedReleaseKind == 'released') {
+                    throw new GradleException("RELEASE_KIND=released requires FREEZEIT_KEYSTORE to reference an existing keystore")
+                }
                 initWith signingConfigs.debug
             }
         }
@@ -34,8 +44,8 @@ android {
         applicationId "io.github.jark006.freezeit"
         minSdk 31
         targetSdk 34
-        versionCode 303001
-        versionName "3.3.1SelfUse"
+        versionCode 303002
+        versionName "3.3.2SelfUse"
 
         resValue "string", "versionName", "${versionName}"
         signingConfig signingConfigs.release

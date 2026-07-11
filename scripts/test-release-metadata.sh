@@ -5,8 +5,8 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 update_json="${UPDATE_JSON:-$root/freezeitRelease/update.json}"
 release_dir="${RELEASE_DIR:-$root/freezeitRelease}"
 mode="${1:-planned}"
-planned_version="${2:-3.3.1SelfUse}"
-planned_code="${3:-303001}"
+planned_version="${2:-3.3.2SelfUse}"
+planned_code="${3:-303002}"
 
 fail() { echo "release metadata test failed: $*" >&2; exit 1; }
 [[ "$mode" == planned || "$mode" == released ]] || fail "mode must be planned or released"
@@ -46,7 +46,7 @@ PY
 [[ ${#published[@]} -eq 4 ]] || fail "cannot parse update metadata"
 
 if [[ "$mode" == planned ]]; then
-  [[ "${published[0]}" != "$planned_version" || "${published[1]}" != "$planned_code" ]] \
+  [[ "${published[0]}" != "$planned_version" && "${published[1]}" != "$planned_code" ]] \
     || fail "planned version must not be advertised before artifact validation"
 else
   [[ "${published[0]}" == "$planned_version" ]] || fail "released version mismatch"

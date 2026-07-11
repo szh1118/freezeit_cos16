@@ -14,6 +14,7 @@ use crate::{
             sync_loaded_config_to_hook, RuntimeControlState,
         },
         error::DaemonError,
+        logging::LogRecord,
     },
     protocol::{
         manager_v1::{
@@ -52,10 +53,11 @@ pub fn handle_single_manager_stream(
 }
 
 fn run_live_control_pass(
-    state: &ReadOnlyState,
+    state: &mut ReadOnlyState,
     control_state: &mut RuntimeControlState,
 ) -> Result<(), DaemonError> {
     if !should_run_control_pass(state) {
+        state.freeze_status.clear();
         return Ok(());
     }
 
@@ -99,7 +101,14 @@ fn run_live_control_pass(
         },
         &foreground_uids,
         timestamp_ms,
-    )
+    )?;
+    state.freeze_status = control_state.freeze_status_records(
+        &state.app_config,
+        &processes_by_uid,
+        &foreground_uids,
+        timestamp_ms,
+    );
+    Ok(())
 }
 
 pub fn should_run_control_pass(state: &ReadOnlyState) -> bool {
@@ -242,7 +251,7 @@ fn spawn_control_loop(
 ) {
     thread::spawn(move || loop {
         thread::sleep(std::time::Duration::from_secs(1));
-        let state_snapshot = match state.lock() {
+        let mut state_snapshot = match state.lock() {
             Ok(mut state) => {
                 refresh_hook_health(&mut state);
                 state.clone()
@@ -259,11 +268,15 @@ fn spawn_control_loop(
                 continue;
             }
         };
-        if let Err(error) = run_live_control_pass(&state_snapshot, &mut control_state) {
+        if let Err(error) = run_live_control_pass(&mut state_snapshot, &mut control_state) {
             eprintln!("control loop pass failed: {error}");
         }
         let operation_log_json = control_state.operation_log.to_json();
-        let operation_log_text = control_state.operation_log.to_legacy_text();
+        let operations = control_state
+            .operation_log
+            .records()
+            .cloned()
+            .collect::<Vec<_>>();
         drop(control_state);
 
         let mut state = match state.lock() {
@@ -274,7 +287,10 @@ fn spawn_control_loop(
             }
         };
         state.operation_log_json = operation_log_json;
-        state.operation_log_text = operation_log_text;
+        for operation in operations {
+            state.manager_log.push(LogRecord::operation(operation));
+        }
+        state.freeze_status = state_snapshot.freeze_status;
     });
 }
 

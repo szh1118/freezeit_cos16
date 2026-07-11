@@ -34,6 +34,7 @@ pub struct RuntimeEnvironment {
 }
 
 impl RuntimeEnvironment {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device_model: impl Into<String>,
         android_version: impl Into<String>,

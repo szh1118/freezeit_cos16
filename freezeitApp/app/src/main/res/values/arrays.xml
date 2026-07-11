@@ -43,4 +43,12 @@
         <item>2 hour</item>
     </string-array>
 
+    <string-array name="log_levels">
+        <item>INFO</item>
+        <item>WARN</item>
+        <item>ERROR</item>
+        <item>CRITICAL</item>
+        <item>DEBUG</item>
+    </string-array>
+
 </resources>

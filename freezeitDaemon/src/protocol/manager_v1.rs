@@ -7,8 +7,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::app::error::DaemonError;
-use crate::app::operation_log::legacy_timestamped_line;
+use crate::app::{
+    error::DaemonError,
+    logging::{decode_log_view, LogRecord, ManagerLog, LOG_LEVEL_SETTING_INDEX},
+};
+use crate::config::migration::parse_legacy_policy_line;
 
 pub const MANAGER_LISTEN_HOST: &str = "127.0.0.1";
 pub const MANAGER_LISTEN_PORT: u16 = 60613;
@@ -30,6 +33,7 @@ pub enum ManagerCommand {
     GetSettings = 8,
     GetUidTime = 9,
     GetXpLog = 10,
+    GetFreezeStatus = 11,
     SetAppCfg = 21,
     SetAppLabel = 22,
     SetSettingsVar = 23,
@@ -55,6 +59,7 @@ impl TryFrom<u8> for ManagerCommand {
             8 => Ok(Self::GetSettings),
             9 => Ok(Self::GetUidTime),
             10 => Ok(Self::GetXpLog),
+            11 => Ok(Self::GetFreezeStatus),
             21 => Ok(Self::SetAppCfg),
             22 => Ok(Self::SetAppLabel),
             23 => Ok(Self::SetSettingsVar),
@@ -85,6 +90,15 @@ pub struct ManagerAppConfigRecord {
     pub permissive: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManagerFreezeStatusRecord {
+    pub uid: u32,
+    pub foreground: bool,
+    pub state: i32,
+    pub seconds: i32,
+    pub process_count: i32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadOnlyState {
     pub module_id: String,
@@ -93,11 +107,12 @@ pub struct ReadOnlyState {
     pub version_code: u32,
     pub author: String,
     pub cluster_num: u32,
-    pub log: String,
+    pub manager_log: ManagerLog,
     pub changelog: String,
     pub settings: Vec<u8>,
     pub xp_log: String,
     pub app_config: Vec<ManagerAppConfigRecord>,
+    pub freeze_status: Vec<ManagerFreezeStatusRecord>,
     pub module_env: String,
     pub work_mode: String,
     pub android_version: String,
@@ -109,7 +124,6 @@ pub struct ReadOnlyState {
     pub capability_report_json: String,
     pub compatibility_report_json: String,
     pub operation_log_json: String,
-    pub operation_log_text: String,
     pub self_check_json: String,
     pub control_allowed: bool,
     pub verified_targets: Vec<(String, u32)>,
@@ -130,11 +144,12 @@ impl Default for ReadOnlyState {
             version_code: 1,
             author: "jark006".to_owned(),
             cluster_num: 0,
-            log: "daemon starting\n".to_owned(),
+            manager_log: ManagerLog::default(),
             changelog: String::new(),
             settings: legacy_default_settings(),
             xp_log: "hook health unknown\n".to_owned(),
             app_config: Vec::new(),
+            freeze_status: Vec::new(),
             module_env: "Magisk".to_owned(),
             work_mode: "Rust daemon degraded".to_owned(),
             android_version: "Unknown".to_owned(),
@@ -146,7 +161,6 @@ impl Default for ReadOnlyState {
             capability_report_json: "{\"capabilities\":[]}".to_owned(),
             compatibility_report_json: "{\"capabilities\":[]}".to_owned(),
             operation_log_json: "{\"operations\":[]}".to_owned(),
-            operation_log_text: String::new(),
             self_check_json: "{\"controlAllowed\":false}".to_owned(),
             control_allowed: false,
             verified_targets: Vec::new(),
@@ -215,14 +229,13 @@ pub fn handle_read_only_command(
         .into_bytes()),
         ManagerCommand::GetChangelog => Ok(state.changelog.as_bytes().to_vec()),
         ManagerCommand::GetLog => {
-            let mut log = state.log.clone();
-            if !state.operation_log_text.is_empty() {
-                if !log.ends_with('\n') {
-                    log.push('\n');
-                }
-                log.push_str(&state.operation_log_text);
-            }
-            Ok(log.into_bytes())
+            let raw = state
+                .settings
+                .get(LOG_LEVEL_SETTING_INDEX)
+                .copied()
+                .unwrap_or(0);
+            let (view, _) = decode_log_view(raw);
+            Ok(state.manager_log.render(view).into_bytes())
         }
         ManagerCommand::GetSettings => Ok(state.settings.clone()),
         ManagerCommand::GetXpLog => Ok(state.xp_log.as_bytes().to_vec()),
@@ -253,15 +266,17 @@ pub fn handle_manager_command(
 ) -> Result<Vec<u8>, DaemonError> {
     match frame.command {
         ManagerCommand::SetAppCfg => {
-            let xposed_payload = encode_xposed_config_payload(&state.settings, &frame.payload)?;
             let previous_records = state.app_config.clone();
             let previous_xposed_payload = encode_xposed_config_payload(
                 &state.settings,
                 &encode_app_config(&previous_records),
             )?;
-            let records = decode_app_config(&frame.payload)?;
+            let requested_records = decode_app_config(&frame.payload)?;
+            let records = merge_app_config_records(&previous_records, &requested_records);
+            let xposed_payload =
+                encode_xposed_config_payload(&state.settings, &encode_app_config(&records))?;
             let previous_file = read_existing_file(state.app_config_path.as_deref())?;
-            persist_app_config(state, &records)?;
+            persist_app_config(state, &previous_records, &records, previous_file.as_deref())?;
             match set_app_config(&xposed_payload) {
                 Ok(true) => {
                     if let Some(message) = format_config_change_log(&previous_records, &records) {
@@ -299,10 +314,7 @@ pub fn handle_manager_command(
             let response = set_settings_var(state, &frame.payload)?;
             if response == b"success" {
                 state.hook_config_synced = false;
-                append_legacy_log_message(
-                    state,
-                    &format!("⚙️设置成功 [{}]:{}", frame.payload[0], frame.payload[1]),
-                );
+                append_legacy_log_message(state, "⚙️设置成功");
             } else if let Ok(message) = String::from_utf8(response.clone()) {
                 append_legacy_log_message(state, &format!("🔧设置失败，{message}"));
             }
@@ -312,17 +324,29 @@ pub fn handle_manager_command(
             encode_realtime_info_with_settings(&frame.payload, &state.settings)
         }
         ManagerCommand::GetUidTime => encode_uid_time(state),
+        ManagerCommand::GetFreezeStatus => Ok(encode_freeze_status(&state.freeze_status)),
         ManagerCommand::ClearLog => {
-            state.log = "\n".to_owned();
-            state.operation_log_text.clear();
-            Ok(state.log.as_bytes().to_vec())
+            state.manager_log.clear();
+            Ok(Vec::new())
         }
         ManagerCommand::GetProcState => {
             append_legacy_proc_state_log(state);
-            Ok(state.log.as_bytes().to_vec())
+            handle_read_only_command(ManagerCommand::GetLog, state)
         }
         _ => handle_read_only_command(frame.command, state),
     }
+}
+
+fn encode_freeze_status(records: &[ManagerFreezeStatusRecord]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(records.len() * 20);
+    for record in records {
+        payload.extend_from_slice(&(record.uid as i32).to_le_bytes());
+        payload.extend_from_slice(&i32::from(record.foreground).to_le_bytes());
+        payload.extend_from_slice(&record.state.to_le_bytes());
+        payload.extend_from_slice(&record.seconds.max(0).to_le_bytes());
+        payload.extend_from_slice(&record.process_count.max(0).to_le_bytes());
+    }
+    payload
 }
 
 fn append_legacy_proc_state_log(state: &mut ReadOnlyState) {
@@ -333,9 +357,10 @@ fn append_legacy_proc_state_log(state: &mut ReadOnlyState) {
 }
 
 fn append_legacy_log_message(state: &mut ReadOnlyState, message: &str) {
+    let timestamp_ms = current_timestamp_ms();
     state
-        .log
-        .push_str(&legacy_timestamped_line(current_timestamp_ms(), message));
+        .manager_log
+        .push(LogRecord::legacy_text(timestamp_ms, message));
 }
 
 fn current_timestamp_ms() -> u128 {
@@ -475,7 +500,7 @@ fn encode_app_config_for_manager(records: &[ManagerAppConfigRecord]) -> Vec<u8> 
 }
 
 pub fn decode_app_config(payload: &[u8]) -> Result<Vec<ManagerAppConfigRecord>, DaemonError> {
-    if payload.len() % 12 != 0 {
+    if !payload.len().is_multiple_of(12) {
         return Err(DaemonError::protocol(
             "app config payload length is not a multiple of 12",
         ));
@@ -504,7 +529,8 @@ fn set_settings_var(state: &mut ReadOnlyState, payload: &[u8]) -> Result<Vec<u8>
         4 if !(3..=120).contains(&val) => Some(format!("超时杀死参数错误, 欲设为:{val}")),
         5 if val > 2 => Some(format!("冻结模式参数错误, 欲设为:{val}")),
         6 if val > 3 => Some(format!("定时压制参数错误, 欲设为:{val}")),
-        10..=30 if val != 0 && val != 1 => Some(format!("开关值错误, 正常范围:0/1, 欲设为:{val}")),
+        30 if val > 4 => Some(format!("日志级别无效, 正常范围:0..4, 欲设为:{val}")),
+        10..=29 if val != 0 && val != 1 => Some(format!("开关值错误, 正常范围:0/1, 欲设为:{val}")),
         2 | 3 | 4 | 5 | 6 | 10..=30 => None,
         _ => Some(format!("设置项不存在, [{idx}]:[{val}]")),
     };
@@ -530,34 +556,136 @@ fn set_settings_var(state: &mut ReadOnlyState, payload: &[u8]) -> Result<Vec<u8>
 
 fn persist_app_config(
     state: &ReadOnlyState,
+    previous_records: &[ManagerAppConfigRecord],
     records: &[ManagerAppConfigRecord],
+    previous_file: Option<&[u8]>,
 ) -> Result<(), DaemonError> {
     let Some(path) = &state.app_config_path else {
         return Err(DaemonError::config(
             "app config persistence path is not configured",
         ));
     };
-    let text = records
+    let records_by_uid = records
         .iter()
         .filter(|record| record.uid != u32::MAX)
-        .map(|record| {
-            format!(
-                "{:05}uid{} {} {}",
-                record.uid,
-                record.uid,
-                record.mode,
-                i32::from(record.permissive)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let payload = if text.is_empty() {
-        text
-    } else {
-        format!("{text}\n")
-    };
+        .map(|record| (record.uid, record))
+        .collect::<BTreeMap<_, _>>();
+    let previous_uids = previous_records
+        .iter()
+        .filter(|record| record.uid != u32::MAX)
+        .map(|record| record.uid)
+        .collect::<BTreeSet<_>>();
+
+    let mut payload = String::new();
+    if let Some(previous_file) = previous_file {
+        if records == previous_records {
+            return Ok(());
+        }
+        let previous_text = std::str::from_utf8(previous_file)
+            .map_err(|_| DaemonError::config("existing app config is not valid UTF-8"))?;
+        let previous_records = previous_records
+            .iter()
+            .filter(|record| record.uid != u32::MAX)
+            .collect::<Vec<_>>();
+        let mut record_index = 0;
+        for raw_line in previous_text.split_inclusive('\n') {
+            let (line, line_ending) = split_line_ending(raw_line);
+            let Some(parsed) = parse_legacy_policy_line(line) else {
+                payload.push_str(raw_line);
+                continue;
+            };
+            let Some(previous_record) = previous_records.get(record_index).copied() else {
+                return Err(DaemonError::config(
+                    "existing app config has more policy lines than loaded records",
+                ));
+            };
+            record_index += 1;
+            let record = records_by_uid
+                .get(&previous_record.uid)
+                .copied()
+                .unwrap_or(previous_record);
+            if record.mode == previous_record.mode
+                && record.permissive == previous_record.permissive
+            {
+                payload.push_str(raw_line);
+            } else {
+                payload.push_str(&format!(
+                    "{} {} {}{}",
+                    parsed.package_or_uid,
+                    record.mode,
+                    i32::from(record.permissive),
+                    line_ending
+                ));
+            }
+        }
+        if record_index != previous_records.len() {
+            return Err(DaemonError::config(format!(
+                "existing app config cannot be aligned safely: {} lines, {} records",
+                record_index,
+                previous_records.len()
+            )));
+        }
+    }
+
+    let records_to_append = records.iter().filter(|record| {
+        record.uid != u32::MAX && (previous_file.is_none() || !previous_uids.contains(&record.uid))
+    });
+    for record in records_to_append {
+        if !payload.is_empty() && !payload.ends_with('\n') {
+            payload.push('\n');
+        }
+        payload.push_str(&format!(
+            "{:05}uid{} {} {}\n",
+            record.uid,
+            record.uid,
+            record.mode,
+            i32::from(record.permissive)
+        ));
+    }
+
     atomic_write(path, payload.as_bytes())?;
     Ok(())
+}
+
+fn split_line_ending(line: &str) -> (&str, &str) {
+    if let Some(body) = line.strip_suffix("\r\n") {
+        (body, "\r\n")
+    } else if let Some(body) = line.strip_suffix('\n') {
+        (body, "\n")
+    } else {
+        (line, "")
+    }
+}
+
+fn merge_app_config_records(
+    previous_records: &[ManagerAppConfigRecord],
+    requested_records: &[ManagerAppConfigRecord],
+) -> Vec<ManagerAppConfigRecord> {
+    let requested_by_uid = requested_records
+        .iter()
+        .filter(|record| record.uid != u32::MAX)
+        .map(|record| (record.uid, *record))
+        .collect::<BTreeMap<_, _>>();
+    let previous_uids = previous_records
+        .iter()
+        .map(|record| record.uid)
+        .collect::<BTreeSet<_>>();
+    let mut merged = previous_records
+        .iter()
+        .map(|record| {
+            requested_by_uid
+                .get(&record.uid)
+                .copied()
+                .unwrap_or(*record)
+        })
+        .collect::<Vec<_>>();
+    merged.extend(
+        requested_records
+            .iter()
+            .filter(|record| record.uid != u32::MAX && !previous_uids.contains(&record.uid))
+            .copied(),
+    );
+    merged
 }
 
 fn read_existing_file(path: Option<&str>) -> Result<Option<Vec<u8>>, DaemonError> {
@@ -760,12 +888,11 @@ fn draw_memory_bars(
     let bar_top = height * 218 / 256;
     let physical_start = width * 5 / 100;
     let physical_end = width * 45 / 100;
-    let physical_used_end = if mem_total > 0 {
-        physical_start
-            + (physical_end - physical_start) * mem_total.saturating_sub(mem_available) / mem_total
-    } else {
-        physical_start
-    };
+    let physical_used_width = (physical_end - physical_start)
+        .saturating_mul(mem_total.saturating_sub(mem_available))
+        .checked_div(mem_total)
+        .unwrap_or(0);
+    let physical_used_end = physical_start + physical_used_width;
     fill_horizontal_bar(
         image,
         width,
@@ -778,11 +905,13 @@ fn draw_memory_bars(
         free_color,
     );
 
-    if swap_total > 0 {
-        let swap_start = width * 55 / 100;
-        let swap_end = width * 95 / 100;
-        let swap_used_end = swap_start
-            + (swap_end - swap_start) * swap_total.saturating_sub(swap_free) / swap_total;
+    let swap_start = width * 55 / 100;
+    let swap_end = width * 95 / 100;
+    if let Some(swap_used_width) = (swap_end - swap_start)
+        .saturating_mul(swap_total.saturating_sub(swap_free))
+        .checked_div(swap_total)
+    {
+        let swap_used_end = swap_start + swap_used_width;
         fill_horizontal_bar(
             image,
             width,
@@ -804,7 +933,7 @@ fn draw_cpu_history(
     history: &CpuHistory,
     colors: &[u32; CPU_CHART_CORES],
 ) {
-    for core in 0..CPU_CHART_CORES {
+    for (core, color) in colors.iter().enumerate().take(CPU_CHART_CORES) {
         for minute_idx in 1..CPU_HISTORY_BUCKETS {
             let usage0 = history.cores[(history.bucket_idx + minute_idx) % CPU_HISTORY_BUCKETS]
                 [core]
@@ -817,7 +946,7 @@ fn draw_cpu_history(
             let x0 =
                 (width * (minute_idx - 1) / (CPU_HISTORY_BUCKETS - 1)).min(width.saturating_sub(1));
             let x1 = (width * minute_idx / (CPU_HISTORY_BUCKETS - 1)).min(width.saturating_sub(1));
-            draw_line(image, width, x0, y0, x1, y1, colors[core]);
+            draw_line(image, width, x0, y0, x1, y1, *color);
         }
     }
 }
@@ -899,9 +1028,7 @@ fn realtime_metrics_from_sample(
     metrics[2] = meminfo.swap_total;
     metrics[3] = meminfo.swap_free;
 
-    for core in 0..CPU_CHART_CORES {
-        metrics[4 + core] = sample.frequencies_mhz[core];
-    }
+    metrics[4..(CPU_CHART_CORES + 4)].copy_from_slice(&sample.frequencies_mhz[..CPU_CHART_CORES]);
 
     let cpu_usage = sampler.record_proc_stat(&sample.proc_stat);
     metrics[20] = cpu_usage.summary;
@@ -1371,18 +1498,20 @@ mod tests {
     fn realtime_cpu_usage_uses_proc_stat_deltas() {
         let mut sampler = RealtimeSampler::default();
         let settings = legacy_default_settings();
-        let mut sample = RealtimeSample::default();
-        sample.meminfo = MemInfoMib {
-            mem_total: 4096,
-            mem_available: 1024,
-            swap_total: 2048,
-            swap_free: 1024,
+        let mut sample = RealtimeSample {
+            meminfo: MemInfoMib {
+                mem_total: 4096,
+                mem_available: 1024,
+                swap_total: 2048,
+                swap_free: 1024,
+            },
+            proc_stat: parse_proc_stat(
+                "cpu  100 0 50 850 0 0 0 0 0 0\n\
+                 cpu0 50 0 25 425 0 0 0 0 0 0\n\
+                 cpu1 50 0 25 425 0 0 0 0 0 0\n",
+            ),
+            ..RealtimeSample::default()
         };
-        sample.proc_stat = parse_proc_stat(
-            "cpu  100 0 50 850 0 0 0 0 0 0\n\
-             cpu0 50 0 25 425 0 0 0 0 0 0\n\
-             cpu1 50 0 25 425 0 0 0 0 0 0\n",
-        );
 
         let first = realtime_metrics_from_sample(777, &settings, &mut sampler, sample.clone());
 
@@ -1412,17 +1541,19 @@ mod tests {
         request.extend_from_slice(&64_u32.to_le_bytes());
         request.extend_from_slice(&123_u32.to_le_bytes());
 
-        let mut sample = RealtimeSample::default();
-        sample.meminfo = MemInfoMib {
-            mem_total: 4096,
-            mem_available: 2048,
-            swap_total: 1024,
-            swap_free: 512,
+        let mut sample = RealtimeSample {
+            meminfo: MemInfoMib {
+                mem_total: 4096,
+                mem_available: 2048,
+                swap_total: 1024,
+                swap_free: 512,
+            },
+            proc_stat: parse_proc_stat(
+                "cpu  100 0 0 900 0 0 0 0 0 0\n\
+                 cpu0 100 0 0 900 0 0 0 0 0 0\n",
+            ),
+            ..RealtimeSample::default()
         };
-        sample.proc_stat = parse_proc_stat(
-            "cpu  100 0 0 900 0 0 0 0 0 0\n\
-             cpu0 100 0 0 900 0 0 0 0 0 0\n",
-        );
         let first =
             encode_realtime_info_with_sample(&request, &settings, &mut sampler, sample.clone())
                 .expect("first realtime response succeeds");

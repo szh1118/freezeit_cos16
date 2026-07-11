@@ -41,9 +41,16 @@
     <string name="update_start">开始更新 应用名称</string>
     <string name="app_label">应用名称</string>
     <string name="clear_log_text">清空日志</string>
+    <string name="clear_log_confirm">此操作会永久清空当前工作日志，是否继续？</string>
     <string name="clear_log_tips">已清空日志</string>
     <string name="title_activity_setting">设置</string>
     <string name="title_activity_task_manager">冻结状态</string>
+    <string name="realtime_loading">正在读取实时数据…</string>
+    <string name="health_status_format">守护进程%1$s / Hook%2$s</string>
+    <string name="health_status_active">正常</string>
+    <string name="health_status_degraded">受限</string>
+    <string name="health_status_inactive">未运行</string>
+    <string name="health_status_unknown">未知</string>
     <string name="freeze_status_foreground">前台</string>
     <string name="freeze_status_background">后台</string>
     <string name="freeze_state_foreground">运行中</string>
@@ -132,8 +139,8 @@
         \n若唤醒率经常99%+，大概率是某些自由后台/系统应用滥用唤醒锁，导致无法进入Doze，可使用BetterBatteryStats(BBS)监控唤醒锁使用情况。
     </string>
 
-    <string name="debug_title">调试日志 ⓘ</string>
-    <string name="debug_tips">开启调试日志，日志记录更加详细运行状况</string>
+    <string name="log_level_title">日志级别 ⓘ</string>
+    <string name="log_level_tips">INFO 仅显示与原版 Freezeit 格式一致的操作日志；WARN、ERROR、CRITICAL 按故障严重程度过滤；DEBUG 显示全部操作日志和 Rust 诊断信息。</string>
 
     <string name="config_help_text">
         【杀死后台】:该应用进入后台超时就直接杀死，而不是冻结。

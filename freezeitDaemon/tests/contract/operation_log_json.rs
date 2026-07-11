@@ -1,7 +1,9 @@
 use freezeit_daemon::{
     app::{
         health::ModuleHealth,
-        operation_log::{operation_to_json, operation_to_legacy_text, OperationLog},
+        operation_log::{
+            operation_to_debug_text, operation_to_json, operation_to_legacy_text, OperationLog,
+        },
     },
     domain::{
         capability::{CapabilityName, ControlCapability},
@@ -37,19 +39,25 @@ fn operation_log_legacy_text_formats_freeze_like_original_manager_log() {
 
     let text = operation_to_legacy_text(&operation);
 
-    assert!(text.starts_with("[08:00:00]  "));
-    assert!(text.contains("❄️冻结 com.example.app 2进程"));
-    assert!(text.contains("UID:10123"));
-    assert!(text.contains("PID:123,124"));
-    assert!(text.contains("方式:cgroup-v2"));
-    assert!(text.contains("结果:成功"));
-    assert!(text.contains("原因:delay elapsed"));
+    assert_eq!(text, "[08:00:00]  ❄️冻结 com.example.app 2进程\n");
+    assert!(!text.contains("UID:"));
+    assert!(!text.contains("PID:"));
+    assert!(!text.contains("方式:"));
+    assert!(!text.contains("结果:"));
+    assert!(!text.contains("原因:"));
     assert!(!text.contains("uid="));
     assert!(!text.contains("backend="));
     assert!(!text.contains("result="));
     assert!(!text.contains("reason="));
     assert!(!text.contains("operationId="));
     assert!(!text.contains("action=freeze"));
+
+    let debug = operation_to_debug_text(&operation);
+    assert!(debug.contains("UID:10123"));
+    assert!(debug.contains("PID:123,124"));
+    assert!(debug.contains("方式:cgroup-v2"));
+    assert!(debug.contains("结果:成功"));
+    assert!(debug.contains("原因:delay elapsed"));
 }
 
 #[test]

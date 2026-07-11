@@ -34,7 +34,6 @@ import io.github.jark006.freezeit.Utils;
 public class AppTime extends AppCompatActivity {
     FreezeStatusAdapter recycleAdapter = new FreezeStatusAdapter();
     Timer timer;
-    int[] newStatusRows;
     final int UPDATE_DATA_SET = 1;
 
     @SuppressLint("MissingInflatedId")
@@ -77,6 +76,7 @@ public class AppTime extends AppCompatActivity {
             timer.cancel();
             timer = null;
         }
+        handler.removeMessages(UPDATE_DATA_SET);
     }
 
     @Override
@@ -84,21 +84,22 @@ public class AppTime extends AppCompatActivity {
         super.onResume();
         findViewById(R.id.container).setBackground(StaticData.getBackgroundDrawable(this));
 
+        if (timer != null)
+            timer.cancel();
         timer = new Timer();
         timer.schedule(new TimerTask() {
             @Override
             public void run() {
-                var recvLen = Utils.freezeitTask(ManagerCmd.getFreezeStatus, null);
+                Utils.TaskResult result = Utils.freezeitTaskResult(ManagerCmd.getFreezeStatus, null);
 
                 // 每行状态为5个int32 [0-4]:[uid foreground state seconds processCount], 共20字节
-                if (recvLen == 0 || recvLen % FreezeStatusAdapter.ROW_BYTE_LEN != 0) {
-                    newStatusRows = new int[0];
-                    handler.sendEmptyMessage(UPDATE_DATA_SET);
+                if (result.length() == 0 || result.length() % FreezeStatusAdapter.ROW_BYTE_LEN != 0) {
+                    handler.sendMessage(Message.obtain(handler, UPDATE_DATA_SET, new int[0]));
                     return;
                 }
-                newStatusRows = new int[recvLen / 4];
-                Utils.Byte2Int(StaticData.response, 0, recvLen, newStatusRows, 0);
-                handler.sendEmptyMessage(UPDATE_DATA_SET);
+                int[] statusRows = new int[result.length() / 4];
+                Utils.Byte2Int(result.payload(), 0, result.length(), statusRows, 0);
+                handler.sendMessage(Message.obtain(handler, UPDATE_DATA_SET, statusRows));
             }
         }, 0, 2000);
     }
@@ -109,7 +110,7 @@ public class AppTime extends AppCompatActivity {
         public void handleMessage(@NonNull Message msg) {
             super.handleMessage(msg);
             if (msg.what == UPDATE_DATA_SET)
-                recycleAdapter.updateDataSet(newStatusRows);
+                recycleAdapter.updateDataSet((int[]) msg.obj);
         }
     };
 

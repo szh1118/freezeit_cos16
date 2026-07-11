@@ -86,6 +86,23 @@ pub fn operation_to_legacy_text(operation: &ControlOperation) -> String {
     legacy_timestamped_line(operation.timestamp_ms, &legacy_operation_message(operation))
 }
 
+pub fn operation_to_debug_text(operation: &ControlOperation) -> String {
+    legacy_timestamped_line(
+        operation.timestamp_ms,
+        &diagnostic_operation_message(operation),
+    )
+}
+
+pub fn operation_is_legacy_info(operation: &ControlOperation) -> bool {
+    match (operation.action, operation.result) {
+        (ControlAction::Freeze, OperationResult::Success)
+        | (ControlAction::Unfreeze, OperationResult::Success)
+        | (ControlAction::Terminate, OperationResult::Success) => true,
+        (ControlAction::Postpone, OperationResult::Postponed) => is_binder_blocker(operation),
+        _ => false,
+    }
+}
+
 pub fn legacy_timestamped_line(timestamp_ms: u128, message: &str) -> String {
     let mut line = format!("{}{}", legacy_time_prefix(timestamp_ms), message);
     if !line.ends_with('\n') {
@@ -95,6 +112,38 @@ pub fn legacy_timestamped_line(timestamp_ms: u128, message: &str) -> String {
 }
 
 fn legacy_operation_message(operation: &ControlOperation) -> String {
+    let package_name = sanitize_legacy_field(&operation.package_name);
+    let process_text = legacy_process_text(operation.pid_list.len());
+
+    match operation.action {
+        ControlAction::Freeze => format!(
+            "{} {package_name} {process_text}",
+            legacy_freeze_phrase(operation)
+        ),
+        ControlAction::Unfreeze if operation.pid_list.is_empty() => {
+            format!("😁启动 {package_name}")
+        }
+        ControlAction::Unfreeze => format!("☀️解冻 {package_name} {process_text}"),
+        ControlAction::Terminate if operation.pid_list.is_empty() => {
+            format!("😭关闭 {package_name}")
+        }
+        ControlAction::Terminate => format!("😭关闭 {package_name} {process_text}"),
+        ControlAction::Postpone if is_binder_blocker(operation) => {
+            let blocker_pid = operation
+                .pid_list
+                .first()
+                .map(i32::to_string)
+                .unwrap_or_else(|| "?".to_owned());
+            format!("{package_name}:{blocker_pid} Binder正在传输, 延迟后再冻结")
+        }
+        ControlAction::Postpone => format!("⏳延迟冻结 {package_name} {process_text}"),
+        ControlAction::Fallback => format!("⚠️降级处理 {package_name} {process_text}"),
+        ControlAction::Skip => format!("⚠️跳过 {package_name} {process_text}"),
+        ControlAction::Recover => format!("♻️恢复 {package_name} {process_text}"),
+    }
+}
+
+fn diagnostic_operation_message(operation: &ControlOperation) -> String {
     let pids = operation
         .pid_list
         .iter()

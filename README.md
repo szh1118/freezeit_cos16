@@ -4,13 +4,13 @@
 
 ## 当前版本
 
-- 模块版本：`3.3.1SelfUse`，版本号：`303001`。
-- `freezeitRelease/update.json` 指向已验证的 `v3.3.1SelfUse` Rust-only 修复包。
+- 模块版本：`3.3.2SelfUse`，版本号：`303002`。
+- `freezeitRelease/update.json` 仍指向已验证的 `v3.3.1SelfUse`；完成 `3.3.2SelfUse` 真机验收后再更新。
 - 新版本仅支持 ARM64，且只包含一个由 `freezeitDaemon/` 为 `aarch64-linux-android` 构建的 Rust 守护进程 `freezeit`。
 - 不提供 C++、x64 或旧守护进程回退。
-- Magisk 源模板位于 `magisk/`，仓库中的模板不保存 daemon、APK 等构建产物。
+- Magisk 源模板位于 `magisk/`，仓库中的模板不保存守护进程、APK 等构建产物。
 
-`3.3.1SelfUse` 修复了 signal fallback 冻结应用后，前台恢复流程未发送 `SIGCONT` 的问题。
+`3.3.2SelfUse` 修复管理器配置保存、冻结状态、共享 UID、下载延迟和并发响应问题；日志页提供 `INFO / WARN / ERROR / CRITICAL / DEBUG` 五档等级，其中 `INFO` 严格保持旧版 C++ 管理器的简洁格式，`DEBUG` 才显示 Rust 诊断字段。清空日志需要二次确认，清空后的旧操作不会再次出现。
 
 ## 构建与打包
 
@@ -20,15 +20,16 @@
 scripts/build-release.sh
 ```
 
-脚本会构建 ARM64 Rust 守护进程与正式版 Manager，核对二者版本，随后调用 `scripts/package-release.sh`。打包在临时的 `.release-staging/` 中进行，输出：
+脚本会构建 ARM64 Rust 守护进程与正式版管理器，核对二者版本，随后调用 `scripts/package-release.sh`。打包在临时的 `.release-staging/` 中进行，输出：
 
 ```text
-freezeitRelease/freezeit_oneplus13_android16_selfuse_v3.3.1SelfUse_303001.zip
+freezeitRelease/freezeit_oneplus13_android16_selfuse_v3.3.2SelfUse_303002.zip
 ```
 
-也可以显式提供已构建并核验的文件：
+脏工作树测试包可显式提供已构建并核验的文件：
 
 ```sh
+RELEASE_KIND=candidate ALLOW_DIRTY=1 \
 DAEMON=/path/to/aarch64/freezeit \
 APK=/path/to/freezeit.apk \
 APK_METADATA=/path/to/output-metadata.json \
@@ -40,23 +41,25 @@ scripts/package-release.sh
 - APK、模块与更新元数据版本一致。
 - ZIP 中恰好包含一个 ARM64 ELF 守护进程和一个 APK。
 - ZIP 路径安全，载荷 SHA-256 完整。
-- `provenance.txt` 记录源码提交、目标架构和构建产物摘要。
+- 正式包必须由 `scripts/build-release.sh` 的同次构建会话生成，不能把任意预构建文件声明为当前提交产物。
+- 正式包必须使用指定签名证书；APK 签名证书 SHA-256 会写入并校验于 `provenance.txt`。
+- `provenance.txt` 记录源码提交、目标架构、构建会话和构建产物来源摘要。
 - `SOURCE_OFFER` 指向对应提交的完整源码。
 
-正式发布包要求 Git 工作树干净。仅测试候选包可以设置 `RELEASE_KIND=candidate ALLOW_DIRTY=1`；候选包会额外保存源码补丁、状态和快照，不能作为正式更新发布。
+正式发布包要求 Git 工作树干净、配置正式签名密钥，并设置 `FREEZEIT_EXPECTED_APK_SIGNER_SHA256`。仅测试候选包可以设置 `RELEASE_KIND=candidate ALLOW_DIRTY=1`；候选包会额外保存源码补丁、状态和快照，不能作为正式更新发布。
 
 ## 验证
 
 ```sh
 scripts/test-release-pipeline.sh
 scripts/test-release-metadata.sh planned
-scripts/validate-release-zip.sh /path/to/release.zip 3.3.1SelfUse 303001
+scripts/validate-release-zip.sh /path/to/release.zip 3.3.2SelfUse 303002
 ```
 
 只有待发布 ZIP 通过完整校验后，才能修改 `freezeitRelease/update.json`。发布后再执行：
 
 ```sh
-scripts/test-release-metadata.sh released 3.3.1SelfUse 303001
+scripts/test-release-metadata.sh released 3.3.2SelfUse 303002
 ```
 
 ## 项目来源
@@ -70,12 +73,12 @@ scripts/test-release-metadata.sh released 3.3.1SelfUse 303001
 - 适配 ColorOS 16 / OxygenOS 16、Android 16 与 Xposed API 102。
 - 核心守护进程由 C++ 重构为 Rust。
 - 使用运行时能力探测替代仅依赖机型、指纹和版本号的硬编码判断。
-- 建立 Rust-only ARM64 构建、验证和发布链。
+- 建立仅 Rust 的 ARM64 构建、验证和发布链。
 - 维护面向自用场景的 SelfUse 修复版本线。
 
 ## 源码与许可证
 
-Rust 守护进程位于 `freezeitDaemon/`，Android Manager 位于 `freezeitApp/`。Rust crate 声明 `GPL-3.0-or-later`；仓库根目录和发布包均保留许可证及对应源码说明。重新分发二进制文件时，必须继续提供相应源码并保留许可证声明。
+Rust 守护进程位于 `freezeitDaemon/`，Android 管理器位于 `freezeitApp/`。Rust crate 声明 `GPL-3.0-or-later`；仓库根目录和发布包均保留许可证及对应源码说明。重新分发二进制文件时，必须继续提供相应源码并保留许可证声明。
 
 ## 安全边界
 

@@ -51,7 +51,23 @@ public class Utils {
 
     private static final String TAG = "Freezeit[Utils]";
 
-    public static synchronized int freezeitTask(byte command, byte[] AdditionalData) {
+    public static final class TaskResult {
+        private final byte[] payload;
+
+        private TaskResult(byte[] payload) {
+            this.payload = payload;
+        }
+
+        public int length() {
+            return payload.length;
+        }
+
+        public byte[] payload() {
+            return payload;
+        }
+    }
+
+    public static synchronized TaskResult freezeitTaskResult(byte command, byte[] AdditionalData) {
         // dataHeader[0-3]:附带数据大小(uint32 小端)
         // dataHeader[4]: 命令(可参考上面)
         // dataHeader[5]: 附带数据的异或校验值
@@ -79,24 +95,23 @@ public class Utils {
 
             if (!readFully(is, dataHeader, 0, 6)) {
                 Log.e(TAG, "Receive dataHeader Fail");
-                return 0;
+                return new TaskResult(new byte[0]);
             }
 
             final int payloadLen = Byte2Int(dataHeader, 0);
             if (payloadLen < 0) {
                 Log.e(TAG, "Invalid payloadLen:" + payloadLen);
-                return 0;
+                return new TaskResult(new byte[0]);
             }
-            if (StaticData.response.length < payloadLen)
-                StaticData.response = new byte[payloadLen];
-            if (!readFully(is, StaticData.response, 0, payloadLen)) {
+            byte[] response = new byte[payloadLen];
+            if (!readFully(is, response, 0, payloadLen)) {
                 Log.e(TAG, "Get payload Fail");
-                return 0;
+                return new TaskResult(new byte[0]);
             }
 
-            return payloadLen;
+            return new TaskResult(response);
         } catch (IOException e) {
-            return 0;
+            return new TaskResult(new byte[0]);
         }
     }
 

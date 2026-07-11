@@ -128,6 +128,7 @@ fn control_pass_records_postpone_while_download_is_active() {
 
     assert_eq!(freezes, 0);
     assert!(state.operation_log.to_json().contains("download activity"));
+    assert_eq!(state.operation_log.records().count(), 1);
 }
 
 #[test]

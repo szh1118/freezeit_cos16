@@ -113,6 +113,7 @@ impl ModuleHealth {
         health
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_capability_failures(
         manager_ready: bool,
         daemon_ready: bool,

@@ -17,6 +17,7 @@ import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
+import android.widget.ImageView;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
@@ -27,6 +28,7 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.nio.ByteBuffer;
+import java.util.Locale;
 import java.util.Timer;
 import java.util.TimerTask;
 
@@ -50,10 +52,11 @@ public class Home extends Fragment implements View.OnClickListener {
     final int realTimeInfoIntLen = 23;
     int[] realTimeInfo = new int[realTimeInfoIntLen]; //ARM64和X64  Native层均为小端
     byte[] realTimeRequest = new byte[12];
-    int realTimeResponseLen = 0;
     boolean hasHealthStatus = false;
     String daemonHealth = "Unknown";
     String hookHealth = "Unknown";
+    ImageView realTimeLayoutTarget;
+    ViewTreeObserver.OnGlobalLayoutListener realTimeLayoutListener;
 
     public View onCreateView(@NonNull LayoutInflater inflater,
                              ViewGroup container, Bundle savedInstanceState) {
@@ -99,10 +102,7 @@ public class Home extends Fragment implements View.OnClickListener {
     @Override
     public void onPause() {
         super.onPause();
-        if (timer != null) {
-            timer.cancel();
-            timer = null;
-        }
+        cancelRealTimeTimer();
     }
 
     @Override
@@ -114,6 +114,9 @@ public class Home extends Fragment implements View.OnClickListener {
     @Override
     public void onDestroyView() {
         super.onDestroyView();
+        cancelRealTimeTimer();
+        clearRealTimeLayoutListener();
+        handler.removeCallbacksAndMessages(null);
         binding = null;
     }
 
@@ -127,7 +130,7 @@ public class Home extends Fragment implements View.OnClickListener {
     void refreshStatus() {
         if (StaticData.hasGetPropInfo) handler.sendEmptyMessage(HAS_MODULE_INFO);
         else new Thread(() -> {
-            var recvLen = Utils.freezeitTask(ManagerCmd.getPropInfo, null);
+            Utils.TaskResult result = Utils.freezeitTaskResult(ManagerCmd.getPropInfo, null);
 
             // info [0]:moduleID [1]:moduleName [2]:moduleVersion [3]:moduleVersionCode [4]:moduleAuthor
             //      [5]:clusterNum: CPU丛集数
@@ -138,7 +141,7 @@ public class Home extends Fragment implements View.OnClickListener {
             //      [10]:extMemory: 内存扩展 MiB
             //      [11]:daemonHealth: Rust daemon active/degraded/inactive
             //      [12]:hookHealth: LSPosed bridge active/degraded/inactive/unknown
-            String[] info = (recvLen == 0) ? null : new String(StaticData.response, 0, recvLen).split("\n");
+            String[] info = result.length() == 0 ? null : new String(result.payload()).split("\n");
             if (info == null || info.length < 5) {
                 handler.sendEmptyMessage(NO_MODULE_INFO);
                 return;
@@ -198,9 +201,11 @@ public class Home extends Fragment implements View.OnClickListener {
                 StaticData.am.getMemoryInfo(memoryInfo); // 底层 /proc/meminfo 的 MemAvailable 不可靠
                 Utils.Int2Byte((int) (memoryInfo.availMem >> 20), realTimeRequest, 8); //Unit: MiB
 
-                realTimeResponseLen = Utils.freezeitTask(ManagerCmd.getRealTimeInfo, realTimeRequest);
-                if (realTimeResponseLen > 0)
-                    handler.sendEmptyMessage(HANDLE_REALTIME_INFO);
+                Utils.TaskResult result = Utils.freezeitTaskResult(
+                        ManagerCmd.getRealTimeInfo,
+                        realTimeRequest);
+                if (result.length() > 0)
+                    handler.sendMessage(Message.obtain(handler, HANDLE_REALTIME_INFO, result.payload()));
             }
         }, 0, 3000);
     }
@@ -266,11 +271,11 @@ public class Home extends Fragment implements View.OnClickListener {
                         if (StaticData.localChangelog.length() > 0)
                             binding.changelogText.setText(StaticData.localChangelog);
                         else new Thread(() -> {
-                            var recvLen = Utils.freezeitTask(ManagerCmd.getChangelog, null);
-                            if (recvLen == 0)
+                            Utils.TaskResult result = Utils.freezeitTaskResult(ManagerCmd.getChangelog, null);
+                            if (result.length() == 0)
                                 return;
 
-                            var split = new String(StaticData.response, 0, recvLen).split("###");
+                            var split = new String(result.payload()).split("###");
                             if (split.length > 1 && split[1].length() > 2) {
                                 StaticData.localChangelog = split[1].trim();
                                 this.sendEmptyMessage(UPDATE_LOCAL_CHANGELOG);
@@ -300,7 +305,11 @@ public class Home extends Fragment implements View.OnClickListener {
                         boolean hookActive = xposedState || "active".equalsIgnoreCase(hookHealth);
                         boolean ready = daemonActive && hookActive;
                         binding.stateLayout.setBackgroundResource(ready ? R.color.normal_green : R.color.warn_orange);
-                        binding.statusText.setText("Daemon " + daemonHealth + " / Hook " + hookHealth);
+                        binding.statusText.setText(getString(
+                                R.string.health_status_format,
+                                localizedHealthStatus(daemonHealth),
+                                localizedHealthStatus(hookHealth)
+                        ));
                     } else {
                         binding.stateLayout.setBackgroundResource(xposedState ? R.color.normal_green : R.color.warn_orange);
                         binding.statusText.setText(xposedState ? StaticData.workMode : "Xposed " + getString(R.string.xposed_warn));
@@ -318,46 +327,98 @@ public class Home extends Fragment implements View.OnClickListener {
                         initRealTimeInfoTimer();
                         return;
                     }
+                    if (binding.cpuImg.getWidth() > 0 && binding.cpuImg.getHeight() > 0) {
+                        initializeRealTimeDimensions();
+                        return;
+                    }
 
-                    var listener = new ViewTreeObserver.OnGlobalLayoutListener() {
+                    clearRealTimeLayoutListener();
+                    realTimeLayoutTarget = binding.cpuImg;
+                    realTimeLayoutListener = new ViewTreeObserver.OnGlobalLayoutListener() {
                         @Override
                         public void onGlobalLayout() {
-                            int width = binding.cpuImg.getWidth() / StaticData.imgScale;
-                            int height = binding.cpuImg.getHeight() / StaticData.imgScale;
-
-                            while (width * height > 1024 * 1024) { // RGBA 最多预留 4MiB 用于绘图
-                                StaticData.imgScale++;
-                                width = binding.cpuImg.getWidth() / StaticData.imgScale;
-                                height = binding.cpuImg.getHeight() / StaticData.imgScale;
+                            ImageView target = realTimeLayoutTarget;
+                            if (target != null) {
+                                ViewTreeObserver observer = target.getViewTreeObserver();
+                                if (observer.isAlive())
+                                    observer.removeOnGlobalLayoutListener(this);
                             }
-                            StaticData.imgWidth = width;
-                            StaticData.imgHeight = height;
-
-                            binding.cpuImg.getViewTreeObserver().removeOnGlobalLayoutListener(this);
-                            initRealTimeInfoTimer();
+                            realTimeLayoutTarget = null;
+                            realTimeLayoutListener = null;
+                            initializeRealTimeDimensions();
                         }
                     };
-                    binding.cpuImg.getViewTreeObserver().addOnGlobalLayoutListener(listener);
+                    realTimeLayoutTarget.getViewTreeObserver()
+                            .addOnGlobalLayoutListener(realTimeLayoutListener);
                 }
                 break;
 
                 case HANDLE_REALTIME_INFO:
-                    realTimeHandleFunc();
+                    realTimeHandleFunc((byte[]) msg.obj);
                     break;
             }
         }
     };
 
+    private void cancelRealTimeTimer() {
+        if (timer != null) {
+            timer.cancel();
+            timer = null;
+        }
+    }
+
+    private void clearRealTimeLayoutListener() {
+        if (realTimeLayoutTarget != null && realTimeLayoutListener != null) {
+            ViewTreeObserver observer = realTimeLayoutTarget.getViewTreeObserver();
+            if (observer.isAlive())
+                observer.removeOnGlobalLayoutListener(realTimeLayoutListener);
+        }
+        realTimeLayoutTarget = null;
+        realTimeLayoutListener = null;
+    }
+
+    private void initializeRealTimeDimensions() {
+        if (binding == null || binding.cpuImg.getWidth() <= 0 || binding.cpuImg.getHeight() <= 0)
+            return;
+
+        int width = binding.cpuImg.getWidth() / StaticData.imgScale;
+        int height = binding.cpuImg.getHeight() / StaticData.imgScale;
+        while (width * height > 1024 * 1024) { // RGBA 最多预留 4MiB 用于绘图
+            StaticData.imgScale++;
+            width = binding.cpuImg.getWidth() / StaticData.imgScale;
+            height = binding.cpuImg.getHeight() / StaticData.imgScale;
+        }
+        StaticData.imgWidth = width;
+        StaticData.imgHeight = height;
+        initRealTimeInfoTimer();
+    }
+
+    private String localizedHealthStatus(String health) {
+        if (health == null)
+            return getString(R.string.health_status_unknown);
+
+        switch (health.toLowerCase(Locale.ROOT)) {
+            case "active":
+                return getString(R.string.health_status_active);
+            case "degraded":
+                return getString(R.string.health_status_degraded);
+            case "inactive":
+                return getString(R.string.health_status_inactive);
+            default:
+                return getString(R.string.health_status_unknown);
+        }
+    }
+
 
     @SuppressLint({"DefaultLocale", "SetTextI18n"})
-    void realTimeHandleFunc() {
+    void realTimeHandleFunc(@NonNull byte[] response) {
 
         // response[0 ~ imgBuffBytes-1]CPU曲线图像数据, [imgBuffBytes ~ end]是其他实时数据
         int imgBuffBytes = StaticData.imgWidth * StaticData.imgHeight * 4; // ARGB 每像素4字节
-        if (realTimeResponseLen <= imgBuffBytes) {
+        if (response.length <= imgBuffBytes) {
             String errorTips = "imgWidth" + StaticData.imgWidth +
                     " imgHeight" + StaticData.imgHeight +
-                    " response.length" + realTimeResponseLen +
+                    " response.length" + response.length +
                     " imgBuffBytes" + imgBuffBytes;
             binding.cpu.setText(errorTips);
             return;
@@ -367,10 +428,10 @@ public class Home extends Fragment implements View.OnClickListener {
                 StaticData.bitmap.getWidth() != StaticData.imgWidth)
             StaticData.bitmap = Bitmap.createBitmap(StaticData.imgWidth, StaticData.imgHeight, Bitmap.Config.ARGB_8888);
 
-        StaticData.bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(StaticData.response, 0, imgBuffBytes));
+        StaticData.bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(response, 0, imgBuffBytes));
         binding.cpuImg.setImageBitmap(Utils.resize(StaticData.bitmap, StaticData.imgScale));
 
-        int realTimeInfoByteLen = realTimeResponseLen - imgBuffBytes;
+        int realTimeInfoByteLen = response.length - imgBuffBytes;
         if (realTimeInfoByteLen != 4 * realTimeInfoIntLen) {
             String errorTips = "Required bytes: " + (4 * realTimeInfoIntLen) + " Received bytes:" + realTimeInfoByteLen;
             binding.cpu.setText(errorTips);
@@ -380,7 +441,7 @@ public class Home extends Fragment implements View.OnClickListener {
         // [0]全部物理内存 [1]可用内存 [2]全部虚拟内存 [3]可用虚拟内存  Unit: MiB
         // [4-11]八个核心频率(MHz) [12-19]八个核心使用率(%)
         // [20]CPU总使用率(%) [21]CPU温度(m℃) [22]电池功率(mW)
-        Utils.Byte2Int(StaticData.response, imgBuffBytes, realTimeInfoIntLen * 4, realTimeInfo, 0);
+        Utils.Byte2Int(response, imgBuffBytes, realTimeInfoIntLen * 4, realTimeInfo, 0);
 
         final double GiB = 1024.0;
         int MemTotal = realTimeInfo[0], MemAvailable = realTimeInfo[1];

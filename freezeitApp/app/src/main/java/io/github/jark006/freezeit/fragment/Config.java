@@ -38,12 +38,13 @@ import androidx.recyclerview.widget.RecyclerView;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Locale;
+import java.util.Map;
 
 import io.github.jark006.freezeit.AppInfoCache;
 import io.github.jark006.freezeit.ManagerCmd;
 import io.github.jark006.freezeit.R;
-import io.github.jark006.freezeit.StaticData;
 import io.github.jark006.freezeit.Utils;
 import io.github.jark006.freezeit.databinding.FragmentConfigBinding;
 
@@ -62,6 +63,7 @@ public class Config extends Fragment {
     // freezeMode: [10]:杀死 [20]:SIGSTOP [21]:SIGSTOP断网 [30]:Freezer [31]:Freezer断网 [40]:自由 [50]:内置
     HashMap<Integer, Pair<Integer, Integer>> appCfg = new HashMap<>();
     ArrayList<Integer> uidListSort = new ArrayList<>();
+    ArrayList<Integer> persistedUidOrder = new ArrayList<>();
 
     public View onCreateView(@NonNull LayoutInflater inflater,
                              ViewGroup container, Bundle savedInstanceState) {
@@ -74,11 +76,15 @@ public class Config extends Fragment {
         binding.recyclerviewApp.setItemAnimator(animator);
         binding.recyclerviewApp.setAdapter(recycleAdapter);
         binding.recyclerviewApp.setHasFixedSize(true);
+        binding.fabSave.setEnabled(false);
 
-        binding.swipeRefreshLayout.setOnRefreshListener(() -> new Thread(() -> {
-            AppInfoCache.refreshCache(requireContext());// 下拉刷新时，先更新应用缓存
-            getAppCfgTask();
-        }).start());
+        binding.swipeRefreshLayout.setOnRefreshListener(() -> {
+            beginConfigLoad();
+            new Thread(() -> {
+                AppInfoCache.refreshCache(requireContext());// 下拉刷新时，先更新应用缓存
+                getAppCfgTask();
+            }).start();
+        });
 
         recycleAdapter.setContext(requireContext());
 
@@ -126,12 +132,12 @@ public class Config extends Fragment {
             lastTimestamp = now;
 
             byte[] newConf = recycleAdapter.getCfgBytes();
-            if (newConf == null) return;
+            if (newConf == null || newConf.length == 0) return;
 
             new Thread(() -> {
-                var recvLen = Utils.freezeitTask(ManagerCmd.setAppCfg, newConf);
-                handler.sendEmptyMessage((recvLen == 7 &&
-                        new String(StaticData.response, 0, 7).equals("success")) ?
+                Utils.TaskResult result = Utils.freezeitTaskResult(ManagerCmd.setAppCfg, newConf);
+                handler.sendEmptyMessage((result.length() == 7 &&
+                        new String(result.payload()).equals("success")) ?
                         SET_CFG_SUCCESS : SET_CFG_FAIL);
             }).start();
         });
@@ -154,12 +160,21 @@ public class Config extends Fragment {
     public void onResume() {
         super.onResume();
 
-        binding.swipeRefreshLayout.setRefreshing(true);
+        beginConfigLoad();
         new Thread(this::getAppCfgTask).start();
     }
 
+    private void beginConfigLoad() {
+        recycleAdapter.beginLoading();
+        if (binding != null) {
+            binding.fabSave.setEnabled(false);
+            binding.swipeRefreshLayout.setRefreshing(true);
+        }
+    }
+
     void getAppCfgTask() {
-        var recvLen = Utils.freezeitTask(ManagerCmd.getAppCfg, null);
+        Utils.TaskResult result = Utils.freezeitTaskResult(ManagerCmd.getAppCfg, null);
+        int recvLen = result.length();
         if (recvLen == 0 || recvLen % 12 != 0) {
             handler.post(() -> {
                 if (binding != null)
@@ -167,15 +182,18 @@ public class Config extends Fragment {
             });
             return;
         }
+        byte[] response = result.payload();
 
         appCfg.clear();
+        persistedUidOrder.clear();
         // 每个配置含：3个[int32]数据，12字节 小端
         for (int i = 0; i < recvLen; i += 12) {
-            int uid = Utils.Byte2Int(StaticData.response, i);
-            int freezeMode = Utils.Byte2Int(StaticData.response, i + 4);
-            int isPermissive = Utils.Byte2Int(StaticData.response, i + 8);
-            if (AppInfoCache.contains(uid)) // 冻它底层可以获取全部应用，但应用层获取的 AppInfoCache 可能会缺一些特殊应用
-                appCfg.put(uid, new Pair<>(freezeMode, isPermissive));
+            int uid = Utils.Byte2Int(response, i);
+            int freezeMode = Utils.Byte2Int(response, i + 4);
+            int isPermissive = Utils.Byte2Int(response, i + 8);
+            if (!appCfg.containsKey(uid))
+                persistedUidOrder.add(uid);
+            appCfg.put(uid, new Pair<>(freezeMode, isPermissive));
         }
 
         var uidList = AppInfoCache.getUidList();
@@ -184,63 +202,61 @@ public class Config extends Fragment {
             if (!appCfg.containsKey(uid))
                 appCfg.put(uid, new Pair<>(Utils.CFG_FREEZER, 1)); // 默认Freezer 宽松
         });
-        // 检查非法配置
-        appCfg.forEach((uid, cfg) -> {
-            if (!Utils.CFG_SET.contains(cfg.first))
-                appCfg.put(uid, new Pair<>(Utils.CFG_FREEZER, cfg.second));
-        });
-
         uidListSort.clear();
 
         // 先排 自由
         for (int uid : uidList) {
             var mode = appCfg.get(uid);
-            if (mode != null && mode.first == Utils.CFG_WHITELIST)
+            if (mode != null && AppConfigSerializer.normalizedFreezeMode(mode.first) == Utils.CFG_WHITELIST)
                 uidListSort.add(uid);
         }
 
         // 优先排列：FREEZER SIGSTOP 杀死后台， 次排列：宽松 严格
         for (int uid : uidList) {
             var mode = appCfg.get(uid);
-            if (mode != null && (mode.first == Utils.CFG_FREEZER || mode.first == Utils.CFG_FREEZER_BR)
+            int freezeMode = mode == null ? Utils.CFG_FREEZER : AppConfigSerializer.normalizedFreezeMode(mode.first);
+            if (mode != null && (freezeMode == Utils.CFG_FREEZER || freezeMode == Utils.CFG_FREEZER_BR)
                     && mode.second != 0)
                 uidListSort.add(uid);
         }
         for (int uid : uidList) {
             var mode = appCfg.get(uid);
-            if (mode != null && (mode.first == Utils.CFG_FREEZER || mode.first == Utils.CFG_FREEZER_BR)
+            int freezeMode = mode == null ? Utils.CFG_FREEZER : AppConfigSerializer.normalizedFreezeMode(mode.first);
+            if (mode != null && (freezeMode == Utils.CFG_FREEZER || freezeMode == Utils.CFG_FREEZER_BR)
                     && mode.second == 0)
                 uidListSort.add(uid);
         }
 
         for (int uid : uidList) {
             var mode = appCfg.get(uid);
-            if (mode != null && (mode.first == CFG_SIGSTOP || mode.first == Utils.CFG_SIGSTOP_BR)
+            int freezeMode = mode == null ? Utils.CFG_FREEZER : AppConfigSerializer.normalizedFreezeMode(mode.first);
+            if (mode != null && (freezeMode == CFG_SIGSTOP || freezeMode == Utils.CFG_SIGSTOP_BR)
                     && mode.second != 0)
                 uidListSort.add(uid);
         }
         for (int uid : uidList) {
             var mode = appCfg.get(uid);
-            if (mode != null && (mode.first == CFG_SIGSTOP || mode.first == Utils.CFG_SIGSTOP_BR)
+            int freezeMode = mode == null ? Utils.CFG_FREEZER : AppConfigSerializer.normalizedFreezeMode(mode.first);
+            if (mode != null && (freezeMode == CFG_SIGSTOP || freezeMode == Utils.CFG_SIGSTOP_BR)
                     && mode.second == 0)
                 uidListSort.add(uid);
         }
 
         for (int uid : uidList) {
             var mode = appCfg.get(uid);
-            if (mode != null && mode.first == Utils.CFG_TERMINATE && mode.second != 0)
+            if (mode != null && AppConfigSerializer.normalizedFreezeMode(mode.first) == Utils.CFG_TERMINATE && mode.second != 0)
                 uidListSort.add(uid);
         }
         for (int uid : uidList) {
             var mode = appCfg.get(uid);
-            if (mode != null && mode.first == Utils.CFG_TERMINATE && mode.second == 0)
+            if (mode != null && AppConfigSerializer.normalizedFreezeMode(mode.first) == Utils.CFG_TERMINATE && mode.second == 0)
                 uidListSort.add(uid);
         }
 
         // 最后排 内置自由
         for (int uid : uidList) {
             var mode = appCfg.get(uid);
-            if (mode != null && mode.first == Utils.CFG_WHITEFORCE)
+            if (mode != null && AppConfigSerializer.normalizedFreezeMode(mode.first) == Utils.CFG_WHITEFORCE)
                 uidListSort.add(uid);
         }
 
@@ -257,7 +273,8 @@ public class Config extends Fragment {
 
             switch (msg.what) {
                 case GET_APP_CFG:
-                    recycleAdapter.updateDataSet(uidListSort, appCfg);
+                    recycleAdapter.updateDataSet(uidListSort, appCfg, persistedUidOrder);
+                    binding.fabSave.setEnabled(true);
                     binding.swipeRefreshLayout.setRefreshing(false);
                     break;
                 case SET_CFG_SUCCESS:
@@ -280,7 +297,11 @@ public class Config extends Fragment {
     static class AppCfgAdapter extends RecyclerView.Adapter<AppCfgAdapter.MyViewHolder> {
         ArrayList<Integer> uidList = new ArrayList<>();
         ArrayList<Integer> uidListFilter = new ArrayList<>(400);
-        static HashMap<Integer, Pair<Integer, Integer>> appCfg = new HashMap<>(); //<uid, <freezeMode, permissive>>
+        final HashMap<Integer, Pair<Integer, Integer>> appCfg = new HashMap<>(); //<uid, <freezeMode, permissive>>
+        final HashMap<Integer, Pair<Integer, Integer>> originalAppCfg = new HashMap<>();
+        final ArrayList<Integer> persistedUidOrder = new ArrayList<>();
+        final HashSet<Integer> changedUids = new HashSet<>();
+        boolean configLoaded = false;
         boolean showSystemApp = false;
         String keyWord = "";
         Context context;
@@ -293,12 +314,27 @@ public class Config extends Fragment {
         }
 
         public void updateDataSet(@NonNull ArrayList<Integer> newUidList,
-                                  @NonNull HashMap<Integer, Pair<Integer, Integer>> newAppCfg) {
+                                  @NonNull HashMap<Integer, Pair<Integer, Integer>> newAppCfg,
+                                  @NonNull ArrayList<Integer> newPersistedUidOrder) {
             uidList = newUidList;
             appCfg.clear();
             appCfg.putAll(newAppCfg);
+            persistedUidOrder.clear();
+            persistedUidOrder.addAll(newPersistedUidOrder);
+            originalAppCfg.clear();
+            for (int uid : persistedUidOrder) {
+                Pair<Integer, Integer> cfg = appCfg.get(uid);
+                if (cfg != null)
+                    originalAppCfg.put(uid, cfg);
+            }
+            changedUids.clear();
+            configLoaded = true;
             keyWord = "";
             updateAndRefreshView();
+        }
+
+        void beginLoading() {
+            configLoaded = false;
         }
 
         @NonNull
@@ -362,7 +398,7 @@ public class Config extends Fragment {
             }
 
             var cfg = appCfg.get(uid);
-            int freezeMode = cfg == null ? CFG_FREEZER : cfg.first;
+            int freezeMode = cfg == null ? CFG_FREEZER : AppConfigSerializer.normalizedFreezeMode(cfg.first);
             int isPermissive = cfg == null ? 0 : cfg.second;
 
             if (freezeMode == CFG_WHITEFORCE) {
@@ -374,8 +410,10 @@ public class Config extends Fragment {
             holder.spinner_cfg.setVisibility(View.VISIBLE);
             holder.spinner_permissive.setVisibility(freezeMode == CFG_WHITELIST ? View.GONE : View.VISIBLE);
 
+            holder.bindingConfig = true;
             holder.spinner_cfg.setSelection(cfgValue2idx(freezeMode));
             holder.spinner_permissive.setSelection(isPermissive == 0 ? 0 : 1);
+            holder.bindingConfig = false;
         }
 
         @Override
@@ -383,12 +421,13 @@ public class Config extends Fragment {
             return uidListFilter.size();
         }
 
-        static class MyViewHolder extends RecyclerView.ViewHolder {
+        class MyViewHolder extends RecyclerView.ViewHolder {
 
             ImageView app_icon;
             TextView app_label;
             Spinner spinner_cfg, spinner_permissive;
             int uid = 0;
+            boolean bindingConfig = false;
 
             public MyViewHolder(View view) {
                 super(view);
@@ -400,11 +439,11 @@ public class Config extends Fragment {
                 spinner_cfg.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
                     @Override
                     public void onItemSelected(AdapterView<?> parent, View view, int spinnerPosition, long id) {
-                        if (uid == 0) return;
+                        if (uid == 0 || bindingConfig) return;
                         var cfg = appCfg.get(uid);
                         int newFreezeMode = idx2cfgValue(spinnerPosition);
                         if (cfg == null || cfg.first == newFreezeMode) return;
-                        appCfg.put(uid, new Pair<>(newFreezeMode, cfg.second));
+                        updateConfig(uid, new Pair<>(newFreezeMode, cfg.second));
                         spinner_permissive.setVisibility(newFreezeMode == CFG_WHITELIST ? View.GONE : View.VISIBLE);
                     }
 
@@ -416,10 +455,12 @@ public class Config extends Fragment {
                 spinner_permissive.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
                     @Override
                     public void onItemSelected(AdapterView<?> parent, View view, int spinnerPosition, long id) {
-                        if (uid == 0) return;
+                        if (uid == 0 || bindingConfig) return;
                         var cfg = appCfg.get(uid);
                         if (cfg == null || cfg.second == spinnerPosition) return;
-                        appCfg.put(uid, new Pair<>(cfg.first, spinnerPosition));
+                        updateConfig(uid, new Pair<>(
+                                AppConfigSerializer.normalizedFreezeMode(cfg.first),
+                                spinnerPosition));
                     }
 
                     @Override
@@ -432,20 +473,21 @@ public class Config extends Fragment {
 
 
         public byte[] getCfgBytes() {
+            if (!configLoaded || appCfg.isEmpty()) return null;
+            Map<Integer, AppConfigSerializer.Value> values = new HashMap<>();
+            appCfg.forEach((uid, cfg) ->
+                    values.put(uid, new AppConfigSerializer.Value(cfg.first, cfg.second)));
+            byte[] payload = AppConfigSerializer.encode(values, persistedUidOrder, changedUids);
+            return payload.length == 0 ? null : payload;
+        }
 
-            if (appCfg.isEmpty()) return null;
-
-            byte[] tmp = new byte[appCfg.size() * 12];
-            final int[] idx = {0};
-            appCfg.forEach((uid, cfg) -> {
-                Utils.Int2Byte(uid, tmp, idx[0]);
-                idx[0] += 4;
-                Utils.Int2Byte(cfg.first, tmp, idx[0]);
-                idx[0] += 4;
-                Utils.Int2Byte(cfg.second, tmp, idx[0]);
-                idx[0] += 4;
-            });
-            return tmp;
+        private void updateConfig(int uid, Pair<Integer, Integer> config) {
+            appCfg.put(uid, config);
+            Pair<Integer, Integer> original = originalAppCfg.get(uid);
+            if (config.equals(original))
+                changedUids.remove(uid);
+            else
+                changedUids.add(uid);
         }
 
         public void switchAppType() {
