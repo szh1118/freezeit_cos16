@@ -149,21 +149,47 @@ fn freeze_process(process: &crate::domain::runtime::RuntimeProcess) -> Result<()
 }
 
 fn unfreeze_process(process: &crate::domain::runtime::RuntimeProcess) -> Result<(), DaemonError> {
-    if let Some(path) = &process.cgroup_freeze_path {
-        let binder_pid = u32::try_from(process.pid)
-            .map_err(|_| DaemonError::system(format!("invalid binder pid {}", process.pid)))?;
-        cgroup::write_freeze_state(path, cgroup::FreezeState::Thawed)?;
-        let binder_path = binder::discover_binder_device()
-            .ok_or_else(|| DaemonError::system("binder device disappeared before unfreeze"))?;
-        binder::set_binder_freeze(
-            binder_path,
-            binder_pid,
-            binder::BinderFreezeRequest::Unfreeze,
-            0,
-        )?;
+    run_unfreeze_sequence(
+        process.cgroup_freeze_path.as_deref(),
+        |path| cgroup::write_freeze_state(path, cgroup::FreezeState::Thawed),
+        || {
+            let binder_pid = u32::try_from(process.pid)
+                .map_err(|_| DaemonError::system(format!("invalid binder pid {}", process.pid)))?;
+            let binder_path = binder::discover_binder_device()
+                .ok_or_else(|| DaemonError::system("binder device disappeared before unfreeze"))?;
+            Ok(binder::set_binder_freeze(
+                binder_path,
+                binder_pid,
+                binder::BinderFreezeRequest::Unfreeze,
+                0,
+            )?)
+        },
+        || signal::send_signal(process.pid, signal::SignalAction::Continue),
+    )
+}
+
+fn run_unfreeze_sequence(
+    cgroup_path: Option<&str>,
+    thaw_cgroup: impl FnOnce(&str) -> Result<(), DaemonError>,
+    unfreeze_binder: impl FnOnce() -> Result<(), DaemonError>,
+    resume_signal: impl FnOnce() -> Result<(), DaemonError>,
+) -> Result<(), DaemonError> {
+    let mut failures = Vec::new();
+    if let Some(path) = cgroup_path {
+        if let Err(error) = thaw_cgroup(path) {
+            failures.push(format!("cgroup thaw failed: {error}"));
+        }
+        if let Err(error) = unfreeze_binder() {
+            failures.push(format!("binder unfreeze failed: {error}"));
+        }
+    }
+    if let Err(error) = resume_signal() {
+        failures.push(format!("SIGCONT failed: {error}"));
+    }
+    if failures.is_empty() {
         Ok(())
     } else {
-        signal::send_signal(process.pid, signal::SignalAction::Continue)
+        Err(DaemonError::system(failures.join("; ")))
     }
 }
 
@@ -250,4 +276,82 @@ fn spawn_control_loop(
         state.operation_log_json = operation_log_json;
         state.operation_log_text = operation_log_text;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_unfreeze_sequence;
+    use crate::app::error::DaemonError;
+    use std::cell::RefCell;
+
+    #[test]
+    fn cgroup_unfreeze_always_finishes_with_sigcont() {
+        let calls = RefCell::new(Vec::new());
+        run_unfreeze_sequence(
+            Some("/tmp/cgroup.freeze"),
+            |_| {
+                calls.borrow_mut().push("cgroup");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("binder");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("sigcont");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(&*calls.borrow(), &["cgroup", "binder", "sigcont"]);
+    }
+
+    #[test]
+    fn signal_only_unfreeze_sends_sigcont_without_other_backends() {
+        let calls = RefCell::new(Vec::new());
+        run_unfreeze_sequence(
+            None,
+            |_| -> Result<(), DaemonError> {
+                calls.borrow_mut().push("cgroup");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("binder");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("sigcont");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(&*calls.borrow(), &["sigcont"]);
+    }
+
+    #[test]
+    fn sigcont_is_attempted_when_cgroup_and_binder_unfreeze_fail() {
+        let calls = RefCell::new(Vec::new());
+        let error = run_unfreeze_sequence(
+            Some("/tmp/cgroup.freeze"),
+            |_| {
+                calls.borrow_mut().push("cgroup");
+                Err(DaemonError::system("thaw"))
+            },
+            || {
+                calls.borrow_mut().push("binder");
+                Err(DaemonError::system("binder"))
+            },
+            || {
+                calls.borrow_mut().push("sigcont");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(&*calls.borrow(), &["cgroup", "binder", "sigcont"]);
+        assert!(error.to_string().contains("cgroup thaw failed"));
+        assert!(error.to_string().contains("binder unfreeze failed"));
+    }
 }

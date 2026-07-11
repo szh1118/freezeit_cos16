@@ -5,10 +5,10 @@ OnePlus/ColorOS Android 16 baseline. It is not a generic Android release.
 
 ## Release Model
 
-- Current module version: `3.3.0SelfUse` / versionCode `303000`.
-- Published metadata in `freezeitRelease/update.json` points to the validated
-  `v3.3.0SelfUse` Rust-only archive. Future metadata changes must remain gated
-  on the exact archive passing the release validator.
+- Planned module version: `3.3.1SelfUse` / versionCode `303001`.
+- Published metadata in `freezeitRelease/update.json` remains on the validated
+  `v3.3.0SelfUse` Rust-only archive until the `3.3.1SelfUse` hotfix archive
+  passes host and device validation.
 - New releases are Rust-only and ARM64-only. The package contains exactly one
   daemon named `freezeit`, built from `freezeitDaemon/` for
   `aarch64-linux-android`.
@@ -26,9 +26,9 @@ scripts/build-release.sh
 ```
 
 It builds the Rust ARM64 daemon and release APK, verifies both use
-`3.3.0SelfUse` / `303000`, and delegates to `scripts/package-release.sh`.
+`3.3.1SelfUse` / `303001`, and delegates to `scripts/package-release.sh`.
 Packaging happens in disposable `.release-staging/` storage and emits
-`freezeitRelease/freezeit_oneplus13_android16_selfuse_v3.3.0SelfUse_303000.zip`.
+`freezeitRelease/freezeit_oneplus13_android16_selfuse_v3.3.1SelfUse_303001.zip`.
 
 For prebuilt artifacts, set `DAEMON`, `APK`, and the matching Gradle
 `output-metadata.json` explicitly:
@@ -57,12 +57,12 @@ and must bind its exact digest through `zipSha256`.
 ```sh
 scripts/test-release-pipeline.sh
 scripts/test-release-metadata.sh planned
-scripts/validate-release-zip.sh /path/to/release.zip 3.3.0SelfUse 303000
+scripts/validate-release-zip.sh /path/to/release.zip 3.3.1SelfUse 303001
 ```
 
 `freezeitRelease/update.json` must be changed only after the final command
 passes for the exact archive that will be published. Then validate published
-metadata with `scripts/test-release-metadata.sh released 3.3.0SelfUse 303000`.
+metadata with `scripts/test-release-metadata.sh released 3.3.1SelfUse 303001`.
 
 ## Source And License
 

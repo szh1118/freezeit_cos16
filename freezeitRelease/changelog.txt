@@ -1,3 +1,9 @@
+### v3.3.1SelfUse
+
+- Fix foreground apps remaining `SIGSTOP`-suspended after a previous signal
+  fallback freeze.
+- Ensure every unfreeze sequence ends with `SIGCONT`.
+
 ### v3.3.0SelfUse
 
 1. 后台 daemon 完成 Rust-only ARM64 收敛，活动代码树不再包含旧 C++ daemon、x64 fallback 或旧构建链。

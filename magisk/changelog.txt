@@ -1,4 +1,11 @@
-### v3.3.0SelfUse planned release structure
+### v3.3.1SelfUse foreground resume hotfix
+
+- Always send `SIGCONT` after cgroup/Binder unfreeze so a process previously
+  stopped by the signal fallback cannot remain suspended when it returns to
+  the foreground.
+- Add a regression test for cgroup/Binder plus signal-fallback recovery.
+
+### v3.3.0SelfUse release structure
 
 - Use the top-level `magisk/` directory as a source-only module template.
 - Package exactly one Rust `aarch64-linux-android` daemon as `freezeit`.

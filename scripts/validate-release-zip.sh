@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ZIP_PATH="${1:-}"
-EXPECTED_VERSION="${2:-3.3.0SelfUse}"
-EXPECTED_VERSION_CODE="${3:-303000}"
+EXPECTED_VERSION="${2:-3.3.1SelfUse}"
+EXPECTED_VERSION_CODE="${3:-303001}"
 [[ -n "$ZIP_PATH" ]] || { echo "usage: $0 <release.zip> [version] [versionCode]" >&2; exit 2; }
 [[ -f "$ZIP_PATH" ]] || { echo "release zip not found: $ZIP_PATH" >&2; exit 1; }
 

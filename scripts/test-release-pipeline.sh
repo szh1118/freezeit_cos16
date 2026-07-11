@@ -11,8 +11,8 @@ done
 if find "$ROOT/magisk" -maxdepth 1 -type f -name '*.apk' -print -quit | grep -q .; then
   fail "template contains APK"
 fi
-grep -Fx 'version=3.3.0SelfUse' "$ROOT/magisk/module.prop" >/dev/null || fail "planned version missing"
-grep -Fx 'versionCode=303000' "$ROOT/magisk/module.prop" >/dev/null || fail "planned versionCode missing"
+grep -Fx 'version=3.3.1SelfUse' "$ROOT/magisk/module.prop" >/dev/null || fail "planned version missing"
+grep -Fx 'versionCode=303001' "$ROOT/magisk/module.prop" >/dev/null || fail "planned versionCode missing"
 grep -F '仅支持 ARM64' "$ROOT/magisk/customize.sh" >/dev/null || fail "installer does not reject non-ARM64"
 grep -F 'freezeitARM64 freezeitX64' "$ROOT/magisk/customize.sh" >/dev/null || fail "legacy daemon rejection missing"
 grep -F 'freezeitVS/magisk' "$ROOT/scripts/package-release.sh" >/dev/null && fail "packager still uses legacy template"
@@ -40,8 +40,8 @@ daemon_sha="$(sha256sum "$tmp/freezeit" | awk '{print $1}')"
 apk_sha="$(sha256sum "$tmp/freezeit.apk" | awk '{print $1}')"
 cat >"$tmp/provenance.txt" <<EOF
 format=freezeit-release-provenance-v1
-version=3.3.0SelfUse
-versionCode=303000
+version=3.3.1SelfUse
+versionCode=303001
 gitCommit=0000000000000000000000000000000000000000
 releaseKind=released
 dirty=false
@@ -144,15 +144,15 @@ status_before="$(git -C "$ROOT" status --short -- freezeitRelease/update.json)"
 
 cat >"$tmp/released-update.json" <<'EOF'
 {
-  "version": "3.3.0SelfUse",
-  "versionCode": 303000,
-  "zipUrl": "https://example.invalid/freezeit_oneplus13_android16_selfuse_v3.3.0SelfUse_303000.zip",
+  "version": "3.3.1SelfUse",
+  "versionCode": 303001,
+  "zipUrl": "https://example.invalid/freezeit_oneplus13_android16_selfuse_v3.3.1SelfUse_303001.zip",
   "zipSha256": "PLACEHOLDER",
   "changelog": "https://example.invalid/changelog.txt"
 }
 EOF
-cp "$tmp/release.zip" "$tmp/freezeit_oneplus13_android16_selfuse_v3.3.0SelfUse_303000.zip"
-release_sha="$(sha256sum "$tmp/freezeit_oneplus13_android16_selfuse_v3.3.0SelfUse_303000.zip" | awk '{print $1}')"
+cp "$tmp/release.zip" "$tmp/freezeit_oneplus13_android16_selfuse_v3.3.1SelfUse_303001.zip"
+release_sha="$(sha256sum "$tmp/freezeit_oneplus13_android16_selfuse_v3.3.1SelfUse_303001.zip" | awk '{print $1}')"
 sed -i "s/PLACEHOLDER/$release_sha/" "$tmp/released-update.json"
 UPDATE_JSON="$tmp/released-update.json" RELEASE_DIR="$tmp" "$ROOT/scripts/test-release-metadata.sh" released >/dev/null
 if "$ROOT/scripts/test-release-metadata.sh" planned '3.3.0;touch-pwned' 303000 >/dev/null 2>&1; then

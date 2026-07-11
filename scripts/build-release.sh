@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-EXPECTED_VERSION="${EXPECTED_VERSION:-3.3.0SelfUse}"
-EXPECTED_VERSION_CODE="${EXPECTED_VERSION_CODE:-303000}"
+EXPECTED_VERSION="${EXPECTED_VERSION:-3.3.1SelfUse}"
+EXPECTED_VERSION_CODE="${EXPECTED_VERSION_CODE:-303001}"
 
 "$ROOT/freezeitDaemon/scripts/build-android.sh"
 (

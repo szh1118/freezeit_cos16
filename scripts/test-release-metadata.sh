@@ -5,8 +5,8 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 update_json="${UPDATE_JSON:-$root/freezeitRelease/update.json}"
 release_dir="${RELEASE_DIR:-$root/freezeitRelease}"
 mode="${1:-planned}"
-planned_version="${2:-3.3.0SelfUse}"
-planned_code="${3:-303000}"
+planned_version="${2:-3.3.1SelfUse}"
+planned_code="${3:-303001}"
 
 fail() { echo "release metadata test failed: $*" >&2; exit 1; }
 [[ "$mode" == planned || "$mode" == released ]] || fail "mode must be planned or released"

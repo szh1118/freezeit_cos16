@@ -5,11 +5,13 @@ for the recorded OnePlus/ColorOS Android 16 baseline.
 
 ## Rust-Only Release Policy
 
-Starting with planned version `3.3.0SelfUse` / `303000`, releases are ARM64-only
+Starting with version `3.3.0SelfUse` / `303000`, releases are ARM64-only
 and package exactly one Rust daemon as `freezeit`. The daemon source is
 `freezeitDaemon/`; the manager source is `freezeitApp/`. Legacy C++ and x64
 payloads are not release inputs, and the top-level `magisk/` template contains
 no binaries or APKs.
+
+The planned version `3.3.1SelfUse` / `303001` is a foreground-resume hotfix.
 
 Build with `scripts/build-release.sh`, or package verified prebuilt artifacts
 with `scripts/package-release.sh`. Every candidate must pass
@@ -19,9 +21,9 @@ AArch64 ELF, safe ZIP paths, complete payload SHA256, and provenance checks.
 ## Publication Gate
 
 `freezeitRelease/update.json` intentionally continues to describe the last
-validated public artifact. Update it to `3.3.0SelfUse` only after the exact
-`freezeit_oneplus13_android16_selfuse_v3.3.0SelfUse_303000.zip` candidate passes
-validation and is placed in this directory. Existing release ZIPs are retained.
+validated public artifact. Keep it on `3.3.0SelfUse` until the exact
+`freezeit_oneplus13_android16_selfuse_v3.3.1SelfUse_303001.zip` hotfix candidate
+passes host and device validation. Existing release ZIPs are retained.
 Released metadata also requires a `zipSha256` equal to that local ZIP after it
 passes `scripts/validate-release-zip.sh`; metadata cannot advertise a missing or
 unvalidated artifact. Dirty trees may produce test candidates only, with an
