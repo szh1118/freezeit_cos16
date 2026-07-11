@@ -11,7 +11,7 @@ and package exactly one Rust daemon as `freezeit`. The daemon source is
 payloads are not release inputs, and the top-level `magisk/` template contains
 no binaries or APKs.
 
-The planned version `3.3.1SelfUse` / `303001` is a foreground-resume hotfix.
+Version `3.3.1SelfUse` / `303001` is the foreground-resume hotfix release.
 
 Build with `scripts/build-release.sh`, or package verified prebuilt artifacts
 with `scripts/package-release.sh`. Every candidate must pass
@@ -20,10 +20,9 @@ AArch64 ELF, safe ZIP paths, complete payload SHA256, and provenance checks.
 
 ## Publication Gate
 
-`freezeitRelease/update.json` intentionally continues to describe the last
-validated public artifact. Keep it on `3.3.0SelfUse` until the exact
-`freezeit_oneplus13_android16_selfuse_v3.3.1SelfUse_303001.zip` hotfix candidate
-passes host and device validation. Existing release ZIPs are retained.
+`freezeitRelease/update.json` describes the validated
+`freezeit_oneplus13_android16_selfuse_v3.3.1SelfUse_303001.zip` hotfix release.
+Existing release ZIPs are retained.
 Released metadata also requires a `zipSha256` equal to that local ZIP after it
 passes `scripts/validate-release-zip.sh`; metadata cannot advertise a missing or
 unvalidated artifact. Dirty trees may produce test candidates only, with an

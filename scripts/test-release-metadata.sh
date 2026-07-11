@@ -19,8 +19,13 @@ require_text() {
 
 require_text magisk/module.prop "version=$planned_version"
 require_text magisk/module.prop "versionCode=$planned_code"
-require_text README.md "Planned module version: \`$planned_version\` / versionCode \`$planned_code\`"
-require_text freezeitRelease/README.md "planned version \`$planned_version\` / \`$planned_code\`"
+if [[ "$mode" == planned ]]; then
+  require_text README.md "Planned module version: \`$planned_version\` / versionCode \`$planned_code\`"
+  require_text freezeitRelease/README.md "planned version \`$planned_version\` / \`$planned_code\`"
+else
+  require_text README.md "Current module version: \`$planned_version\` / versionCode \`$planned_code\`"
+  require_text freezeitRelease/README.md "Version \`$planned_version\` / \`$planned_code\`"
+fi
 require_text README.md 'GPL-3.0-or-later'
 require_text freezeitRelease/README.md 'GPL-3.0-or-later'
 

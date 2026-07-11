@@ -5,10 +5,9 @@ OnePlus/ColorOS Android 16 baseline. It is not a generic Android release.
 
 ## Release Model
 
-- Planned module version: `3.3.1SelfUse` / versionCode `303001`.
-- Published metadata in `freezeitRelease/update.json` remains on the validated
-  `v3.3.0SelfUse` Rust-only archive until the `3.3.1SelfUse` hotfix archive
-  passes host and device validation.
+- Current module version: `3.3.1SelfUse` / versionCode `303001`.
+- Published metadata in `freezeitRelease/update.json` points to the validated
+  `v3.3.1SelfUse` Rust-only hotfix archive.
 - New releases are Rust-only and ARM64-only. The package contains exactly one
   daemon named `freezeit`, built from `freezeitDaemon/` for
   `aarch64-linux-android`.
