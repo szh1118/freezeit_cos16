@@ -139,8 +139,10 @@ if "$ROOT/scripts/validate-release-zip.sh" "$tmp/bad-provenance.zip" >/dev/null 
   fail "validator accepted mismatched provenance digest"
 fi
 
-status_before="$(git -C "$ROOT" status --short -- freezeitRelease/update.json)"
-[[ -z "$status_before" ]] || fail "update.json changed before a validated 3.3.0 release exists"
+if [[ -n "$(git -C "$ROOT" status --short -- freezeitRelease/update.json)" ]]; then
+  "$ROOT/scripts/test-release-metadata.sh" released 3.3.1SelfUse 303001 >/dev/null \
+    || fail "changed update.json does not describe a validated release"
+fi
 
 cat >"$tmp/released-update.json" <<'EOF'
 {
