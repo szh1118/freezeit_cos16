@@ -171,15 +171,22 @@ impl SystemAwareCgroupBinderBackend {
             };
         }
 
-        if self.environment.cgroup_available {
+        if self.environment.cgroup_available && self.environment.binder_available {
             return FreezeDecision {
                 action: DecisionAction::Freeze,
-                reason: if self.environment.binder_available {
-                    "cgroup and binder freezer available".to_owned()
-                } else {
-                    "cgroup freezer available; binder freezer unavailable".to_owned()
-                },
+                reason: "cgroup and binder freezer available".to_owned(),
             };
+        }
+
+        // cgroup 可用但 binder 不可用时不能走 Freeze 路径：freeze_process 会把
+        // binder::set_binder_freeze 当作前置条件（用 `?` 提前返回），必然失败并回滚，
+        // 使本可用的 cgroup.freeze 精确冻结退化为信号回退。交给 fallback_decision
+        // 按 policy 的 fallback_strategy 决定用信号还是推迟。
+        if self.environment.cgroup_available && !self.environment.binder_available {
+            return fallback_decision(
+                policy,
+                "cgroup freezer available but binder freezer unavailable; freeze_process requires binder",
+            );
         }
 
         fallback_decision(policy, "preferred freezer unavailable")

@@ -292,6 +292,11 @@ fn escape_json(value: &str) -> String {
             '\n' => "\\n".chars().collect(),
             '\r' => "\\r".chars().collect(),
             '\t' => "\\t".chars().collect(),
+            // RFC 8259 要求 U+0000..U+001F 用 \uXXXX 转义，否则裸控制字符（NUL、ESC
+            // 等）会让 manager 端 JSON parser 拒绝整条 operation log，丢失全部历史。
+            c if (c as u32) < 0x20 => {
+                format!("\\u{:04x}", c as u32).chars().collect::<Vec<_>>()
+            }
             other => vec![other],
         })
         .collect()

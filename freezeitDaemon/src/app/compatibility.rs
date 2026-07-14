@@ -245,6 +245,9 @@ fn escape_json(value: &str) -> String {
             '\n' => "\\n".chars().collect(),
             '\r' => "\\r".chars().collect(),
             '\t' => "\\t".chars().collect(),
+            c if (c as u32) < 0x20 => {
+                format!("\\u{:04x}", c as u32).chars().collect::<Vec<_>>()
+            }
             other => vec![other],
         })
         .collect()

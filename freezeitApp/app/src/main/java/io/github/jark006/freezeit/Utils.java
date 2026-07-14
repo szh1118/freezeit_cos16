@@ -99,7 +99,10 @@ public class Utils {
             }
 
             final int payloadLen = Byte2Int(dataHeader, 0);
-            if (payloadLen < 0) {
+            // 必须设上限，否则恶意/畸形响应头 payloadLen=0x7FFFFFFF 会通过 <0 检查并
+            // 触发 new byte[2147483647] 抛 OutOfMemoryError（catch 只接 IOException）。
+            // 与 Rust 端 MAX_PAYLOAD_LEN (1 MiB) 对齐。
+            if (payloadLen < 0 || payloadLen > 1024 * 1024) {
                 Log.e(TAG, "Invalid payloadLen:" + payloadLen);
                 return new TaskResult(new byte[0]);
             }

@@ -4,6 +4,7 @@ import static io.github.jark006.freezeit.hook.XpUtils.log;
 
 import android.content.Context;
 import android.net.LocalServerSocket;
+import android.net.LocalSocket;
 import android.os.Build;
 import android.os.Handler;
 
@@ -193,94 +194,101 @@ public class FreezeitService {
         }
 
         @SuppressWarnings("InfiniteLoopStatement")
-        void acceptHandle() throws IOException {
+        void acceptHandle() {
             while (true) {
-                var client = mSocketServer.accept();//堵塞,单线程处理
-                if (client == null) continue;
+                LocalSocket client = null;
+                try {
+                    client = mSocketServer.accept();//堵塞,单线程处理
+                    if (client == null) continue;
 
-                client.setSoTimeout(3000);
-                var is = client.getInputStream();
-
-                final int recvLen = is.read(buff, 0, 8);
-                if (recvLen != 8) {
-                    log(TAG, "非法连接 接收长度 " + recvLen);
-                    is.close();
-                    client.close();
-                    continue;
-                }
-
-                // 前4字节是请求码，后4字节是附加数据长度
-                final int requestCode = Utils.Byte2Int(buff, 0);
-                if (!requestCodeSet.contains(requestCode)) {
-                    log(TAG, "非法请求码 " + requestCode);
-                    is.close();
-                    client.close();
-                    continue;
-                }
-
-                final int payloadLen = Utils.Byte2Int(buff, 4);
-                if (payloadLen > 0) {
-                    if (buff.length <= payloadLen) {
-                        log(TAG, "数据量超过承载范围 " + payloadLen);
-                        is.close();
-                        client.close();
-                        continue;
-                    }
-
-                    int readCnt = 0;
-                    while (readCnt < payloadLen) { //欲求不满
-                        int cnt = is.read(buff, readCnt, payloadLen - readCnt);
-                        if (cnt < 0) {
-                            log(TAG, "接收完毕或错误 " + cnt);
-                            break;
-                        }
-                        readCnt += cnt;
-                    }
-                    if (payloadLen != readCnt) {
-                        log(TAG, "接收错误 payloadLen" + payloadLen + " readCnt" + readCnt);
-                        is.close();
-                        client.close();
-                        continue;
+                    handleClient(client);
+                } catch (Exception e) {
+                    // 单个客户端中途断开/写入失败不得传出 acceptHandle，否则会消耗
+                    // run() 的重试次数，重试耗尽后整个 LocalSocketServer 线程退出，
+                    // 本启动周期内 Xposed 桥接永久不可用。这里吞掉并继续 accept 下一个。
+                    log(TAG, "acceptHandle 处理异常: " + e);
+                } finally {
+                    if (client != null) {
+                        try { client.close(); } catch (Exception ignored) {}
                     }
                 }
+            }
+        }
 
-                var os = client.getOutputStream();
-                switch (requestCode) {
-                    case GET_FOREGROUND:
-                        handleForeground(os, buff);
-                        break;
-                    case GET_SCREEN_STATE:
-                        handleScreen(os, buff);
-                        break;
-                    case GET_XP_LOG:
-                        handleXpLog(os);
-                        break;
-                    case SET_CONFIG:
-                        handleConfig(os, buff, payloadLen);
-                        break;
-                    case SET_WAKEUP_LOCK:
-                        handleWakeupLock(os, buff, payloadLen);
-                        break;
-                    case BREAK_NETWORK:
-                        handleDestroySocket(os, buff, payloadLen);
-                        break;
-                    case UPDATE_PENDING:
-                        handlePendingApp(os, buff, payloadLen);
-                        break;
-                    case GET_HOOK_HEALTH:
-                        handleHookHealth(os);
-                        break;
-                    case GET_RUNTIME_APP_STATES:
-                        handleRuntimeAppStates(os);
-                        break;
-                    case GET_SYSTEM_FREEZER_HINTS:
-                        handleSystemFreezerHints(os);
-                        break;
-                    default:
-                        log(TAG, "请求码功能暂未实现TODO: " + requestCode);
-                        break;
+        void handleClient(LocalSocket client) throws IOException {
+            client.setSoTimeout(3000);
+            var is = client.getInputStream();
+
+            final int recvLen = is.read(buff, 0, 8);
+            if (recvLen != 8) {
+                log(TAG, "非法连接 接收长度 " + recvLen);
+                return;
+            }
+
+            // 前4字节是请求码，后4字节是附加数据长度
+            final int requestCode = Utils.Byte2Int(buff, 0);
+            if (!requestCodeSet.contains(requestCode)) {
+                log(TAG, "非法请求码 " + requestCode);
+                return;
+            }
+
+            final int payloadLen = Utils.Byte2Int(buff, 4);
+            if (payloadLen > 0) {
+                if (buff.length <= payloadLen) {
+                    log(TAG, "数据量超过承载范围 " + payloadLen);
+                    return;
                 }
-                client.close();
+
+                int readCnt = 0;
+                while (readCnt < payloadLen) { //欲求不满
+                    int cnt = is.read(buff, readCnt, payloadLen - readCnt);
+                    if (cnt < 0) {
+                        log(TAG, "接收完毕或错误 " + cnt);
+                        break;
+                    }
+                    readCnt += cnt;
+                }
+                if (payloadLen != readCnt) {
+                    log(TAG, "接收错误 payloadLen" + payloadLen + " readCnt" + readCnt);
+                    return;
+                }
+            }
+
+            var os = client.getOutputStream();
+            switch (requestCode) {
+                case GET_FOREGROUND:
+                    handleForeground(os, buff);
+                    break;
+                case GET_SCREEN_STATE:
+                    handleScreen(os, buff);
+                    break;
+                case GET_XP_LOG:
+                    handleXpLog(os);
+                    break;
+                case SET_CONFIG:
+                    handleConfig(os, buff, payloadLen);
+                    break;
+                case SET_WAKEUP_LOCK:
+                    handleWakeupLock(os, buff, payloadLen);
+                    break;
+                case BREAK_NETWORK:
+                    handleDestroySocket(os, buff, payloadLen);
+                    break;
+                case UPDATE_PENDING:
+                    handlePendingApp(os, buff, payloadLen);
+                    break;
+                case GET_HOOK_HEALTH:
+                    handleHookHealth(os);
+                    break;
+                case GET_RUNTIME_APP_STATES:
+                    handleRuntimeAppStates(os);
+                    break;
+                case GET_SYSTEM_FREEZER_HINTS:
+                    handleSystemFreezerHints(os);
+                    break;
+                default:
+                    log(TAG, "请求码功能暂未实现TODO: " + requestCode);
+                    break;
             }
         }
 

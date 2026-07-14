@@ -1,3 +1,16 @@
+### v3.3.3SelfUse
+
+- 修复 manager socket 校验长度前按声明值分配内存且无读取超时；畸形长度不再触发 4GB 分配或阻塞控制循环。
+- daemon 接受循环增加 panic 隔离，单个请求崩溃不再拖垮整个守护进程。
+- 守护进程重启时补发 SIGCONT 恢复上一轮用信号冻结的进程，避免重启后应用永久卡死。
+- 修复仅有 cgroup 无 binder freezer 时误走 Freeze 路径回滚、失去精确冻结的问题。
+- 把 hook 健康检查网络往返移出 state 锁，慢 hook 桥接不再阻塞冻结/解冻。
+- 修复 Xposed 桥接未捕获 IOException 导致重试耗尽、整周期桥接死亡的问题。
+- 修复 Java 客户端 payloadLen 无上限校验导致 OOM 崩溃。
+- 修复 Config 页下拉刷新后台线程 requireContext 崩溃。
+- 修复 ClearLog 无法清屏、GetProcState 受日志级别过滤无响应。
+- 设置写入改原子写，避免断电损坏；JSON 转义控制字符；安装器 APK 权限收紧为 0600。
+
 ### v3.3.2SelfUse
 
 - 修复 Manager 无操作保存时写入展示默认项的问题。

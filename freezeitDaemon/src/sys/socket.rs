@@ -4,27 +4,38 @@ use std::{
     net::{TcpListener, TcpStream},
     sync::{Arc, Mutex},
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
     app::{
         controller::{
             is_control_policy_mode, refresh_runtime_diagnostics, run_control_pass_with_sampling,
-            sync_loaded_config_to_hook, RuntimeControlState,
+            RuntimeControlState,
         },
         error::DaemonError,
         logging::LogRecord,
     },
     protocol::{
         manager_v1::{
-            encode_frame, handle_manager_command, parse_frame, ReadOnlyState, HEADER_LEN,
-            MANAGER_LISTEN_HOST, MANAGER_LISTEN_PORT,
+            encode_app_config, encode_frame, encode_xposed_config_payload,
+            handle_manager_command, parse_frame, ReadOnlyState, HEADER_LEN,
+            MANAGER_LISTEN_HOST, MANAGER_LISTEN_PORT, MAX_PAYLOAD_LEN,
         },
         xposed::{classify_bridge_error, classify_hook_health_payload},
     },
     sys::{binder, cgroup, procfs, signal, xposed_bridge},
 };
+
+/// 一次管理器请求的读取/写入超时。设置后慢客户端不能永久占住 state 锁阻塞控制循环。
+const MANAGER_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
 
 pub fn bind_manager_listener() -> Result<TcpListener, DaemonError> {
     Ok(TcpListener::bind((
@@ -38,14 +49,25 @@ pub fn handle_single_manager_stream(
     state: &mut ReadOnlyState,
 ) -> Result<(), DaemonError> {
     let mut header = [0_u8; HEADER_LEN];
+    // 给整条流设置超时，避免慢/恶意客户端在 read_exact 上永久阻塞并占住 state 锁。
+    let _ = stream.set_read_timeout(Some(MANAGER_STREAM_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(MANAGER_STREAM_TIMEOUT));
     stream.read_exact(&mut header)?;
     let payload_len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    // 必须在 resize 之前校验长度上限，否则恶意 0xFFFFFFFF 会触发 ~4GB 分配 + 永久阻塞读。
+    if payload_len > MAX_PAYLOAD_LEN {
+        return Err(DaemonError::protocol(format!(
+            "manager frame payload too large: {payload_len} > {MAX_PAYLOAD_LEN}"
+        )));
+    }
     let mut bytes = header.to_vec();
     bytes.resize(HEADER_LEN + payload_len, 0);
     stream.read_exact(&mut bytes[HEADER_LEN..])?;
 
     let request = parse_frame(&bytes)?;
-    refresh_hook_health(state);
+    // 注意：不再在每次 manager 请求时同步刷新 hook 健康——控制循环已每秒在锁外
+    // 执行 xposed bridge 网络往返并写回 state，这里再刷一次会把 3 秒同步调用留在
+    // state 锁内，阻塞控制循环。manager 端读取的 hook_health 最多滞后 1 秒，可接受。
     let payload = handle_manager_command(&request, state, xposed_bridge::set_config)?;
     let response = encode_frame(request.command, &payload)?;
     stream.write_all(&response)?;
@@ -202,12 +224,92 @@ fn run_unfreeze_sequence(
     }
 }
 
-fn refresh_hook_health(state: &mut ReadOnlyState) {
-    state.daemon_health = "active".to_owned();
-    if !state.hook_config_synced {
-        let _ = sync_loaded_config_to_hook(state, xposed_bridge::set_config);
+/// 锁内：读取做 hook 健康检查与配置同步所需的只读快照，并标记是否需要同步配置。
+/// 真正的网络往返在锁外执行（见 `execute_hook_health_work`），避免 3 秒同步调用
+/// 期间占住全局 state Mutex 阻塞控制循环/管理器请求。
+fn prepare_hook_health_work(state: &ReadOnlyState) -> HookHealthWork {
+    let needs_config_sync = !state.hook_config_synced;
+    let xposed_payload = if needs_config_sync {
+        encode_xposed_config_payload(&state.settings, &encode_app_config(&state.app_config)).ok()
+    } else {
+        None
+    };
+    HookHealthWork {
+        needs_config_sync,
+        xposed_payload,
     }
-    match xposed_bridge::query_hook_health() {
+}
+
+struct HookHealthWork {
+    needs_config_sync: bool,
+    xposed_payload: Option<Vec<u8>>,
+}
+
+/// 锁外：执行 xposed bridge 的同步网络往返（3 秒超时）。不持有 state 锁。
+fn execute_hook_health_work(
+    work: HookHealthWork,
+    set_app_config: impl FnOnce(&[u8]) -> Result<bool, DaemonError>,
+) -> HookHealthResult {
+    let sync_result = if work.needs_config_sync {
+        match &work.xposed_payload {
+            Some(payload) => match set_app_config(payload) {
+                Ok(synced) => Some(Ok(synced)),
+                Err(error) => Some(Err(error)),
+            },
+            None => Some(Err(DaemonError::protocol(
+                "failed to encode xposed config payload for sync",
+            ))),
+        }
+    } else {
+        None
+    };
+    let health_result = xposed_bridge::query_hook_health();
+    HookHealthResult {
+        sync_result,
+        health_result,
+    }
+}
+
+struct HookHealthResult {
+    sync_result: Option<Result<bool, DaemonError>>,
+    health_result: Result<String, DaemonError>,
+}
+
+/// 锁内：把锁外收集的结果写回 state。
+fn apply_hook_health_result(state: &mut ReadOnlyState, result: HookHealthResult) {
+    state.daemon_health = "active".to_owned();
+    if let Some(sync_outcome) = result.sync_result {
+        match sync_outcome {
+            Ok(synced) => {
+                state.hook_config_synced = synced;
+                if synced {
+                    state.manager_log.push_once(LogRecord::diagnostic(
+                        crate::app::logging::LogLevel::Debug,
+                        now_ms(),
+                        format!(
+                            "hook config synced: managed_apps={} settings={}",
+                            state.app_config.len(),
+                            state.settings.len()
+                        ),
+                    ));
+                } else {
+                    state.manager_log.push_once(LogRecord::fault(
+                        crate::app::logging::LogLevel::Warn,
+                        now_ms(),
+                        "hook config sync rejected",
+                    ));
+                }
+            }
+            Err(error) => {
+                state.manager_log.push_once(LogRecord::fault(
+                    crate::app::logging::LogLevel::Warn,
+                    now_ms(),
+                    format!("hook config sync failed: {error}"),
+                ));
+            }
+        }
+    }
+    match result.health_result {
         Ok(payload) => {
             let status = classify_hook_health_payload(&payload);
             state.hook_health = status.health_label().to_owned();
@@ -234,8 +336,23 @@ pub fn run_manager_server_forever(state: ReadOnlyState) -> Result<(), DaemonErro
                 let mut state = state
                     .lock()
                     .map_err(|_| DaemonError::system("manager state mutex poisoned"))?;
-                if let Err(error) = handle_single_manager_stream(stream, &mut state) {
-                    eprintln!("manager request failed: {error}");
+                // 单个请求的 panic 不得拖垮整个守护进程——daemon 退出会让所有经
+                // SIGSTOP 冻结的应用无人恢复。捕获后记日志继续服务下一条连接。
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle_single_manager_stream(stream, &mut state)
+                }));
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => eprintln!("manager request failed: {error}"),
+                    Err(panic) => eprintln!(
+                        "manager request panicked: {}",
+                        panic.downcast_ref::<String>()
+                            .map(|s| s.clone())
+                            .or_else(|| {
+                                panic.downcast_ref::<&'static str>().map(|s| s.to_string())
+                            })
+                            .unwrap_or_else(|| "unknown panic".to_string())
+                    ),
                 }
             }
             Err(error) => return Err(DaemonError::from(error)),
@@ -251,9 +368,20 @@ fn spawn_control_loop(
 ) {
     thread::spawn(move || loop {
         thread::sleep(std::time::Duration::from_secs(1));
+        // hook 健康检查与配置同步的 xposed bridge 网络往返最长 3 秒，必须在 state 锁
+        // 之外执行，否则会阻塞管理器 TCP 请求。先在锁内取出工作描述，释放锁做网络，
+        // 再重新加锁写回并 clone 出本轮控制所需的只读快照。
+        let hook_work = match state.lock() {
+            Ok(state) => prepare_hook_health_work(&state),
+            Err(_) => {
+                eprintln!("control loop state mutex poisoned");
+                continue;
+            }
+        };
+        let hook_result = execute_hook_health_work(hook_work, xposed_bridge::set_config);
         let mut state_snapshot = match state.lock() {
             Ok(mut state) => {
-                refresh_hook_health(&mut state);
+                apply_hook_health_result(&mut state, hook_result);
                 state.clone()
             }
             Err(_) => {

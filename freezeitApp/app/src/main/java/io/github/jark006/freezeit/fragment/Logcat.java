@@ -166,7 +166,9 @@ public class Logcat extends Fragment {
 
     void logTask(byte cmd) {
         Utils.TaskResult result = Utils.freezeitTaskResult(cmd, null);
-        if (result.length() == 0 || result.length() == lastLogLen)
+        // 区分「长度未变」（跳过）与「长度归零」（清屏）。原先 0 字节一律跳过，
+        // 导致 ClearLog 返回空 / 日志过滤后无可见记录时 UI 卡在旧内容。
+        if (result.length() == lastLogLen)
             return;
         lastLogLen = result.length();
         handler.sendMessage(Message.obtain(handler, NEW_LOG_CONTENT, result.payload()));

@@ -9,7 +9,7 @@ use std::{
 
 use crate::app::{
     error::DaemonError,
-    logging::{decode_log_view, LogRecord, ManagerLog, LOG_LEVEL_SETTING_INDEX},
+    logging::{decode_log_view, LogRecord, LogView, ManagerLog, LOG_LEVEL_SETTING_INDEX},
 };
 use crate::config::migration::parse_legacy_policy_line;
 
@@ -327,11 +327,17 @@ pub fn handle_manager_command(
         ManagerCommand::GetFreezeStatus => Ok(encode_freeze_status(&state.freeze_status)),
         ManagerCommand::ClearLog => {
             state.manager_log.clear();
-            Ok(Vec::new())
+            // 返回非空负载：旧版返回 b"\n"。客户端 Logcat.logTask 对 0 字节响应会
+            // 提前返回不刷新 UI，导致清屏按钮不清空。这里返回换行使长度检查通过、
+            // 触发 TextView 清空。
+            Ok(b"\n".to_vec())
         }
         ManagerCommand::GetProcState => {
             append_legacy_proc_state_log(state);
-            handle_read_only_command(ManagerCommand::GetLog, state)
+            // 用 LogView::Info 直接渲染，不受 settings[30] 日志级别过滤——proc-state
+            // 摘要以 Info/LegacyOperation 追加，在 Warn/Error/Critical 视图下会被
+            // record_is_visible 过滤掉导致 check 按钮无响应。
+            Ok(state.manager_log.render(LogView::Info).into_bytes())
         }
         _ => handle_read_only_command(frame.command, state),
     }
@@ -547,7 +553,7 @@ fn set_settings_var(state: &mut ReadOnlyState, payload: &[u8]) -> Result<Vec<u8>
             format!("写入设置文件失败, [{idx}]:{val}: persistence path missing").into_bytes(),
         );
     };
-    if let Err(error) = fs::write(path, &state.settings) {
+    if let Err(error) = atomic_write(path, &state.settings) {
         return Ok(format!("写入设置文件失败, [{idx}]:{val}: {error}").into_bytes());
     }
 

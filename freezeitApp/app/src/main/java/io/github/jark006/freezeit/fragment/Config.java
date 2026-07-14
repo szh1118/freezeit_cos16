@@ -80,8 +80,11 @@ public class Config extends Fragment {
 
         binding.swipeRefreshLayout.setOnRefreshListener(() -> {
             beginConfigLoad();
+            // 在主线程取 context 再传入后台线程；若在线程体内调 requireContext()，
+            // Fragment detach（onDetach 置空 mContext）后会抛 IllegalStateException 崩溃。
+            final android.content.Context context = requireContext().getApplicationContext();
             new Thread(() -> {
-                AppInfoCache.refreshCache(requireContext());// 下拉刷新时，先更新应用缓存
+                AppInfoCache.refreshCache(context);// 下拉刷新时，先更新应用缓存
                 getAppCfgTask();
             }).start();
         });

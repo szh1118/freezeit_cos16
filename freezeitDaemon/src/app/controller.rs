@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -44,7 +44,7 @@ use crate::{
         },
         xposed::{classify_bridge_error, classify_hook_health_payload},
     },
-    sys::{socket, xposed_bridge},
+    sys::{procfs, signal, socket, xposed_bridge},
 };
 
 pub fn run() -> Result<(), DaemonError> {
@@ -62,6 +62,8 @@ pub fn run_with_paths(paths: &DaemonPaths) -> Result<(), DaemonError> {
             format!("hook config sync failed: {error}"),
         ));
     }
+    // 在进入 server 主循环前，恢复上一轮用 SIGSTOP 冻结、daemon 重启后无人恢复的进程。
+    recover_stopped_managed_processes_after_restart(&mut state);
     socket::run_manager_server_forever(state)
 }
 
@@ -1292,18 +1294,45 @@ pub fn is_control_policy_mode(mode: i32) -> bool {
 }
 
 fn backend_environment(processes: &[RuntimeProcess]) -> BackendEnvironment {
+    // 测试钩子：binder freezer 在 CI/非 Android 环境检测必然不可用，但控制逻辑的
+    // 单元测试需要模拟「cgroup+binder 均可用」的真实设备场景。生产路径该 thread_local
+    // 始终为 None，走真实 binder 检测；仅测试通过 set_test_binder_available 注入。
+    let binder_available = match TEST_BINDER_AVAILABLE.with(|cell| cell.get()) {
+        Some(value) => value,
+        None => {
+            crate::sys::binder::detect_binder_freezer_capability().status
+                == crate::domain::capability::CapabilityStatus::Available
+        }
+    };
     BackendEnvironment {
         cgroup_available: !processes.is_empty()
             && processes
                 .iter()
                 .all(|process| process.cgroup_freeze_path.is_some()),
-        binder_available: crate::sys::binder::detect_binder_freezer_capability().status
-            == crate::domain::capability::CapabilityStatus::Available,
+        binder_available,
         network_available: true,
         wakelock_available: true,
         screen_state_available: true,
         hook_fresh: true,
     }
+}
+
+thread_local! {
+    /// 测试专用：覆盖 binder 可用性检测结果。生产恒为 None。
+    static TEST_BINDER_AVAILABLE: std::cell::Cell<Option<bool>> = std::cell::Cell::new(None);
+}
+
+/// 测试专用：注入 binder 可用性，返回一个 guard 在 drop 时恢复默认检测。
+#[doc(hidden)]
+pub fn set_test_binder_available(available: bool) -> impl Drop {
+    TEST_BINDER_AVAILABLE.with(|cell| cell.set(Some(available)));
+    struct ResetGuard;
+    impl Drop for ResetGuard {
+        fn drop(&mut self) {
+            TEST_BINDER_AVAILABLE.with(|cell| cell.set(None));
+        }
+    }
+    ResetGuard
 }
 
 fn backend_name(processes: &[RuntimeProcess]) -> &'static str {
@@ -1462,5 +1491,74 @@ pub fn recover_after_restart(
             "observed {} process(es) before new control",
             processes.len()
         ),
+    }
+}
+
+/// 守护进程重启后，上一轮用信号回退（SIGSTOP）冻结的进程仍处于 T 状态：
+/// `frozen_apps` 仅存内存未持久化，新实例不知道哪些进程曾被 SIGSTOP，
+/// discover 又把 control_state 硬编码为 Running，导致前台解冻路径不会发 SIGCONT。
+/// 这里在进入 server 前，扫描所有受管 uid 中处于停止状态的进程并补发 SIGCONT，
+/// 让这些应用在重启后能被正常使用，再由后续控制循环决定是否重新冻结。
+pub fn recover_stopped_managed_processes_after_restart(state: &mut ReadOnlyState) {
+    let managed_uids: BTreeSet<u32> = state
+        .app_config
+        .iter()
+        .filter(|record| is_control_policy_mode(record.mode))
+        .map(|record| record.uid)
+        .collect();
+    if managed_uids.is_empty() {
+        return;
+    }
+
+    let timestamp_ms = current_timestamp_ms();
+    let processes_by_uid = match procfs::discover_managed_uid_processes(
+        procfs::PROC_ROOT,
+        &managed_uids,
+    ) {
+        Ok(map) => map,
+        Err(error) => {
+            state.manager_log.push_once(LogRecord::fault(
+                LogLevel::Error,
+                timestamp_ms,
+                format!("restart recovery: process discovery failed: {error}"),
+            ));
+            return;
+        }
+    };
+
+    let mut recovered = 0u32;
+    let mut failed = 0u32;
+    for (_uid, processes) in &processes_by_uid {
+        for process in processes {
+            // 只恢复被信号停止（T/t）的进程；cgroup 冻结的进程由 cgroup.freeze
+            // 自行管理状态，且这里没有 cgroup 路径上下文去解冻，故跳过。
+            if process.cgroup_freeze_path.is_some() {
+                continue;
+            }
+            if !procfs::proc_state_is_stopped(
+                &match fs::read_to_string(format!(
+                    "{}/{}/stat",
+                    procfs::PROC_ROOT,
+                    process.pid
+                )) {
+                    Ok(stat) => stat,
+                    Err(_) => continue,
+                },
+            ) {
+                continue;
+            }
+            match signal::send_signal(process.pid, signal::SignalAction::Continue) {
+                Ok(()) => recovered += 1,
+                Err(_) => failed += 1,
+            }
+        }
+    }
+
+    if recovered > 0 || failed > 0 {
+        state.manager_log.push_once(LogRecord::fault(
+            LogLevel::Info,
+            timestamp_ms,
+            format!("restart recovery: SIGCONT recovered={recovered} failed={failed}"),
+        ));
     }
 }

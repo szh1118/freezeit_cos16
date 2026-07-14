@@ -563,7 +563,9 @@ fn remaining_legacy_commands_return_compatibility_payloads() {
         |_| Ok(true),
     )
     .expect("clear log succeeds");
-    assert!(cleared.is_empty());
+    // ClearLog 返回 b"\n"（非空）而非空 Vec：客户端 Logcat.logTask 对 0 字节响应会
+    // 跳过 UI 更新，返回换行使清屏按钮能正常清空 TextView。
+    assert_eq!(cleared, b"\n");
     assert!(state.manager_log.is_empty());
 
     let diagnostics = handle_manager_command(
@@ -573,6 +575,39 @@ fn remaining_legacy_commands_return_compatibility_payloads() {
     )
     .expect("structured diagnostics still available");
     assert_eq!(diagnostics, b"{\"operations\":[{\"action\":\"freeze\"}]}");
+}
+
+#[test]
+fn get_proc_state_returns_summary_even_when_log_level_filters_out_info() {
+    // 回归：GetProcState 追加的 proc-state 摘要是 Info 级 LegacyOperation 记录，
+    // 早期实现经 GetLog 路径按 settings[30] 过滤，在 Warn/Error/Critical 视图下被丢弃
+    // 导致 Logcat 的 check 按钮无响应。修复后 GetProcState 用 LogView::Info 直接渲染。
+    let mut state = ReadOnlyState::default();
+    state.settings[30] = 3; // LogView::Error
+
+    let proc_state = handle_manager_command(
+        &manager_frame(ManagerCommand::GetProcState, &[]),
+        &mut state,
+        |_| Ok(true),
+    )
+    .expect("proc state succeeds");
+    let proc_state = String::from_utf8(proc_state).unwrap();
+    assert!(
+        proc_state.contains("进程冻结状态"),
+        "proc-state summary must render even under Error log view: {proc_state}"
+    );
+
+    // 对照：GetLog 在 Error 视图下应返回空（无 Error/Critical 记录）。
+    let get_log = handle_manager_command(
+        &manager_frame(ManagerCommand::GetLog, &[]),
+        &mut state,
+        |_| Ok(true),
+    )
+    .expect("get log succeeds");
+    assert!(
+        String::from_utf8(get_log).unwrap().is_empty(),
+        "GetLog honors the Error filter and returns empty"
+    );
 }
 
 #[test]

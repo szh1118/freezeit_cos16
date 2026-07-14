@@ -267,6 +267,9 @@ fn control_pass_uses_manager_freeze_delay_before_freezing() {
 
 #[test]
 fn control_pass_records_partial_freeze_when_uid_rescan_finds_new_processes() {
+    // 该测试需要走 Freeze（cgroup+binder）决策路径以触发 rescan 发现新 PID 的逻辑；
+    // CI 环境 detect_binder_freezer_capability 不可用，故注入 binder 可用。
+    let _binder_guard = freezeit_daemon::app::controller::set_test_binder_available(true);
     let mut state = RuntimeControlState::default();
     let config = vec![ManagerAppConfigRecord {
         uid: 10_123,

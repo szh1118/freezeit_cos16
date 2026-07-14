@@ -96,7 +96,9 @@ done
 [ "$fullApkPath" = "$MODPATH/freezeit.apk" ] || abort "- 🚫 安装包中的唯一 APK 必须命名为 freezeit.apk"
 apkPath=/data/local/tmp/freezeit.apk
 mv -f "$fullApkPath" "$apkPath"
-chmod 666 "$apkPath"
+# 0600：/data/local/tmp 全设备可读可写，666 会让任意 app 能在 pm install 前篡改 APK。
+# pm install 以 root 运行，owner-only 权限足够读取。
+chmod 600 "$apkPath"
 
 echo "- 冻它APP 正在安装..."
 output=$(pm install -r -f "$apkPath" 2>&1)

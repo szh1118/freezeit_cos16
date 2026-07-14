@@ -60,6 +60,30 @@ pub fn read_process_start_time(proc_root: impl AsRef<Path>, pid: i32) -> Result<
     parse_process_start_time(&stat)
 }
 
+/// 解析 /proc/<pid>/stat 的 state 字段（comm 右括号后的第一个字符）。
+/// 'T' = 停止（job control/信号），'t' = tracing stop。两者都意味着进程被挂起，
+/// 可能是上一次守护进程用 SIGSTOP 冻结后、daemon 在重启前未发 SIGCONT 恢复所致。
+pub fn parse_proc_state_char(stat_text: &str) -> Result<char, DaemonError> {
+    let command_end = stat_text
+        .rfind(')')
+        .ok_or_else(|| DaemonError::system("proc stat did not contain a command terminator"))?;
+    stat_text[command_end + 1..]
+        .split_whitespace()
+        .next()
+        .and_then(|token| token.chars().next())
+        .ok_or_else(|| DaemonError::system("proc stat did not contain a readable state field"))
+}
+
+/// 进程是否处于被信号停止的状态（'T'/'t'），需要 SIGCONT 恢复。
+pub fn proc_state_is_stopped(stat_text: &str) -> bool {
+    matches!(parse_proc_state_char(stat_text), Ok('T') | Ok('t'))
+}
+
+pub fn read_proc_state_char(proc_root: impl AsRef<Path>, pid: i32) -> Result<char, DaemonError> {
+    let stat = fs::read_to_string(proc_root.as_ref().join(pid.to_string()).join("stat"))?;
+    parse_proc_state_char(&stat)
+}
+
 pub fn process_context_switch_evidence(status_text: &str) -> Option<String> {
     let voluntary = read_status_u64(status_text, "voluntary_ctxt_switches:")?;
     let nonvoluntary = read_status_u64(status_text, "nonvoluntary_ctxt_switches:")?;

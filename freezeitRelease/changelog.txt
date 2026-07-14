@@ -1,3 +1,18 @@
+### v3.3.3SelfUse
+
+1. 修复 manager socket 在校验长度前按客户端声明的 payload_len 分配内存且无读取超时的问题；恶意或畸形长度声明不再触发 ~4GB 分配或永久阻塞控制循环。
+2. 守护进程接受循环增加 catch_unwind，单个请求的 panic 不再拖垮整个 daemon，避免经 SIGSTOP 冻结的应用因 daemon 退出而无人恢复。
+3. 守护进程重启时扫描受管 uid 中处于停止状态（T/t）的非 cgroup 进程并补发 SIGCONT，修复上一轮用信号冻结的应用在重启后永久卡死的问题。
+4. 修复 `can_freeze` 在仅有 cgroup freezer、无 binder freezer 时仍路由到 Freeze 路径导致 binder 前置失败回滚、失去 cgroup.freeze 精确冻结的问题。
+5. 把控制循环的 hook 健康检查与配置同步的 xposed bridge 网络往返移出全局 state Mutex 持有期；移除管理器请求路径的冗余每请求刷新，慢 hook 桥接不再阻塞冻结/解冻。
+6. 修复 FreezeitService Xposed 桥接 `acceptHandle` 未捕获 IOException 的问题；客户端中途断开不再泄漏 client socket、不再消耗重试次数导致整个启动周期桥接死亡。
+7. 修复 Java 客户端 `payloadLen` 无上限校验导致畸形响应头触发 OutOfMemoryError 崩溃的问题。
+8. 修复 Config 页下拉刷新在后台线程调用 `requireContext()` 导致 Fragment detach 后崩溃的问题。
+9. 修复 ClearLog 返回空 Vec 使 Logcat 无法清屏、GetProcState 受日志级别过滤导致 check 按钮无响应的问题。
+10. `set_settings_var` 改用原子写（临时文件+fsync+rename），避免断电时 settings.db 损坏。
+11. `escape_json` 按 RFC 8259 转义 U+0000..U+001F 控制字符，避免 package_name 含裸控制字符破坏 operation log JSON。
+12. 安装器暂存 APK 权限由 0666 收紧为 0600，避免任意应用在 pm install 前篡改 APK。
+
 ### v3.3.2SelfUse
 
 1. 修复 Manager 无操作保存时把展示默认项写入配置的问题。
