@@ -1,7 +1,7 @@
 {
-    "version": "3.3.1SelfUse",
-    "versionCode": 303001,
-    "zipUrl": "https://github.com/szh1118/freezeit_cos16/releases/download/v3.3.1SelfUse/freezeit_oneplus13_android16_selfuse_v3.3.1SelfUse_303001.zip",
-    "zipSha256": "f4802815f18b303982f1b500dcd09157bb6df3b555ac17591ac6c75c1512666d",
+    "version": "3.3.3SelfUse",
+    "versionCode": 303003,
+    "zipUrl": "https://github.com/szh1118/freezeit_cos16/releases/download/v3.3.3SelfUse/freezeit_oneplus13_android16_selfuse_v3.3.3SelfUse_303003.zip",
+    "zipSha256": "a3e5e4ab58ea1c83bf4396241910cd54621f3bca366267c19e2f8430b5c651a0",
     "changelog": "https://raw.githubusercontent.com/szh1118/freezeit_cos16/main/freezeitRelease/changelog.txt"
 }
