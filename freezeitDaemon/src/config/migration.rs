@@ -1,5 +1,5 @@
 use crate::app::error::DaemonError;
-use crate::domain::policy::{FallbackAction, ForegroundStrategy, FreezeMode, FreezePolicy};
+use crate::domain::policy::FreezePolicy;
 
 pub fn migrate_legacy_config() -> Result<(), DaemonError> {
     Ok(())
@@ -19,6 +19,18 @@ pub struct LegacyPolicyRecord {
     pub package_or_uid: String,
     pub mode: i32,
     pub permissive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyPolicyTarget {
+    Uid(u32),
+    PackageName(String),
+}
+
+impl LegacyPolicyRecord {
+    pub fn target(&self) -> Option<LegacyPolicyTarget> {
+        parse_legacy_policy_target(&self.package_or_uid)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +56,27 @@ pub fn parse_legacy_policy_line(line: &str) -> Option<LegacyPolicyRecord> {
     })
 }
 
+pub fn parse_legacy_policy_target(token: &str) -> Option<LegacyPolicyTarget> {
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    if let Ok(uid) = token.parse::<u32>() {
+        return Some(LegacyPolicyTarget::Uid(uid));
+    }
+
+    let Some((legacy_uid, encoded_uid)) = token.split_once("uid") else {
+        return Some(LegacyPolicyTarget::PackageName(token.to_owned()));
+    };
+    if !legacy_uid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Some(LegacyPolicyTarget::PackageName(token.to_owned()));
+    }
+
+    let legacy_uid = legacy_uid.parse::<u32>().ok()?;
+    let encoded_uid = encoded_uid.parse::<u32>().ok()?;
+    (legacy_uid == encoded_uid).then_some(LegacyPolicyTarget::Uid(legacy_uid))
+}
+
 pub fn parse_legacy_label_line(line: &str) -> Option<LegacyLabelRecord> {
     let line = normalize_legacy_line(line)?;
     let (package_name, label) = line.split_once("####")?;
@@ -67,6 +100,7 @@ pub fn migrate_legacy_files(
     let policies = app_config
         .lines()
         .filter_map(parse_legacy_policy_line)
+        .filter(|record| record.target().is_some())
         .map(|record| {
             let policy = migrate_legacy_policy(&record);
             (record, policy)
@@ -85,24 +119,46 @@ pub fn migrate_legacy_files(
 }
 
 pub fn migrate_legacy_policy(record: &LegacyPolicyRecord) -> FreezePolicy {
-    let mode = match record.mode {
-        10 => FreezeMode::Terminate,
-        20 | 21 | 30 | 31 => FreezeMode::Freeze,
-        40 | 50 => FreezeMode::Protected,
-        _ => FreezeMode::Free,
-    };
+    FreezePolicy::from_legacy_mode(record.mode, record.permissive)
+}
 
-    FreezePolicy::Selected {
-        mode,
-        delay_ms: 0,
-        foreground_strategy: if record.permissive {
-            ForegroundStrategy::Permissive
-        } else {
-            ForegroundStrategy::Strict
-        },
-        allow_network_restriction: matches!(record.mode, 21 | 31),
-        allow_wakelock_restriction: false,
-        fallback_strategy: vec![FallbackAction::Postpone, FallbackAction::Skip],
-        updated_at_ms: 0,
+#[cfg(test)]
+mod tests {
+    use super::{
+        migrate_legacy_files, migrate_legacy_policy, parse_legacy_policy_line,
+        parse_legacy_policy_target, LegacyPolicyTarget,
+    };
+    use crate::domain::policy::FreezePolicy;
+
+    #[test]
+    fn legacy_uid_parser_only_accepts_canonical_uid_tokens() {
+        assert_eq!(
+            parse_legacy_policy_target("10123uid10123"),
+            Some(LegacyPolicyTarget::Uid(10_123))
+        );
+        assert_eq!(
+            parse_legacy_policy_target("com.example.uid12345"),
+            Some(LegacyPolicyTarget::PackageName(
+                "com.example.uid12345".to_owned()
+            ))
+        );
+        assert_eq!(parse_legacy_policy_target("10123uid99999"), None);
+    }
+
+    #[test]
+    fn migration_uses_the_shared_legacy_mode_conversion() {
+        let record = parse_legacy_policy_line("com.example.app 21 1").expect("legacy policy");
+
+        assert_eq!(
+            migrate_legacy_policy(&record),
+            FreezePolicy::from_legacy_mode(21, true)
+        );
+    }
+
+    #[test]
+    fn migration_omits_invalid_canonical_uid_targets() {
+        let migrated = migrate_legacy_files("10123uid99999 30 1\n", "", &[]);
+
+        assert!(migrated.policies.is_empty());
     }
 }

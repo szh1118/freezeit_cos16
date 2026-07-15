@@ -41,7 +41,9 @@ public class AlarmHook {
             while (iterator.hasNext()) {
                 final var Alarm = iterator.next(); //迭代器后移，再返回新位置的元素
                 final int uid = config.getAlarmUid(Alarm);
-                if (!config.managedApp.contains(uid))
+                // Until foreground and pending-freeze snapshots are both known, preserve the
+                // alarm. A managed UID alone does not prove that its process is frozen.
+                if (!FreezeitService.shouldSuppressBackgroundWork(config, uid))
                     continue;
 
                 iterator.remove();

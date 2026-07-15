@@ -1,9 +1,11 @@
 package io.github.jark006.freezeit.activity;
 
+import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
 import android.view.View;
+import android.widget.Toast;
 
 import androidx.appcompat.app.AppCompatActivity;
 
@@ -42,47 +44,54 @@ public class About extends AppCompatActivity implements View.OnClickListener {
         findViewById(R.id.container).setBackground(StaticData.getBackgroundDrawable(this));
     }
 
+    private boolean tryStartActivity(Intent intent) {
+        try {
+            if (intent.resolveActivity(getPackageManager()) == null)
+                return false;
+            startActivity(intent);
+            return true;
+        } catch (ActivityNotFoundException | SecurityException e) {
+            return false;
+        }
+    }
+
+    private void openLink(int linkResId) {
+        Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(getString(linkResId)));
+        if (!tryStartActivity(intent))
+            Toast.makeText(this, R.string.update_fail, Toast.LENGTH_LONG).show();
+    }
+
     @Override
     public void onClick(View v) {
         int id = v.getId();
         if (id == R.id.coolapk_link) {
-            try {
-                Intent intent = new Intent();
-                intent.setClassName("com.coolapk.market", "com.coolapk.market.view.AppLinkActivity");
-                intent.setAction("android.intent.action.VIEW");
-                intent.setData(Uri.parse("coolmarket://u/1212220"));
-                startActivity(intent);
-            } catch (Exception e) {
-                startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(getString(R.string.coolapk_link))));
-            }
+            Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse("coolmarket://u/1212220"));
+            intent.setClassName("com.coolapk.market", "com.coolapk.market.view.AppLinkActivity");
+            if (!tryStartActivity(intent))
+                openLink(R.string.coolapk_link);
         } else if (id == R.id.github_link) {
-            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(getString(R.string.github_link))));
+            openLink(R.string.github_link);
         } else if (id == R.id.github_app_link) {
-            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(getString(R.string.github_app_link))));
+            openLink(R.string.github_app_link);
         } else if (id == R.id.github_project_link) {
-            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(getString(R.string.github_project_link))));
+            openLink(R.string.github_project_link);
         } else if (id == R.id.lanzou_link) {
-            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(getString(R.string.lanzou_link))));
+            openLink(R.string.lanzou_link);
         } else if (id == R.id.qq_channel_link) {
-            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(getString(R.string.qq_channel_link))));
+            openLink(R.string.qq_channel_link);
         } else if (id == R.id.telegram_group) {
-            try {
-                startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(getString(R.string.tg_link))));
-            } catch (Exception e) {
-                startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(getString(R.string.tg_https_link))));
-            }
+            if (!tryStartActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(getString(R.string.tg_link)))))
+                openLink(R.string.tg_https_link);
         } else if (id == R.id.telegram_channel) {
-            try {
-                startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(getString(R.string.tg_channel_link))));
-            } catch (Exception e) {
-                startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(getString(R.string.tg_channel_https_link))));
-            }
+            if (!tryStartActivity(new Intent(Intent.ACTION_VIEW,
+                    Uri.parse(getString(R.string.tg_channel_link)))))
+                openLink(R.string.tg_channel_https_link);
         } else if (id == R.id.website_link) {
-            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(getString(R.string.website_link))));
+            openLink(R.string.website_link);
         } else if (id == R.id.tutorial_link) {
-            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(getString(R.string.tutorial_link))));
+            openLink(R.string.tutorial_link);
         } else if (id == R.id.changelog_text) {
-            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(getString(R.string.online_changelog_link))));
+            openLink(R.string.online_changelog_link);
         } else if (id == R.id.privacy_text) {
             Utils.textDialog(this, R.string.privacy_title, R.string.privacy_content);
         } else if (id == R.id.wechat_pay) {

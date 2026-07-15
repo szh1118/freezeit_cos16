@@ -201,11 +201,8 @@ fn legacy_context_suffix(operation: &ControlOperation, pids: &str) -> String {
     if !operation.reason.trim().is_empty() {
         parts.push(format!("原因:{}", sanitize_legacy_field(&operation.reason)));
     }
-    if should_show_details(&operation.details) {
-        parts.push(format!(
-            "详情:{}",
-            sanitize_legacy_field(&operation.details)
-        ));
+    if let Some(details) = meaningful_details(&operation.details) {
+        parts.push(format!("详情:{}", sanitize_legacy_field(details)));
     }
     format!(" {}", parts.join(" "))
 }
@@ -236,11 +233,22 @@ fn legacy_result_text(result: OperationResult) -> &'static str {
     }
 }
 
-fn should_show_details(details: &str) -> bool {
-    if details.trim().is_empty() {
-        return false;
+fn meaningful_details(details: &str) -> Option<&str> {
+    let details = details.trim();
+    if details.is_empty() {
+        return None;
     }
-    !details.trim().starts_with("process_count=")
+
+    let details = if let Some(remainder) = details.strip_prefix("process_count=") {
+        match remainder.find(char::is_whitespace) {
+            Some(separator) => remainder[separator..].trim_start(),
+            None => "",
+        }
+    } else {
+        details
+    };
+
+    (!details.is_empty()).then_some(details)
 }
 
 fn is_binder_blocker(operation: &ControlOperation) -> bool {
@@ -294,10 +302,35 @@ fn escape_json(value: &str) -> String {
             '\t' => "\\t".chars().collect(),
             // RFC 8259 要求 U+0000..U+001F 用 \uXXXX 转义，否则裸控制字符（NUL、ESC
             // 等）会让 manager 端 JSON parser 拒绝整条 operation log，丢失全部历史。
-            c if (c as u32) < 0x20 => {
-                format!("\\u{:04x}", c as u32).chars().collect::<Vec<_>>()
-            }
+            c if (c as u32) < 0x20 => format!("\\u{:04x}", c as u32).chars().collect::<Vec<_>>(),
             other => vec![other],
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_text_keeps_evidence_after_process_count_prefix() {
+        let operation = ControlOperation {
+            operation_id: 7,
+            timestamp_ms: 1_000,
+            package_name: "com.example.partial".to_owned(),
+            uid: 10_123,
+            pid_list: vec![123, 124],
+            action: ControlAction::Freeze,
+            backend: "signal".to_owned(),
+            reason: "rollback required".to_owned(),
+            result: OperationResult::Partial,
+            details: "process_count=2 signaled=2 rolled_back=1 rollback_failures=1 binder=busy"
+                .to_owned(),
+        };
+
+        let rendered = operation_to_debug_text(&operation);
+
+        assert!(rendered.contains("详情:signaled=2 rolled_back=1 rollback_failures=1 binder=busy"));
+        assert!(!rendered.contains("详情:process_count="));
+    }
 }

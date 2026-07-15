@@ -8,6 +8,7 @@ import android.os.Looper;
 import android.os.Message;
 import android.text.Layout;
 import android.text.method.ScrollingMovementMethod;
+import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.Menu;
 import android.view.MenuInflater;
@@ -20,8 +21,13 @@ import androidx.annotation.NonNull;
 import androidx.core.view.MenuProvider;
 import androidx.fragment.app.Fragment;
 
+import java.util.Arrays;
 import java.util.Timer;
 import java.util.TimerTask;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import io.github.jark006.freezeit.AppInfoCache;
 import io.github.jark006.freezeit.ManagerCmd;
@@ -30,13 +36,19 @@ import io.github.jark006.freezeit.Utils;
 import io.github.jark006.freezeit.databinding.FragmentLogcatBinding;
 
 public class Logcat extends Fragment {
+    private static final String TAG = "Freezeit[Logcat]";
+
     private FragmentLogcatBinding binding;
     final int NEW_LOG_CONTENT = 1,
             UPDATE_LABEL_SUCCESS = 2,
-            UPDATE_LABEL_FAIL = 3;
+            UPDATE_LABEL_FAIL = 3,
+            LOG_REQUEST_FAILED = 4;
 
     Timer timer;
-    int lastLogLen = 0;
+    private byte[] lastLogPayload;
+    private int logGeneration;
+    private final ExecutorService logExecutor = Executors.newSingleThreadExecutor();
+    private final AtomicBoolean pollingRequestQueued = new AtomicBoolean();
     long lastTimestamp = 0;
     boolean isGetWorkLog = true;
     AlertDialog clearDialog;
@@ -67,7 +79,6 @@ public class Logcat extends Fragment {
                     Utils.layoutDialog(requireContext(), R.layout.help_dialog_logcat);
                 } else if (id == R.id.switch_log) {
                     isGetWorkLog = !isGetWorkLog;
-                    cancelTimer();
                     resetTimer();
                 } else if (id == R.id.update_label) {
                     Toast.makeText(requireContext(), R.string.update_start, Toast.LENGTH_SHORT).show();
@@ -94,7 +105,7 @@ public class Logcat extends Fragment {
             lastTimestamp = now;
 
             isGetWorkLog = true;
-            new Thread(() -> logTask(ManagerCmd.printFreezerProc)).start();
+            runManualLogTask(ManagerCmd.printFreezerProc);
         });
 
         binding.fabClear.setOnClickListener(view -> {
@@ -111,7 +122,7 @@ public class Logcat extends Fragment {
                     .setNegativeButton(android.R.string.cancel, null)
                     .setPositiveButton(R.string.clear_log_text, (dialog, which) -> {
                         isGetWorkLog = true;
-                        new Thread(() -> logTask(ManagerCmd.clearLog)).start();
+                        runManualLogTask(ManagerCmd.clearLog);
                     })
                     .create();
             clearDialog.setOnDismissListener(dialog -> clearDialog = null);
@@ -123,6 +134,7 @@ public class Logcat extends Fragment {
 
     @Override
     public void onDestroyView() {
+        invalidateLogRequests();
         cancelTimer();
         handler.removeCallbacksAndMessages(null);
         if (clearDialog != null) {
@@ -136,6 +148,7 @@ public class Logcat extends Fragment {
     @Override
     public void onPause() {
         super.onPause();
+        invalidateLogRequests();
         cancelTimer();
     }
 
@@ -143,6 +156,12 @@ public class Logcat extends Fragment {
     public void onResume() {
         super.onResume();
         resetTimer();
+    }
+
+    @Override
+    public void onDestroy() {
+        logExecutor.shutdownNow();
+        super.onDestroy();
     }
 
     void cancelTimer() {
@@ -154,24 +173,54 @@ public class Logcat extends Fragment {
 
     void resetTimer() {
         cancelTimer();
-        lastLogLen = 0;
-        timer = new Timer();
-        timer.schedule(new TimerTask() {
+        lastLogPayload = null;
+        final int generation = invalidateLogRequests();
+        final byte command = isGetWorkLog ? ManagerCmd.getLog : ManagerCmd.getXpLog;
+        Timer pollTimer = new Timer();
+        timer = pollTimer;
+        pollTimer.schedule(new TimerTask() {
             @Override
             public void run() {
-                logTask(isGetWorkLog ? ManagerCmd.getLog : ManagerCmd.getXpLog);
+                enqueueLogTask(command, generation, false);
             }
         }, 0, 5000);
     }
 
-    void logTask(byte cmd) {
-        Utils.TaskResult result = Utils.freezeitTaskResult(cmd, null);
-        // 区分「长度未变」（跳过）与「长度归零」（清屏）。原先 0 字节一律跳过，
-        // 导致 ClearLog 返回空 / 日志过滤后无可见记录时 UI 卡在旧内容。
-        if (result.length() == lastLogLen)
+    void runManualLogTask(byte command) {
+        cancelTimer();
+        int generation = invalidateLogRequests();
+        enqueueLogTask(command, generation, true);
+    }
+
+    private int invalidateLogRequests() {
+        return ++logGeneration;
+    }
+
+    private void enqueueLogTask(byte command, int generation, boolean restartTimer) {
+        boolean isPollingRequest = !restartTimer;
+        if (isPollingRequest && !pollingRequestQueued.compareAndSet(false, true))
             return;
-        lastLogLen = result.length();
-        handler.sendMessage(Message.obtain(handler, NEW_LOG_CONTENT, result.payload()));
+
+        try {
+            logExecutor.execute(() -> {
+                try {
+                    Utils.TaskResult result = Utils.freezeitTaskResult(command, null);
+                    LogResponse response = new LogResponse(command, restartTimer, result.payload());
+                    // 用 success() 区分「合法空 payload（如 ClearLog 成功后日志为空，应清屏）」
+                    // 与「RPC 失败（应保留旧日志并提示）」，避免把清屏误报为失败或失败时清空旧日志。
+                    handler.sendMessage(Message.obtain(handler,
+                            result.success() ? NEW_LOG_CONTENT : LOG_REQUEST_FAILED,
+                            generation, 0, response));
+                } finally {
+                    if (isPollingRequest)
+                        pollingRequestQueued.set(false);
+                }
+            });
+        } catch (RejectedExecutionException exception) {
+            if (isPollingRequest)
+                pollingRequestQueued.set(false);
+            Log.w(TAG, "Log request ignored after executor shutdown", exception);
+        }
     }
 
     void scrollLogToBottom() {
@@ -197,8 +246,32 @@ public class Logcat extends Fragment {
 
             switch (msg.what) {
                 case NEW_LOG_CONTENT:
-                    binding.logView.setText(new String((byte[]) msg.obj));
-                    binding.logView.post(Logcat.this::scrollLogToBottom);
+                    if (msg.arg1 != logGeneration)
+                        return;
+
+                    LogResponse response = (LogResponse) msg.obj;
+                    if (response.command == ManagerCmd.clearLog) {
+                        lastLogPayload = new byte[0];
+                        binding.logView.setText("");
+                    } else if (!Arrays.equals(lastLogPayload, response.payload)) {
+                        lastLogPayload = response.payload;
+                        binding.logView.setText(new String(response.payload));
+                        binding.logView.post(Logcat.this::scrollLogToBottom);
+                    }
+                    if (response.restartTimer)
+                        resetTimer();
+                    break;
+
+                case LOG_REQUEST_FAILED:
+                    if (msg.arg1 != logGeneration)
+                        return;
+
+                    LogResponse failedResponse = (LogResponse) msg.obj;
+                    if (failedResponse.restartTimer) {
+                        Toast.makeText(requireContext(), R.string.get_log_fail_tips,
+                                Toast.LENGTH_SHORT).show();
+                        resetTimer();
+                    }
                     break;
 
                 case UPDATE_LABEL_SUCCESS:
@@ -211,4 +284,20 @@ public class Logcat extends Fragment {
             }
         }
     };
+
+    private static final class LogResponse {
+        private final byte command;
+        private final boolean restartTimer;
+        private final byte[] payload;
+
+        private LogResponse(byte command, boolean restartTimer, byte[] payload) {
+            this.command = command;
+            this.restartTimer = restartTimer;
+            this.payload = payload;
+        }
+
+        private byte[] payload() {
+            return payload;
+        }
+    }
 }

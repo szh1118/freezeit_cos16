@@ -11,12 +11,53 @@ fi
 
 [ "$ARCH" = "arm64" ] || abort "- 🚫 安装失败：Rust daemon 仅支持 ARM64，当前架构: $ARCH"
 
+require_checksum_entry() {
+    required_file=$1
+    checksum_counts=$(awk -v target="$required_file" '
+        function is_sha256(value) {
+            return length(value) == 64 && value ~ /^[0-9a-fA-F]+$/
+        }
+        function names_target_noncanon(line, record, candidate, base) {
+            record = line
+            if (substr(record, 1, 1) == "\\") {
+                record = substr(record, 2)
+            }
+            sub(/[[:space:]]+$/, "", record)
+            candidate = record
+            sub(/^.*[[:space:]]+/, "", candidate)
+            if (substr(candidate, 1, 1) == "*") {
+                candidate = substr(candidate, 2)
+            }
+            base = candidate
+            sub(/^.*\//, "", base)
+            return candidate == target || base == target
+        }
+        {
+            hash = substr($0, 1, 64)
+            marker = substr($0, 65, 2)
+            filename = substr($0, 67)
+            if (length($0) == 66 + length(target) && is_sha256(hash) &&
+                    (marker == "  " || marker == " *") && filename == target) {
+                exact_count++
+            } else if (names_target_noncanon($0)) {
+                noncanonical_count++
+            }
+        }
+        END { printf "%d:%d\n", exact_count + 0, noncanonical_count + 0 }
+    ' "$MODPATH/SHA256SUMS")
+
+    [ "$checksum_counts" = "1:0" ] || abort "- 🚫 安装包 SHA256SUMS 必须且只能包含 $required_file 的一条规范有效摘要"
+}
+
 for forbidden_daemon in freezeitARM64 freezeitX64 freezeitRustARM64 freezeitRustX64; do
     [ ! -e "$MODPATH/$forbidden_daemon" ] || abort "- 🚫 安装包包含已禁止的 daemon: $forbidden_daemon"
 done
 
 [ -f "$MODPATH/freezeit" ] || abort "- 🚫 安装包缺少唯一 Rust daemon: freezeit"
+[ -f "$MODPATH/freezeit.apk" ] || abort "- 🚫 安装包缺少唯一 APK: freezeit.apk"
 [ -f "$MODPATH/SHA256SUMS" ] || abort "- 🚫 安装包缺少 SHA256SUMS"
+require_checksum_entry freezeit
+require_checksum_entry freezeit.apk
 (cd "$MODPATH" && sha256sum -c SHA256SUMS) || abort "- 🚫 安装包 SHA256 校验失败"
 
 chmod a+x "$MODPATH"/freezeit

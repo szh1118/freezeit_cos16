@@ -87,10 +87,9 @@ public class BroadCastHook {
             // BroadcastFilter https://cs.android.com/android/platform/superproject/main/+/main:frameworks/base/services/core/java/com/android/server/am/BroadcastFilter.java
             final int uid = config.getBroadcastFilterOwningUid(param.args[1]);// BroadcastFilter
 
-            // 不在管理范围，或顶层前台 则不清理广播
-            if (!config.managedApp.contains(uid) ||
-                    config.foregroundUid.contains(uid) ||
-                    config.pendingUid.contains(uid))
+            // A configuration entry alone is not proof of a frozen process. Fail open until
+            // daemon foreground/pending snapshots are current.
+            if (!FreezeitService.shouldSuppressBackgroundWork(config, uid))
                 return;
 
             // https://cs.android.com/android/platform/superproject/main/+/main:frameworks/base/services/core/java/com/android/server/am/BroadcastQueue.java;l=946
@@ -123,10 +122,7 @@ public class BroadCastHook {
         public void beforeHookedMethod(MethodHookParam param) {
             final int uid = config.getProcessRecordUid(param.args[1]);// processRecord
 
-            // 不在管理范围，或顶层前台 则不清理广播
-            if (!config.managedApp.contains(uid) ||
-                    config.foregroundUid.contains(uid) ||
-                    config.pendingUid.contains(uid))
+            if (!FreezeitService.shouldSuppressBackgroundWork(config, uid))
                 return;
 
             try {

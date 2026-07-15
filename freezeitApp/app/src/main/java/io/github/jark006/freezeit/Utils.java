@@ -1,16 +1,12 @@
 package io.github.jark006.freezeit;
 
-import android.annotation.SuppressLint;
 import android.app.AlertDialog;
 import android.app.Dialog;
 import android.content.ContentResolver;
 import android.content.Context;
-import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.Matrix;
 import android.net.Uri;
-import android.os.FileUtils;
-import android.provider.OpenableColumns;
 import android.util.Log;
 import android.widget.ImageView;
 
@@ -27,8 +23,9 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.net.URL;
-import java.util.Objects;
+import java.net.URLConnection;
 import java.util.Set;
 
 public class Utils {
@@ -50,12 +47,22 @@ public class Utils {
     );
 
     private static final String TAG = "Freezeit[Utils]";
+    private static final int MAX_FRAME_PAYLOAD_BYTES = 1024 * 1024;
+    private static final int SOCKET_CONNECT_TIMEOUT_MS = 3_000;
+    private static final int SOCKET_TOTAL_DEADLINE_MS = 5_000;
+    private static final int NETWORK_TIMEOUT_MS = 5_000;
 
     public static final class TaskResult {
         private final byte[] payload;
+        private final boolean success;
 
         private TaskResult(byte[] payload) {
+            this(payload, false);
+        }
+
+        private TaskResult(byte[] payload, boolean success) {
             this.payload = payload;
+            this.success = success;
         }
 
         public int length() {
@@ -65,25 +72,35 @@ public class Utils {
         public byte[] payload() {
             return payload;
         }
+
+        // 区分「守护进程返回了合法的空 payload」（例如 ClearLog 成功后日志为空，应清屏）
+        // 与「RPC 失败」（连接超时/校验错误，应保留旧内容并提示）。两者 length() 都是 0，
+        // 必须用 success 区分，否则清屏操作会被误报为失败、或失败时把旧日志清空。
+        public boolean success() {
+            return success;
+        }
     }
 
-    public static synchronized TaskResult freezeitTaskResult(byte command, byte[] AdditionalData) {
+    public static TaskResult freezeitTaskResult(byte command, byte[] AdditionalData) {
         // dataHeader[0-3]:附带数据大小(uint32 小端)
         // dataHeader[4]: 命令(可参考上面)
         // dataHeader[5]: 附带数据的异或校验值
+        if (AdditionalData != null && AdditionalData.length > MAX_FRAME_PAYLOAD_BYTES) {
+            Log.e(TAG, "Request payload is too large: " + AdditionalData.length);
+            return new TaskResult(new byte[0]);
+        }
+
         byte[] dataHeader = {0, 0, 0, 0, command, 0};
-        try (var socket = new Socket()) {
-            socket.connect(new InetSocketAddress("127.0.0.1", 60613), 3000);
+        long deadlineNanos = System.nanoTime() + SOCKET_TOTAL_DEADLINE_MS * 1_000_000L;
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress("127.0.0.1", 60613),
+                    Math.min(SOCKET_CONNECT_TIMEOUT_MS, remainingTimeoutMillis(deadlineNanos)));
             InputStream is = socket.getInputStream();
             OutputStream os = socket.getOutputStream();
 
             if (AdditionalData != null && AdditionalData.length > 0) {
-                byte XOR = 0;
-                for (byte b : AdditionalData)
-                    XOR ^= b;
-
                 Int2Byte(AdditionalData.length, dataHeader, 0);
-                dataHeader[5] = XOR;
+                dataHeader[5] = checksum(AdditionalData);
 
                 os.write(dataHeader);
                 os.write(AdditionalData);
@@ -93,8 +110,13 @@ public class Utils {
 
             os.flush();
 
-            if (!readFully(is, dataHeader, 0, 6)) {
+            if (!readFully(socket, is, dataHeader, 0, 6, deadlineNanos)) {
                 Log.e(TAG, "Receive dataHeader Fail");
+                return new TaskResult(new byte[0]);
+            }
+
+            if (dataHeader[4] != command) {
+                Log.e(TAG, "Unexpected response command: " + Byte.toUnsignedInt(dataHeader[4]));
                 return new TaskResult(new byte[0]);
             }
 
@@ -102,54 +124,91 @@ public class Utils {
             // 必须设上限，否则恶意/畸形响应头 payloadLen=0x7FFFFFFF 会通过 <0 检查并
             // 触发 new byte[2147483647] 抛 OutOfMemoryError（catch 只接 IOException）。
             // 与 Rust 端 MAX_PAYLOAD_LEN (1 MiB) 对齐。
-            if (payloadLen < 0 || payloadLen > 1024 * 1024) {
+            if (payloadLen < 0 || payloadLen > MAX_FRAME_PAYLOAD_BYTES) {
                 Log.e(TAG, "Invalid payloadLen:" + payloadLen);
                 return new TaskResult(new byte[0]);
             }
             byte[] response = new byte[payloadLen];
-            if (!readFully(is, response, 0, payloadLen)) {
+            if (!readFully(socket, is, response, 0, payloadLen, deadlineNanos)) {
                 Log.e(TAG, "Get payload Fail");
                 return new TaskResult(new byte[0]);
             }
+            if (dataHeader[5] != checksum(response)) {
+                Log.e(TAG, "Response checksum mismatch");
+                return new TaskResult(new byte[0]);
+            }
 
-            return new TaskResult(response);
+            return new TaskResult(response, true);
         } catch (IOException e) {
             return new TaskResult(new byte[0]);
         }
     }
 
-    private static boolean readFully(InputStream is, byte[] bytes, int offset, int length) throws IOException {
+    private static byte checksum(byte[] payload) {
+        byte checksum = 0;
+        for (byte value : payload)
+            checksum ^= value;
+        return checksum;
+    }
+
+    private static int remainingTimeoutMillis(long deadlineNanos) throws SocketTimeoutException {
+        long remainingNanos = deadlineNanos - System.nanoTime();
+        if (remainingNanos <= 0)
+            throw new SocketTimeoutException("Manager response deadline exceeded");
+
+        return (int) Math.max(1L, (remainingNanos + 999_999L) / 1_000_000L);
+    }
+
+    private static boolean readFully(Socket socket, InputStream is, byte[] bytes, int offset, int length,
+                                     long deadlineNanos) throws IOException {
         int readCnt = 0;
         while (readCnt < length) {
+            socket.setSoTimeout(remainingTimeoutMillis(deadlineNanos));
             int cnt = is.read(bytes, offset + readCnt, length - readCnt);
-            if (cnt < 0)
+            if (cnt <= 0)
                 return false;
             readCnt += cnt;
+            if (System.nanoTime() >= deadlineNanos)
+                throw new SocketTimeoutException("Manager response deadline exceeded");
         }
         return true;
     }
 
     public static byte[] getNetworkData(String link) {
+        HttpURLConnection conn = null;
         try {
             URL url = new URL(link);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(5 * 1000);
+            URLConnection connection = url.openConnection();
+            if (!(connection instanceof HttpURLConnection))
+                return null;
+
+            conn = (HttpURLConnection) connection;
+            conn.setConnectTimeout(NETWORK_TIMEOUT_MS);
+            conn.setReadTimeout(NETWORK_TIMEOUT_MS);
             conn.setRequestMethod("GET");
-            conn.connect();
-            if (conn.getResponseCode() != 200) return null;
+            if (conn.getResponseCode() != HttpURLConnection.HTTP_OK)
+                return null;
 
-            InputStream is = conn.getInputStream();
-            ByteArrayOutputStream os = new ByteArrayOutputStream();
-            int len;
-            byte[] buffer = new byte[4096];
-            while ((len = is.read(buffer)) != -1)
-                os.write(buffer, 0, len);
-
-            is.close();
-            os.close();
-            return os.toByteArray();
+            try (InputStream is = conn.getInputStream();
+                 ByteArrayOutputStream os = new ByteArrayOutputStream()) {
+                int total = 0;
+                int len;
+                byte[] buffer = new byte[4096];
+                while ((len = is.read(buffer)) != -1) {
+                    if (len > MAX_FRAME_PAYLOAD_BYTES - total) {
+                        Log.w(TAG, "Network response is too large");
+                        return null;
+                    }
+                    os.write(buffer, 0, len);
+                    total += len;
+                }
+                return os.toByteArray();
+            }
         } catch (IOException e) {
             return null;
+        } finally {
+            if (conn != null)
+                conn.disconnect();
         }
     }
 
@@ -229,32 +288,40 @@ public class Utils {
     }
 
     public static String getFileAbsolutePath(@NonNull Context context, @NonNull Uri uri) {
-
-        File file = null;
-        //android10以上转换
-        if (Objects.equals(uri.getScheme(), ContentResolver.SCHEME_FILE)) {
-            file = new File(uri.getPath());
-        } else if (uri.getScheme().equals(ContentResolver.SCHEME_CONTENT)) {
-            //把文件复制到沙盒目录
-            ContentResolver contentResolver = context.getContentResolver();
-            @SuppressLint("Recycle")
-            Cursor cursor = contentResolver.query(uri, null, null, null, null);
-            if (cursor.moveToFirst()) {
-                @SuppressLint("Range")
-                String displayName = cursor.getString(cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME));
-                try {
-                    InputStream is = contentResolver.openInputStream(uri);
-                    File cache = new File(context.getExternalCacheDir().getAbsolutePath(), Math.round((Math.random() + 1) * 1000) + displayName);
-                    FileOutputStream fos = new FileOutputStream(cache);
-                    FileUtils.copy(is, fos);
-                    file = cache;
-                    fos.close();
-                    is.close();
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
-            }
+        if (ContentResolver.SCHEME_FILE.equals(uri.getScheme())) {
+            String path = uri.getPath();
+            return path == null ? null : new File(path).getAbsolutePath();
         }
-        return file == null ? null : file.getAbsolutePath();
+        if (!ContentResolver.SCHEME_CONTENT.equals(uri.getScheme()))
+            return null;
+
+        File cache = null;
+        boolean copied = false;
+        try {
+            File cacheDirectory = context.getCacheDir();
+            if (cacheDirectory == null)
+                return null;
+
+            cache = File.createTempFile("freezeit-", ".tmp", cacheDirectory);
+            try (InputStream input = context.getContentResolver().openInputStream(uri);
+                 FileOutputStream output = new FileOutputStream(cache)) {
+                if (input == null)
+                    throw new IOException("Content provider returned no stream");
+
+                byte[] buffer = new byte[8192];
+                int length;
+                while ((length = input.read(buffer)) != -1)
+                    output.write(buffer, 0, length);
+                output.flush();
+            }
+            copied = true;
+            return cache.getAbsolutePath();
+        } catch (IOException | SecurityException e) {
+            Log.e(TAG, "Copy content URI failed", e);
+            return null;
+        } finally {
+            if (!copied && cache != null && cache.exists() && !cache.delete())
+                Log.w(TAG, "Could not delete partial content cache file");
+        }
     }
 }

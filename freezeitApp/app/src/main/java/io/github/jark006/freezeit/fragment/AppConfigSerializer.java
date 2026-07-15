@@ -29,7 +29,7 @@ final class AppConfigSerializer {
         ArrayList<Integer> outputOrder = new ArrayList<>();
         HashSet<Integer> included = new HashSet<>();
         for (int uid : persistedUidOrder) {
-            if (values.containsKey(uid) && included.add(uid)) {
+            if (changedUids.contains(uid) && values.containsKey(uid) && included.add(uid)) {
                 outputOrder.add(uid);
             }
         }
@@ -48,7 +48,7 @@ final class AppConfigSerializer {
         for (int uid : outputOrder) {
             Value value = values.get(uid);
             writeInt(uid, bytes, offset);
-            writeInt(normalizedFreezeMode(value.freezeMode), bytes, offset + 4);
+            writeInt(value.freezeMode, bytes, offset + 4);
             writeInt(value.permissive, bytes, offset + 8);
             offset += 12;
         }

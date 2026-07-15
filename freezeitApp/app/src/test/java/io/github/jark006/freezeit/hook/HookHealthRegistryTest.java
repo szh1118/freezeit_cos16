@@ -67,6 +67,20 @@ public class HookHealthRegistryTest {
     }
 
     @Test
+    public void unsupportedModernBroadcastKeepsSystemControlActive() {
+        HookHealthRegistry.recordRegistered("system#core");
+
+        FreezeitHookEntry.recordUnsupportedModernBroadcast(
+                new UnsupportedOperationException("not implemented"));
+
+        String hookHealth = HookHealthRegistry.toJson();
+        String report = ScopedHealthReport.systemServer(true, true, true, true, true, hookHealth);
+        assertTrue(hookHealth.contains("\"critical\":false"));
+        assertFalse(HookHealthRegistry.isDegraded());
+        assertTrue(report.contains("\"system_control_status\":\"active\""));
+    }
+
+    @Test
     public void successfulRetryClearsPreviousFailure() {
         String criticalHook = "athena#critical";
         HookHealthRegistry.declareHook(criticalHook, true);

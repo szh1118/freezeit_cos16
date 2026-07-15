@@ -4,6 +4,9 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
 
 import io.github.jark006.freezeit.Utils;
 
@@ -16,7 +19,8 @@ public class XpUtils {
     public final static boolean DEBUG_PENDING_UID = false;
 
     static final int maxLogLength = 16000; // 16K 非KiB
-    public static StringBuilder xpLogContent = new StringBuilder(maxLogLength); // StringBuffer?
+    // Published builders are immutable after assignment, so direct socket reads see a whole log snapshot.
+    public static volatile StringBuilder xpLogContent = new StringBuilder(maxLogLength);
 
     private static HookBackend hookBackend = new MissingHookBackend();
 
@@ -99,22 +103,25 @@ public class XpUtils {
     }
 
     public static synchronized void log(final String TAG, final String content) {
-        if (xpLogContent.length() + TAG.length() + content.length() + 20 > maxLogLength)
-            xpLogContent.setLength(0);
+        StringBuilder current = xpLogContent;
+        StringBuilder next = new StringBuilder(maxLogLength);
+        if (current.length() + TAG.length() + content.length() + 20 <= maxLogLength)
+            next.append(current);
 
         var timeStamp = System.currentTimeMillis() / 1000 + 8 * 3600; //UTC+8
         var hour = (timeStamp / 3600) % 24;
         var min = (timeStamp % 3600) / 60;
         var sec = timeStamp % 60;
 
-        if (hour < 10) xpLogContent.append('0');
-        xpLogContent.append(hour).append(':');
-        if (min < 10) xpLogContent.append('0');
-        xpLogContent.append(min).append(':');
-        if (sec < 10) xpLogContent.append('0');
-        xpLogContent.append(sec).append(' ');
+        if (hour < 10) next.append('0');
+        next.append(hour).append(':');
+        if (min < 10) next.append('0');
+        next.append(min).append(':');
+        if (sec < 10) next.append('0');
+        next.append(sec).append(' ');
 
-        xpLogContent.append(TAG).append(": ").append(content).append('\n');
+        next.append(TAG).append(": ").append(content).append('\n');
+        xpLogContent = next;
     }
 
     public static boolean hookMethod(String TAG, ClassLoader classLoader, MethodHook callback,
@@ -188,12 +195,16 @@ public class XpUtils {
     }
 
     public static Object getObjectField(final Object obj, final String fieldName) {
+        if (obj == null) {
+            log("Freezeit[getObjectField]", "获取失败 null#" + fieldName);
+            return null;
+        }
         try {
             Field field = findField(obj.getClass(), fieldName);
             if (field == null) throw new NoSuchFieldException(fieldName);
             return field.get(obj);
         } catch (Exception e) {
-            log("Freezeit[getObjectField]", "获取失败 " + obj.getClass().getName() + "#" + fieldName + ": " + e);
+            log("Freezeit[getObjectField]", "获取失败 " + getClassName(obj) + "#" + fieldName + ": " + e);
             return null;
         }
     }
@@ -211,36 +222,52 @@ public class XpUtils {
     }
 
     public static int getInt(final Object obj, final String fieldName) {
+        if (obj == null) {
+            log("Freezeit[getInt]", "获取失败 null#" + fieldName);
+            return -1;
+        }
         try {
             Field field = findField(obj.getClass(), fieldName);
             if (field == null) throw new NoSuchFieldException(fieldName);
             return field.getInt(obj);
         } catch (Exception e) {
-            log("Freezeit[getInt]", "获取失败 " + obj.getClass().getName() + "#" + fieldName + ": " + e);
+            log("Freezeit[getInt]", "获取失败 " + getClassName(obj) + "#" + fieldName + ": " + e);
             return -1;
         }
     }
 
     public static boolean getBoolean(final Object obj, final String fieldName) {
+        if (obj == null) {
+            log("Freezeit[getBoolean]", "获取失败 null#" + fieldName);
+            return false;
+        }
         try {
             Field field = findField(obj.getClass(), fieldName);
             if (field == null) throw new NoSuchFieldException(fieldName);
             return field.getBoolean(obj);
         } catch (Exception e) {
-            log("Freezeit[getBoolean]", "获取失败 " + obj.getClass().getName() + "#" + fieldName + ": " + e);
+            log("Freezeit[getBoolean]", "获取失败 " + getClassName(obj) + "#" + fieldName + ": " + e);
             return false;
         }
     }
 
     public static String getString(final Object obj, final String fieldName) {
+        if (obj == null) {
+            log("Freezeit[getString]", "获取失败 null#" + fieldName);
+            return "null";
+        }
         try {
             Field field = findField(obj.getClass(), fieldName);
             if (field == null) throw new NoSuchFieldException(fieldName);
             return (String) field.get(obj);
         } catch (Exception e) {
-            log("Freezeit[getString]", "获取失败 " + obj.getClass().getName() + "#" + fieldName + ": " + e);
+            log("Freezeit[getString]", "获取失败 " + getClassName(obj) + "#" + fieldName + ": " + e);
             return "null";
         }
+    }
+
+    private static String getClassName(Object obj) {
+        return obj == null ? "null" : obj.getClass().getName();
     }
 
     private static Field findField(Class<?> clazz, String fieldName) {
@@ -321,40 +348,52 @@ public class XpUtils {
         }
     }
 
-    // 少量元素(0-10)时，clear,add,contain 性能均优于 HashSet, TreeSet
+    // 小集合使用不可变数组快照，读侧无需竞争 hook 热路径上的锁。
     public static class VectorSet {
-        int size = 0, maxSize;
-        int[] vector;
+        private static final int[] EMPTY_VECTOR = new int[0];
+
+        int maxSize;
+        volatile int[] vector;
 
         public VectorSet(int maxSize) {
-            this.maxSize = maxSize;
-            vector = new int[maxSize];
+            this.maxSize = Math.max(0, maxSize);
+            vector = EMPTY_VECTOR;
         }
 
         public int size() {
-            return size;
+            return vector.length;
         }
 
         public boolean isEmpty() {
-            return size == 0;
+            return vector.length == 0;
         }
 
-        public void clear() {
-            size = 0;
+        public synchronized void clear() {
+            vector = EMPTY_VECTOR;
         }
 
-        public void add(final int n) {
-            for (int i = 0; i < size; i++) {
-                if (vector[i] == n) return;
+        public synchronized void add(final int n) {
+            int[] current = vector;
+            for (int uid : current) {
+                if (uid == n) return;
             }
-            if (size < maxSize)
-                vector[size++] = n;
+
+            int[] next = Arrays.copyOf(current, current.length + 1);
+            next[current.length] = n;
+            vector = next;
+            if (next.length > maxSize)
+                maxSize = next.length;
         }
 
-        public void erase(final int n) {
-            for (int i = 0; i < size; i++) {
-                if (vector[i] == n) {
-                    vector[i] = vector[--size];
+        public synchronized void erase(final int n) {
+            int[] current = vector;
+            for (int i = 0; i < current.length; i++) {
+                if (current[i] == n) {
+                    int[] next = new int[current.length - 1];
+                    System.arraycopy(current, 0, next, 0, i);
+                    if (i < next.length)
+                        next[i] = current[current.length - 1];
+                    vector = next;
                     return;
                 }
             }
@@ -363,66 +402,68 @@ public class XpUtils {
         // 顺序查找
         public boolean contains(final int n) {
             if (n < 10000) return false;
-            for (int i = 0; i < size; i++) {
-                if (vector[i] == n)
+            int[] current = vector;
+            for (int uid : current) {
+                if (uid == n)
                     return true;
             }
             return false;
         }
 
         public void toBytes(byte[] bytes, int byteOffset) {
-            if (size > 0)
-                Utils.Int2Byte(vector, 0, size, bytes, byteOffset);
+            int[] current = vector;
+            if (current.length > 0)
+                Utils.Int2Byte(current, 0, current.length, bytes, byteOffset);
         }
     }
 
-    // 造轮子：常见UID位于 10000 ~ 14000
-    // 在 APP UID 范围, 性能均优于HashSet
+    // 应用 UID 可跨用户空间，不能假设局限在一个 4K 的主用户区间。
     public static class BucketSet {
         final int uidMin = 10000;
-        final int uidMax = 14000;// 默认最多4千个应用
-        int size = 0;
-        boolean[] bucket = new boolean[uidMax - uidMin];
+        private volatile Set<Integer> values;
 
         public BucketSet() {
-            clear();
+            values = Collections.emptySet();
         }
 
         public int size() {
-            return size;
+            return values.size();
         }
 
         public boolean isEmpty() {
-            return size == 0;
+            return values.isEmpty();
         }
 
-        public void clear() {
-            size = 0;
-            Arrays.fill(bucket, false);
+        public synchronized void clear() {
+            values = Collections.emptySet();
         }
 
-        public void add(final int n) {
-            if (n < uidMin || uidMax <= n)
+        public synchronized void add(final int n) {
+            if (n < uidMin)
                 return;
-            if (!bucket[n - uidMin]) {
-                bucket[n - uidMin] = true;
-                size++;
-            }
+
+            Set<Integer> current = values;
+            if (current.contains(n)) return;
+
+            Set<Integer> next = new HashSet<>(current);
+            next.add(n);
+            values = Collections.unmodifiableSet(next);
         }
 
-        public void erase(final int n) {
-            if (n < uidMin || uidMax <= n)
+        public synchronized void erase(final int n) {
+            if (n < uidMin)
                 return;
-            if (bucket[n - uidMin]) {
-                bucket[n - uidMin] = false;
-                size--;
-            }
+
+            Set<Integer> current = values;
+            if (!current.contains(n)) return;
+
+            Set<Integer> next = new HashSet<>(current);
+            next.remove(n);
+            values = next.isEmpty() ? Collections.emptySet() : Collections.unmodifiableSet(next);
         }
 
         public boolean contains(final int n) {
-            if (n < uidMin || uidMax <= n)
-                return false;
-            return bucket[n - uidMin];
+            return n >= uidMin && values.contains(n);
         }
     }
 }

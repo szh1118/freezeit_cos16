@@ -1,3 +1,14 @@
+### v3.3.4SelfUse
+
+- 修复 Binder 调试节点不可读时 `binder_queue unknown` 被误判为活动事务，所有候选应用永久停在等待冻结状态的问题；只有明确的 active/busy Binder 证据才延迟冻结。
+- 修复 Binder freezer 降级后的 SIGSTOP 回退操作被错误记录为 `cgroup.freeze`；日志现在报告实际执行的 `signal.stop` 后端。
+- 强化控制循环的冻结/解冻状态回收、重启恢复、前台保护、共享 UID 与系统 UID 防护，避免应用状态长期失真或错误控制。
+- 加固 manager socket、Xposed bridge 与配置同步的长度限制、时限、会话一致性和失败降级路径。
+- 修复 hook 侧前台、待冻结、WakeLock、Alarm、ANR、广播与 Athena 处理中的状态边界问题。
+- Android 16 上未实现的 `BroadcastQueueModernImpl` 广播抑制按可选能力降级，不再关闭核心冻结/解冻控制；该广播拦截优化暂不可用。
+- 修复管理器配置、缓存、网络、内容 URI 和页面并发更新中的资源泄漏、错误响应与 UI 回归。
+- 发布链增加 APK 证书、构建会话、来源证明与 ZIP 校验覆盖；正式包只包含受控构建的 ARM64 Rust daemon 与管理器 APK。
+
 ### v3.3.3SelfUse
 
 - 修复 manager socket 校验长度前按声明值分配内存且无读取超时；畸形长度不再触发 4GB 分配或阻塞控制循环。

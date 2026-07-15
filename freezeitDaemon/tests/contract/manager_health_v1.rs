@@ -926,9 +926,9 @@ fn logcat_switches_between_work_log_and_xposed_log_not_json_diagnostics() {
     let reset_timer_start = logcat
         .find("void resetTimer()")
         .expect("resetTimer method exists");
-    let reset_timer_body = &logcat[reset_timer_start..reset_timer_start + 260];
+    let reset_timer_body = &logcat[reset_timer_start..reset_timer_start + 320];
     assert!(
-        reset_timer_body.contains("lastLogLen = 0;"),
+        reset_timer_body.contains("lastLogPayload = null;"),
         "switching log sources must force refresh even when payload byte lengths match"
     );
 }
@@ -1182,7 +1182,7 @@ fn failed_log_level_write_restores_persisted_selection() {
         .nth(1)
         .expect("failure handler exists");
 
-    assert!(failure_handler.contains("msg.arg1 == debugIdx"));
+    assert!(failure_handler.contains("failure.index == debugIdx"));
     assert!(failure_handler.contains("logLevelSpinner.setSelection"));
     assert!(failure_handler.contains("LogLevelCodec.toSpinnerPosition"));
 }
@@ -1194,9 +1194,8 @@ fn settings_write_completion_keeps_its_own_index_and_value() {
     );
 
     assert!(settings.contains("void setVarTask(int index, int value)"));
-    assert!(settings.contains("msg.arg1 = index"));
-    assert!(settings.contains("msg.arg2 = value"));
-    assert!(settings.contains("settingsVar[msg.arg1] = (byte) msg.arg2"));
+    assert!(settings.contains("SetVarResult(index, value, operation"));
+    assert!(settings.contains("settingsVar[success.index] = (byte) success.value"));
     assert!(!settings.contains("varIndexForHandle"));
     assert!(!settings.contains("newValueForHandle"));
 }

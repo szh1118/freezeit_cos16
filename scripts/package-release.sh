@@ -6,9 +6,13 @@ TEMPLATE_DIR="$ROOT/magisk"
 OUT_DIR="${OUT_DIR:-$ROOT/freezeitRelease}"
 DAEMON="${DAEMON:-$ROOT/freezeitDaemon/target/aarch64-linux-android/release/freezeit}"
 APK="${APK:-}"
-EXPECTED_VERSION="${EXPECTED_VERSION:-3.3.2SelfUse}"
-EXPECTED_VERSION_CODE="${EXPECTED_VERSION_CODE:-303002}"
+module_prop() {
+  awk -F= -v key="$1" '$1 == key {print substr($0, index($0, "=") + 1); exit}' "$TEMPLATE_DIR/module.prop"
+}
+EXPECTED_VERSION="${EXPECTED_VERSION:-$(module_prop version)}"
+EXPECTED_VERSION_CODE="${EXPECTED_VERSION_CODE:-$(module_prop versionCode)}"
 SOURCE_REPOSITORY_URL="${SOURCE_REPOSITORY_URL:-https://github.com/szh1118/freezeit_cos16}"
+SOURCE_REPOSITORY_URL="${SOURCE_REPOSITORY_URL%/}"
 RELEASE_KIND="${RELEASE_KIND:-released}"
 ALLOW_DIRTY="${ALLOW_DIRTY:-0}"
 BUILD_SESSION_ROOT="${BUILD_SESSION_ROOT:-$ROOT/.release-staging}"
@@ -31,6 +35,79 @@ unique_prop() {
 }
 normalize_sha256() {
   printf '%s' "$1" | tr -d '[:space:]:' | tr '[:upper:]' '[:lower:]'
+}
+validate_android_aarch64_executable() {
+  local binary="$1"
+  local header
+  local program_headers
+  local entry_point
+  local elf_type
+  local interpreter_segments
+  local dynamic_segments
+  local entry_point_value
+  local load_address
+  local load_size
+  local executable_entry=false
+  local interpreters=()
+  header="$(readelf -h "$binary")" || fail "daemon is not an ELF: $binary"
+  printf '%s\n' "$header" | grep -Eq 'Class:[[:space:]]+ELF64' \
+    || fail "daemon is not a 64-bit ELF: $binary"
+  printf '%s\n' "$header" | grep -Eq 'Data:[[:space:]]+2.s complement, little endian' \
+    || fail "daemon is not a little-endian ELF: $binary"
+  elf_type="$(awk '/^[[:space:]]*Type:/ {print $2; exit}' <<<"$header")"
+  [[ "$elf_type" == DYN || "$elf_type" == EXEC ]] || fail "daemon is not an executable ELF: $binary"
+  printf '%s\n' "$header" | grep -Eq 'Machine:[[:space:]]+AArch64' \
+    || fail "daemon is not an AArch64 ELF: $binary"
+  entry_point="$(awk '/Entry point address:/ {print $4}' <<<"$header")"
+  [[ "$entry_point" =~ ^0x[0-9A-Fa-f]+$ && ! "$entry_point" =~ ^0x0+$ ]] \
+    || fail "daemon has no executable entry point: $binary"
+  program_headers="$(readelf -W -l "$binary")" || fail "cannot inspect daemon program headers: $binary"
+  entry_point_value=$((16#${entry_point#0x}))
+  while IFS=' ' read -r load_address load_size; do
+    [[ "$load_address" =~ ^0x[0-9A-Fa-f]+$ && "$load_size" =~ ^0x[0-9A-Fa-f]+$ ]] || continue
+    if (( load_size > 0 && entry_point_value >= load_address && entry_point_value - load_address < load_size )); then
+      executable_entry=true
+      break
+    fi
+  done < <(
+    awk '$1 == "LOAD" && ($7 ~ /E/ || $8 ~ /E/) {print $3, $6}' <<<"$program_headers"
+  )
+  [[ "$executable_entry" == true ]] || fail "daemon has no executable PT_LOAD segment: $binary"
+  interpreter_segments="$(awk '$1 == "INTERP" {count++} END {print count + 0}' <<<"$program_headers")"
+  dynamic_segments="$(awk '$1 == "DYNAMIC" {count++} END {print count + 0}' <<<"$program_headers")"
+  mapfile -t interpreters < <(
+    printf '%s\n' "$program_headers" \
+      | sed -nE 's/^[[:space:]]*\[Requesting program interpreter: ([^][]+)\][[:space:]]*$/\1/p'
+  )
+  if [[ "$elf_type" == DYN ]]; then
+    [[ "$interpreter_segments" -eq 1 && ${#interpreters[@]} -eq 1 ]] \
+      || fail "daemon must have exactly one Android PT_INTERP: $binary"
+    [[ "${interpreters[0]}" == /system/bin/linker64 ]] \
+      || fail "daemon is not linked for the Android AArch64 dynamic linker: $binary"
+    [[ "$dynamic_segments" -eq 1 ]] || fail "dynamic daemon must have exactly one PT_DYNAMIC: $binary"
+  else
+    [[ "$interpreter_segments" -eq 0 && ${#interpreters[@]} -eq 0 ]] \
+      || fail "static daemon must not have PT_INTERP: $binary"
+    [[ "$dynamic_segments" -eq 0 ]] || fail "static daemon must not have PT_DYNAMIC: $binary"
+  fi
+  return 0
+}
+top_level_file_fingerprint() {
+  local directory="$1"
+  (
+    cd "$directory"
+    while IFS= read -r -d '' path; do
+      printf '%s\0' "$path"
+      stat -c '%a' -- "$path"
+      sha256sum -- "$path"
+    done < <(find . -mindepth 1 -maxdepth 1 -type f -printf '%P\0' | LC_ALL=C sort -z)
+  ) | sha256sum | awk '{print $1}'
+}
+release_input_fingerprint() {
+  {
+    printf 'template=%s\n' "$(top_level_file_fingerprint "$TEMPLATE_DIR")"
+    printf 'license=%s\n' "$(sha256sum -- "$ROOT/LICENSE" | awk '{print $1}')"
+  } | sha256sum | awk '{print $1}'
 }
 resolve_apksigner() {
   local configured="${APKSIGNER:-}"
@@ -91,6 +168,15 @@ if [[ -n "$dirty_status" ]]; then
   [[ "$RELEASE_KIND" == candidate && "$ALLOW_DIRTY" == 1 ]] \
     || fail "working tree is dirty; only RELEASE_KIND=candidate ALLOW_DIRTY=1 may package it"
 fi
+source_commit="$(git -C "$ROOT" rev-parse HEAD)"
+assert_packaging_source_unchanged() {
+  [[ "$(git -C "$ROOT" rev-parse HEAD)" == "$source_commit" ]] \
+    || fail "HEAD changed while release packaging was running"
+  [[ "$(git -C "$ROOT" status --porcelain=v1 --untracked-files=all)" == "$dirty_status" ]] \
+    || fail "working tree changed while release packaging was running"
+  [[ "$(release_input_fingerprint)" == "$input_fingerprint" ]] \
+    || fail "Magisk template or LICENSE changed while release packaging was running"
+}
 [[ "$EXPECTED_VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$ ]] || fail "invalid version value"
 [[ "$EXPECTED_VERSION_CODE" =~ ^[0-9]{1,10}$ ]] || fail "invalid versionCode value"
 [[ "$(prop version "$TEMPLATE_DIR/module.prop")" == "$EXPECTED_VERSION" ]] || fail "module version must be $EXPECTED_VERSION"
@@ -106,7 +192,7 @@ require_regular_file "$APK"
 DAEMON="$(realpath -e "$DAEMON")"
 APK="$(realpath -e "$APK")"
 
-readelf -h "$DAEMON" | grep -Eq 'Machine:[[:space:]]+AArch64' || fail "daemon is not an AArch64 ELF: $DAEMON"
+validate_android_aarch64_executable "$DAEMON"
 
 APK_METADATA="${APK_METADATA:-$(dirname "$APK")/output-metadata.json}"
 require_regular_file "$APK_METADATA"
@@ -143,6 +229,10 @@ if [[ -n "$BUILD_SESSION_FILE" || -n "$BUILD_SESSION_ID" || -n "$BUILD_SESSION_S
   [[ "$manifest_commit" == "$(git -C "$ROOT" rev-parse HEAD)" ]] || fail "build session commit mismatch"
   [[ "$(unique_prop releaseKind "$session_file")" == "$RELEASE_KIND" ]] \
     || fail "build session release kind mismatch"
+  [[ "$(unique_prop version "$session_file")" == "$EXPECTED_VERSION" ]] \
+    || fail "build session version mismatch"
+  [[ "$(unique_prop versionCode "$session_file")" == "$EXPECTED_VERSION_CODE" ]] \
+    || fail "build session versionCode mismatch"
   [[ "$(unique_prop daemonPath "$session_file")" == "$DAEMON" ]] || fail "daemon path is not from this build session"
   [[ "$(unique_prop apkPath "$session_file")" == "$APK" ]] || fail "APK path is not from this build session"
   [[ "$(unique_prop apkMetadataPath "$session_file")" == "$APK_METADATA" ]] \
@@ -207,18 +297,37 @@ fi
 if find "$TEMPLATE_DIR" -mindepth 2 -print -quit | grep -q .; then
   fail "template must contain only top-level files"
 fi
+template_fingerprint="$(top_level_file_fingerprint "$TEMPLATE_DIR")"
+license_sha="$(sha256sum -- "$ROOT/LICENSE" | awk '{print $1}')"
+input_fingerprint="$(release_input_fingerprint)"
 
 stage_parent="${STAGING_ROOT:-$ROOT/.release-staging}"
-mkdir -p "$stage_parent" "$OUT_DIR"
+mkdir -p "$stage_parent"
+stage_parent="$(cd "$stage_parent" && pwd -P)"
+mkdir -p "$OUT_DIR"
+OUT_DIR="$(cd "$OUT_DIR" && pwd -P)"
 stage="$(mktemp -d "$stage_parent/package.XXXXXX")"
 trap 'rm -rf "$stage"' EXIT
+assert_packaging_source_unchanged
 cp -a "$TEMPLATE_DIR/." "$stage/"
+assert_packaging_source_unchanged
+[[ "$(top_level_file_fingerprint "$stage")" == "$template_fingerprint" ]] \
+  || fail "staged Magisk template does not match the verified source template"
 cp "$DAEMON" "$stage/freezeit"
 cp "$APK" "$stage/freezeit.apk"
 cp "$ROOT/LICENSE" "$stage/LICENSE"
+[[ "$(sha256sum -- "$stage/LICENSE" | awk '{print $1}')" == "$license_sha" ]] \
+  || fail "staged LICENSE does not match the verified packaging input"
+assert_packaging_source_unchanged
+if [[ "$build_session_id" != none ]]; then
+  cp "$session_file" "$stage/build-session.manifest"
+  chmod 0600 "$stage/build-session.manifest"
+  [[ "$(sha256sum "$stage/build-session.manifest" | awk '{print $1}')" == "$build_session_manifest_sha" ]] \
+    || fail "staged build session manifest differs from the verified build session"
+fi
 chmod 0755 "$stage/freezeit" "$stage/customize.sh" "$stage/service.sh" "$stage/uninstall.sh"
 
-commit="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf unknown)"
+commit="$source_commit"
 dirty=false
 if [[ -n "$dirty_status" ]]; then
   dirty=true
@@ -234,6 +343,7 @@ if [[ -n "$dirty_status" ]]; then
   [[ ${#snapshot_files[@]} -gt 0 ]] || fail "dirty candidate source snapshot is empty"
   tar -C "$ROOT" -czf "$stage/source-snapshot.tar.gz" "${snapshot_files[@]}"
 fi
+assert_packaging_source_unchanged
 daemon_sha="$(sha256sum "$stage/freezeit" | awk '{print $1}')"
 apk_sha="$(sha256sum "$stage/freezeit.apk" | awk '{print $1}')"
 if [[ "$build_session_id" != none ]]; then
@@ -248,6 +358,7 @@ if [[ "$dirty" == true ]]; then
   snapshot_sha="$(sha256sum "$stage/source-snapshot.tar.gz" | awk '{print $1}')"
   state_sha="$(sha256sum "$stage/source-state.txt" | awk '{print $1}')"
 fi
+assert_packaging_source_unchanged
 cat >"$stage/provenance.txt" <<PROVENANCE
 format=freezeit-release-provenance-v2
 version=$EXPECTED_VERSION
@@ -296,5 +407,12 @@ rm -f "$out_zip"
     fail "zip or bsdtar is required"
   fi
 )
-"$ROOT/scripts/validate-release-zip.sh" "$out_zip" "$EXPECTED_VERSION" "$EXPECTED_VERSION_CODE"
+if [[ "$build_session_manifest_sha" != none ]]; then
+  FREEZEIT_EXPECTED_BUILD_SESSION_MANIFEST_SHA256="$build_session_manifest_sha" \
+    SOURCE_REPOSITORY_URL="$SOURCE_REPOSITORY_URL" \
+    "$ROOT/scripts/validate-release-zip.sh" "$out_zip" "$EXPECTED_VERSION" "$EXPECTED_VERSION_CODE"
+else
+  SOURCE_REPOSITORY_URL="$SOURCE_REPOSITORY_URL" \
+    "$ROOT/scripts/validate-release-zip.sh" "$out_zip" "$EXPECTED_VERSION" "$EXPECTED_VERSION_CODE"
+fi
 echo "packaged release: $out_zip"

@@ -26,7 +26,9 @@ public class Main extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        checkPrivacy(this);
+        final Context appContext = getApplicationContext();
+        checkPrivacy(this, () -> new Thread(
+                () -> AppInfoCache.refreshCache(appContext), "AppInfoCacheRefresh").start());
 
         StaticData.am = (ActivityManager) this.getSystemService(ACTIVITY_SERVICE);
 
@@ -43,7 +45,6 @@ public class Main extends AppCompatActivity {
         NavigationUI.setupActionBarWithNavController(this, navController, appBarConfiguration);
         NavigationUI.setupWithNavController(binding.navView, navController);
 
-        new Thread(() -> AppInfoCache.refreshCache(this)).start();
     }
 
     @Override
@@ -53,10 +54,18 @@ public class Main extends AppCompatActivity {
     }
 
     public static void checkPrivacy(Context context) {
+        checkPrivacy(context, null);
+    }
+
+    public static void checkPrivacy(Context context, Runnable onAccepted) {
         SharedPreferences sf = context.getSharedPreferences("preferences", Context.MODE_PRIVATE);
         final String key = BuildConfig.VERSION_NAME + "isAccept";
         var isAccept = sf.getBoolean(key, false);
-        if (isAccept) return;
+        if (isAccept) {
+            if (onAccepted != null)
+                onAccepted.run();
+            return;
+        }
 
         AlertDialog.Builder builder = new AlertDialog.Builder(context);
         builder.setTitle(R.string.privacy_title).setMessage(R.string.privacy_content)
@@ -65,6 +74,8 @@ public class Main extends AppCompatActivity {
                     var edit = sf.edit();
                     edit.putBoolean(key, true);
                     edit.apply();
+                    if (onAccepted != null)
+                        onAccepted.run();
                 })
                 .setCancelable(false)
                 .create()

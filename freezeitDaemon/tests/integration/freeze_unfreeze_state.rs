@@ -35,7 +35,7 @@ fn background_delay_reaches_pending_then_frozen_and_foreground_cancels() {
     assert_eq!(scheduler.due_at(5100).len(), 1);
     assert!(scheduler
         .cancel_foreground(&app.package_name, app.uid)
-        .is_some());
+        .is_none());
     assert!(scheduler.due_at(6000).is_empty());
 }
 
@@ -372,6 +372,7 @@ fn control_pass_skips_non_control_policies_and_absent_processes_without_log_spam
 fn live_control_pass_requires_active_hook_and_configured_apps() {
     let mut state = freezeit_daemon::protocol::manager_v1::ReadOnlyState {
         hook_health: "active".to_owned(),
+        hook_config_synced: true,
         control_allowed: true,
         app_config: vec![ManagerAppConfigRecord {
             uid: 10_123,

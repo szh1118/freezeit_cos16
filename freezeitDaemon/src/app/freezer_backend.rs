@@ -171,6 +171,42 @@ impl SystemAwareCgroupBinderBackend {
             };
         }
 
+        let requested_restrictions = policy.requested_restrictions();
+        if requested_restrictions.network_break && !self.environment.network_available {
+            return FreezeDecision {
+                action: DecisionAction::Postpone,
+                reason: "network restriction requested but backend is unavailable".to_owned(),
+            };
+        }
+        if requested_restrictions.wakelock_restriction && !self.environment.wakelock_available {
+            return FreezeDecision {
+                action: DecisionAction::Postpone,
+                reason: "wakelock restriction requested but backend is unavailable".to_owned(),
+            };
+        }
+
+        match policy {
+            FreezePolicy::Selected {
+                mode: crate::domain::policy::FreezeMode::Terminate,
+                ..
+            } => {
+                return FreezeDecision {
+                    action: DecisionAction::Terminate,
+                    reason: "terminate policy selected".to_owned(),
+                };
+            }
+            FreezePolicy::Selected {
+                mode: crate::domain::policy::FreezeMode::SignalStop,
+                ..
+            } => {
+                return FreezeDecision {
+                    action: DecisionAction::Signal,
+                    reason: "signal-stop policy selected".to_owned(),
+                };
+            }
+            FreezePolicy::Selected { .. } => {}
+        }
+
         if self.environment.cgroup_available && self.environment.binder_available {
             return FreezeDecision {
                 action: DecisionAction::Freeze,
@@ -312,21 +348,26 @@ fn capability_with_status(
 }
 
 fn idle_blocker(processes: &[RuntimeProcess]) -> Option<String> {
-    let busy = processes.iter().find(|process| {
-        process.control_state == ControlState::PendingFreeze
-            && process.binder_state.as_deref().is_some_and(|state| {
-                let normalized = state.to_ascii_lowercase();
-                normalized.contains("busy")
-                    || normalized.contains("sync_txn")
-                    || normalized.contains("txns_pending")
-                    || normalized.contains("binder_pending")
-            })
+    let blocked = processes.iter().find(|process| {
+        if process.control_state != ControlState::PendingFreeze {
+            return false;
+        }
+
+        let Some(state) = process.binder_state.as_deref() else {
+            return false;
+        };
+        let normalized = state.to_ascii_lowercase();
+        normalized.contains("binder_queue active")
+            || normalized.contains("busy")
+            || normalized.contains("sync_txn")
+            || normalized.contains("txns_pending")
+            || normalized.contains("binder_pending")
     })?;
 
     Some(format!(
-        "pending freeze idle evidence not satisfied for pid {}: {}",
-        busy.pid,
-        busy.binder_state.as_deref().unwrap_or("unknown")
+        "pending freeze idle evidence is not satisfied by binder transaction state for pid {}: {}",
+        blocked.pid,
+        blocked.binder_state.as_deref().unwrap_or("unavailable")
     ))
 }
 
@@ -368,5 +409,161 @@ pub fn mark_processes_frozen(processes: &mut [RuntimeProcess]) {
 pub fn mark_processes_running(processes: &mut [RuntimeProcess]) {
     for process in processes {
         process.control_state = ControlState::Running;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{
+        policy::{FallbackAction, ForegroundStrategy, FreezeMode},
+        runtime::ProcessState,
+    };
+
+    fn app() -> ManagedApp {
+        ManagedApp {
+            package_name: "com.example.app".to_owned(),
+            user_id: 0,
+            uid: 10_123,
+            label: "Example".to_owned(),
+            is_system_app: false,
+            protected_reason: None,
+            policy_id: "0:com.example.app".to_owned(),
+            last_seen_baseline: String::new(),
+        }
+    }
+
+    fn policy() -> FreezePolicy {
+        FreezePolicy::Selected {
+            mode: FreezeMode::Freeze,
+            delay_ms: 0,
+            foreground_strategy: ForegroundStrategy::Strict,
+            allow_network_restriction: false,
+            allow_wakelock_restriction: false,
+            fallback_strategy: vec![FallbackAction::Signal],
+            updated_at_ms: 0,
+        }
+    }
+
+    fn pending_process(binder_state: &str) -> RuntimeProcess {
+        RuntimeProcess {
+            pid: 123,
+            uid: 10_123,
+            package_name: "com.example.app".to_owned(),
+            process_name: "com.example.app".to_owned(),
+            proc_state: ProcessState::Cached,
+            control_state: ControlState::PendingFreeze,
+            cgroup_freeze_path: Some("/sys/fs/cgroup/uid_10123/pid_123/cgroup.freeze".to_owned()),
+            binder_state: Some(binder_state.to_owned()),
+            start_time_ticks: Some(1),
+            last_seen_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn unavailable_binder_debug_evidence_does_not_block_a_pending_freeze() {
+        let backend = SystemAwareCgroupBinderBackend::new(BackendEnvironment::default());
+
+        let decision = backend.can_freeze(
+            &app(),
+            &policy(),
+            &[pending_process(
+                "binder_queue unknown context_switches voluntary=7 nonvoluntary=3 total=10",
+            )],
+        );
+
+        assert_eq!(decision.action, DecisionAction::Freeze);
+    }
+
+    #[test]
+    fn affirmative_binder_activity_blocks_a_pending_freeze() {
+        let backend = SystemAwareCgroupBinderBackend::new(BackendEnvironment::default());
+
+        for evidence in ["binder_queue active_sync_transaction", "binder_queue busy"] {
+            let decision = backend.can_freeze(&app(), &policy(), &[pending_process(evidence)]);
+
+            assert_eq!(
+                decision.action,
+                DecisionAction::Postpone,
+                "evidence={evidence}"
+            );
+            assert!(decision.reason.contains("binder"));
+        }
+    }
+
+    #[test]
+    fn terminate_mode_selects_sigkill_even_when_both_freezers_are_available() {
+        let backend = SystemAwareCgroupBinderBackend::new(BackendEnvironment::default());
+        let mut terminate_policy = policy();
+        let FreezePolicy::Selected { mode, .. } = &mut terminate_policy;
+        *mode = FreezeMode::Terminate;
+
+        let decision = backend.can_freeze(
+            &app(),
+            &terminate_policy,
+            &[pending_process("binder_queue idle")],
+        );
+
+        assert_eq!(decision.action, DecisionAction::Terminate);
+    }
+
+    #[test]
+    fn requested_restriction_postpones_when_its_backend_is_unavailable() {
+        let backend = SystemAwareCgroupBinderBackend::new(BackendEnvironment {
+            network_available: false,
+            ..BackendEnvironment::default()
+        });
+        let mut restricted_policy = policy();
+        let FreezePolicy::Selected {
+            allow_network_restriction,
+            ..
+        } = &mut restricted_policy;
+        *allow_network_restriction = true;
+
+        let decision = backend.can_freeze(
+            &app(),
+            &restricted_policy,
+            &[pending_process("binder_queue idle")],
+        );
+
+        assert_eq!(decision.action, DecisionAction::Postpone);
+        assert!(decision.reason.contains("network"));
+    }
+
+    #[test]
+    fn cgroup_without_binder_selects_the_signal_fallback() {
+        let backend = SystemAwareCgroupBinderBackend::new(BackendEnvironment {
+            cgroup_available: true,
+            binder_available: false,
+            ..BackendEnvironment::default()
+        });
+
+        let decision =
+            backend.can_freeze(&app(), &policy(), &[pending_process("binder_queue idle")]);
+
+        assert_eq!(decision.action, DecisionAction::Signal);
+    }
+
+    #[test]
+    fn requested_wakelock_restriction_postpones_when_its_backend_is_unavailable() {
+        let backend = SystemAwareCgroupBinderBackend::new(BackendEnvironment {
+            wakelock_available: false,
+            ..BackendEnvironment::default()
+        });
+        let mut restricted_policy = policy();
+        let FreezePolicy::Selected {
+            allow_wakelock_restriction,
+            ..
+        } = &mut restricted_policy;
+        *allow_wakelock_restriction = true;
+
+        let decision = backend.can_freeze(
+            &app(),
+            &restricted_policy,
+            &[pending_process("binder_queue idle")],
+        );
+
+        assert_eq!(decision.action, DecisionAction::Postpone);
+        assert!(decision.reason.contains("wakelock"));
     }
 }

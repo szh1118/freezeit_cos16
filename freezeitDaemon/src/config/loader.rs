@@ -1,9 +1,14 @@
-use std::{fs, path::Path};
+use std::{
+    fs::{self, File},
+    io::Read,
+    path::Path,
+};
 
 use crate::app::error::DaemonError;
 
 pub const DEFAULT_MODULE_DIR: &str = "/data/adb/modules/freezeit";
 pub const MODULE_DIR_ENV: &str = "FREEZEIT_MODULE_DIR";
+pub const MAX_SETTINGS_DB_BYTES: usize = 1024 * 1024;
 
 pub fn resolve_module_dir<I, S>(
     args: I,
@@ -30,7 +35,8 @@ where
         }
     }
     Ok(env_module_dir
-        .filter(|value| !value.trim().is_empty())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_MODULE_DIR)
         .to_owned())
 }
@@ -107,7 +113,7 @@ pub fn parse_manager_app_config(payload: &[u8]) -> Result<Vec<String>, DaemonErr
 
 fn read_optional_text(path: impl AsRef<Path>) -> Result<Option<String>, DaemonError> {
     let path = path.as_ref();
-    if !path.exists() {
+    if optional_metadata(path)?.is_none() {
         return Ok(None);
     }
 
@@ -116,9 +122,80 @@ fn read_optional_text(path: impl AsRef<Path>) -> Result<Option<String>, DaemonEr
 
 fn read_optional_bytes(path: impl AsRef<Path>) -> Result<Option<Vec<u8>>, DaemonError> {
     let path = path.as_ref();
-    if !path.exists() {
+    if optional_metadata(path)?.is_none() {
         return Ok(None);
     }
 
-    Ok(Some(fs::read(path)?))
+    let file = File::open(path)?;
+    let size = file.metadata()?.len();
+    if size > MAX_SETTINGS_DB_BYTES as u64 {
+        return Err(DaemonError::config(format!(
+            "settings database exceeds {MAX_SETTINGS_DB_BYTES} byte limit"
+        )));
+    }
+
+    let mut bytes = Vec::with_capacity(size as usize);
+    let mut limited = file.take(MAX_SETTINGS_DB_BYTES as u64 + 1);
+    limited.read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_SETTINGS_DB_BYTES {
+        return Err(DaemonError::config(format!(
+            "settings database exceeds {MAX_SETTINGS_DB_BYTES} byte limit"
+        )));
+    }
+
+    Ok(Some(bytes))
+}
+
+fn optional_metadata(path: &Path) -> Result<Option<fs::Metadata>, DaemonError> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, fs::File};
+
+    use super::{load_policy_files, resolve_module_dir, DaemonPaths};
+    use crate::app::error::DaemonError;
+
+    #[test]
+    fn environment_module_dir_is_trimmed_before_it_is_returned() {
+        assert_eq!(
+            resolve_module_dir(["freezeit"], Some("  /data/adb/modules/freezeit  "))
+                .expect("module directory"),
+            "/data/adb/modules/freezeit"
+        );
+    }
+
+    #[test]
+    fn strict_loader_propagates_metadata_errors_instead_of_treating_them_as_missing() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let not_a_directory = temp.path().join("not-a-directory");
+        fs::write(&not_a_directory, "not a directory").expect("create file");
+        let paths = DaemonPaths::from_module_dir(not_a_directory.to_string_lossy().to_string());
+
+        let error = load_policy_files(&paths).expect_err("metadata failure must not be missing");
+
+        assert!(matches!(
+            error,
+            DaemonError::Io(error) if error.kind() == std::io::ErrorKind::NotADirectory
+        ));
+    }
+
+    #[test]
+    fn settings_database_over_the_limit_is_rejected_before_reading_it() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let paths = DaemonPaths::from_module_dir(temp.path().to_string_lossy().to_string());
+        let settings = File::create(&paths.settings_db).expect("settings database");
+        settings
+            .set_len(2 * 1024 * 1024)
+            .expect("oversized settings database");
+
+        let error = load_policy_files(&paths).expect_err("oversized settings must be rejected");
+
+        assert!(matches!(error, DaemonError::Config(_)));
+    }
 }

@@ -2,16 +2,22 @@ package io.github.jark006.freezeit.activity;
 
 import android.Manifest;
 import android.annotation.SuppressLint;
+import android.content.ActivityNotFoundException;
+import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
+import android.graphics.ImageDecoder;
+import android.graphics.Rect;
 import android.graphics.drawable.BitmapDrawable;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Message;
+import android.os.SystemClock;
+import android.util.Log;
 import android.view.View;
 import android.widget.AdapterView;
 import android.widget.SeekBar;
@@ -30,9 +36,24 @@ import io.github.jark006.freezeit.R;
 import io.github.jark006.freezeit.StaticData;
 import io.github.jark006.freezeit.Utils;
 
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
 
 public class Settings extends AppCompatActivity implements View.OnClickListener {
-    final int INIT_UI = 1, SET_VAR_SUCCESS = 2, SET_VAR_FAIL = 3;
+    private static final String TAG = "Freezeit[Settings]";
+    private static final int MAX_BACKGROUND_WIDTH = 1080;
+    private static final ExecutorService SETTINGS_RPC_EXECUTOR = Executors.newSingleThreadExecutor();
+    private static final ExecutorService BACKGROUND_IMPORT_EXECUTOR = Executors.newSingleThreadExecutor();
+    private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
+
+    final int INIT_UI = 1, SET_VAR_SUCCESS = 2, SET_VAR_FAIL = 3, GET_SETTINGS_FAIL = 4;
 
     Spinner freezeModeSpinner, reFreezeTimeoutSpinner, wakeupTimeoutSpinner, logLevelSpinner;
     SeekBar freezeTimeoutSeekbar, terminateTimeoutSeekbar;
@@ -58,8 +79,35 @@ public class Settings extends AppCompatActivity implements View.OnClickListener 
 
     byte[] settingsVar = new byte[256];
     long lastTimestamp = 0;
+    long settingsRevision = 0;
+    long nextSetOperation = 0;
+    final long[] latestSetOperation = new long[256];
 
     ActivityResultLauncher<Intent> pickPicture;
+
+    private static final class SettingsSnapshot {
+        final long revision;
+        final byte[] values;
+
+        SettingsSnapshot(long revision, byte[] values) {
+            this.revision = revision;
+            this.values = values;
+        }
+    }
+
+    private static final class SetVarResult {
+        final int index;
+        final int value;
+        final long operation;
+        final String error;
+
+        SetVarResult(int index, int value, long operation, String error) {
+            this.index = index;
+            this.value = value;
+            this.operation = operation;
+            this.error = error;
+        }
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -108,30 +156,9 @@ public class Settings extends AppCompatActivity implements View.OnClickListener 
                     result.getData().getData() == null)
                 return;
 
-            try {
-                String imagePath = Utils.getFileAbsolutePath(this, result.getData().getData());
-                var bg = BitmapFactory.decodeFile(imagePath);
-                if (bg == null || bg.getHeight() == 0 || bg.getWidth() == 0) return;
-
-                // 居中截取 宽:高 = 1:2
-                if (bg.getHeight() > 2 * bg.getWidth())
-                    bg = Bitmap.createBitmap(bg, 0, bg.getHeight() / 2 - bg.getWidth(),
-                            bg.getWidth(), bg.getWidth() * 2);
-                else if (bg.getHeight() < 2 * bg.getWidth())
-                    bg = Bitmap.createBitmap(bg, bg.getWidth() / 2 - bg.getHeight() / 4, 0,
-                            bg.getHeight() / 2, bg.getHeight());
-
-                // 限制分辨率
-                if (bg.getWidth() > 1080)
-                    bg = Utils.resize(bg, 1080f / bg.getWidth());
-
-                bg.compress(Bitmap.CompressFormat.JPEG, 90,
-                        openFileOutput(StaticData.bgFileName, Context.MODE_PRIVATE));
-
-                StaticData.bg = new BitmapDrawable(getResources(), bg);
-                StaticData.bg.setAlpha(56);
-            } catch (Exception ignore) {
-            }
+            final Uri imageUri = result.getData().getData();
+            final Context appContext = getApplicationContext();
+            BACKGROUND_IMPORT_EXECUTOR.execute(() -> importBackground(appContext, imageUri));
         });
     }
 
@@ -139,16 +166,17 @@ public class Settings extends AppCompatActivity implements View.OnClickListener 
     public void onResume() {
         super.onResume();
         findViewById(R.id.container).setBackground(StaticData.getBackgroundDrawable(this));
-        new Thread(() -> {
+        final long revision = ++settingsRevision;
+        SETTINGS_RPC_EXECUTOR.execute(() -> {
             Utils.TaskResult result = Utils.freezeitTaskResult(ManagerCmd.getSettings, null);
             if (result.length() != 256) {
-                handler.post(() -> Toast.makeText(getBaseContext(),
-                        getString(R.string.get_settings_fail), Toast.LENGTH_LONG).show());
+                handler.sendMessage(Message.obtain(handler, GET_SETTINGS_FAIL,
+                        Long.valueOf(revision)));
                 return;
             }
-            handler.sendMessage(Message.obtain(handler, INIT_UI, result.payload()));
-        }
-        ).start();
+            handler.sendMessage(Message.obtain(handler, INIT_UI,
+                    new SettingsSnapshot(revision, result.payload())));
+        });
     }
 
 
@@ -161,7 +189,7 @@ public class Settings extends AppCompatActivity implements View.OnClickListener 
                 if (settingsVar[idx] == spinnerPosition)
                     return;
 
-                var now = System.currentTimeMillis();
+                var now = SystemClock.elapsedRealtime();
                 if ((now - lastTimestamp) < 1000) {
                     Toast.makeText(getBaseContext(), getString(R.string.slowly_tips), Toast.LENGTH_LONG).show();
                     spinner.setSelection(settingsVar[idx]);
@@ -189,7 +217,7 @@ public class Settings extends AppCompatActivity implements View.OnClickListener 
                 if (Byte.toUnsignedInt(settingsVar[debugIdx]) == storageValue)
                     return;
 
-                var now = System.currentTimeMillis();
+                var now = SystemClock.elapsedRealtime();
                 if ((now - lastTimestamp) < 1000) {
                     Toast.makeText(getBaseContext(), getString(R.string.slowly_tips), Toast.LENGTH_LONG).show();
                     logLevelSpinner.setSelection(
@@ -226,7 +254,7 @@ public class Settings extends AppCompatActivity implements View.OnClickListener 
                 if (settingsVar[idx] == seekBar.getProgress())
                     return;
 
-                var now = System.currentTimeMillis();
+                var now = SystemClock.elapsedRealtime();
                 if ((now - lastTimestamp) < 1000) {
                     Toast.makeText(getBaseContext(), getString(R.string.slowly_tips), Toast.LENGTH_SHORT).show();
                     seekBar.setProgress(settingsVar[idx]);//进度条，文字 恢复原值
@@ -247,7 +275,7 @@ public class Settings extends AppCompatActivity implements View.OnClickListener 
             if (settingsVar[idx] == (isChecked ? 1 : 0))
                 return;
 
-            var now = System.currentTimeMillis();
+            var now = SystemClock.elapsedRealtime();
             if ((now - lastTimestamp) < 1000) {
                 Toast.makeText(getBaseContext(), getString(R.string.slowly_tips), Toast.LENGTH_LONG).show();
                 sw.setChecked(settingsVar[idx] != 0);
@@ -260,28 +288,27 @@ public class Settings extends AppCompatActivity implements View.OnClickListener 
     }
 
     void setVarTask(int index, int value) {
-        new Thread(() -> {
+        final long operation = ++nextSetOperation;
+        latestSetOperation[index] = operation;
+        ++settingsRevision;
+        SETTINGS_RPC_EXECUTOR.execute(() -> {
             byte[] request = {(byte) index, (byte) value};
             Utils.TaskResult result = Utils.freezeitTaskResult(ManagerCmd.setSettingsVar, request);
 
-            Message msg = Message.obtain();
-            msg.arg1 = index;
-            msg.arg2 = value;
             if (result.length() == 0) {
-                msg.what = SET_VAR_FAIL;
-                msg.obj = "UnknownError";
+                handler.sendMessage(Message.obtain(handler, SET_VAR_FAIL,
+                        new SetVarResult(index, value, operation, "UnknownError")));
             } else {
                 String res = new String(result.payload());
                 if (res.equals("success")) {
-                    msg.what = SET_VAR_SUCCESS;
+                    handler.sendMessage(Message.obtain(handler, SET_VAR_SUCCESS,
+                            new SetVarResult(index, value, operation, null)));
                 } else {
-                    msg.what = SET_VAR_FAIL;
-                    msg.obj = res;
+                    handler.sendMessage(Message.obtain(handler, SET_VAR_FAIL,
+                            new SetVarResult(index, value, operation, res)));
                 }
             }
-            handler.sendMessage(msg);
-        }
-        ).start();
+        });
     }
 
     private final Handler handler = new Handler(Looper.getMainLooper()) {
@@ -289,7 +316,10 @@ public class Settings extends AppCompatActivity implements View.OnClickListener 
         public void handleMessage(Message msg) {
             switch (msg.what) {
                 case INIT_UI:
-                    System.arraycopy((byte[]) msg.obj, 0, settingsVar, 0, settingsVar.length);
+                    SettingsSnapshot snapshot = (SettingsSnapshot) msg.obj;
+                    if (snapshot.revision != settingsRevision)
+                        break;
+                    System.arraycopy(snapshot.values, 0, settingsVar, 0, settingsVar.length);
                     InitSpinner(freezeModeSpinner, freezeModeIdx);
                     InitSpinner(reFreezeTimeoutSpinner, reFreezeTimeoutIdx);
                     InitSpinner(wakeupTimeoutSpinner, wakeupTimeoutIdx);
@@ -306,21 +336,108 @@ public class Settings extends AppCompatActivity implements View.OnClickListener 
                     break;
 
                 case SET_VAR_SUCCESS:
-                    settingsVar[msg.arg1] = (byte) msg.arg2;
+                    SetVarResult success = (SetVarResult) msg.obj;
+                    settingsVar[success.index] = (byte) success.value;
                     break;
 
                 case SET_VAR_FAIL:
-                    if (msg.arg1 == debugIdx) {
-                        logLevelSpinner.setSelection(
-                                LogLevelCodec.toSpinnerPosition(Byte.toUnsignedInt(settingsVar[debugIdx])));
-                    } else {
-                        restoreSettingControl(msg.arg1);
+                    SetVarResult failure = (SetVarResult) msg.obj;
+                    if (latestSetOperation[failure.index] == failure.operation) {
+                        if (failure.index == debugIdx) {
+                            logLevelSpinner.setSelection(
+                                    LogLevelCodec.toSpinnerPosition(Byte.toUnsignedInt(settingsVar[debugIdx])));
+                        } else {
+                            restoreSettingControl(failure.index);
+                        }
                     }
-                    Toast.makeText(getBaseContext(), getString(R.string.setup_failed) + ": " + msg.obj, Toast.LENGTH_LONG).show();
+                    Toast.makeText(getBaseContext(), getString(R.string.setup_failed) + ": " + failure.error,
+                            Toast.LENGTH_LONG).show();
+                    break;
+
+                case GET_SETTINGS_FAIL:
+                    if (((Long) msg.obj) == settingsRevision) {
+                        Toast.makeText(getBaseContext(), getString(R.string.get_settings_fail),
+                                Toast.LENGTH_LONG).show();
+                    }
                     break;
             }
         }
     };
+
+    private static Bitmap decodeBackground(Context context, Uri imageUri) throws IOException {
+        ImageDecoder.Source source;
+        if (ContentResolver.SCHEME_FILE.equals(imageUri.getScheme())) {
+            String path = imageUri.getPath();
+            if (path == null)
+                throw new IOException("Image URI has no file path");
+            source = ImageDecoder.createSource(new File(path));
+        } else {
+            source = ImageDecoder.createSource(context.getContentResolver(), imageUri);
+        }
+
+        return ImageDecoder.decodeBitmap(source, (decoder, info, ignored) -> {
+            int sourceWidth = info.getSize().getWidth();
+            int sourceHeight = info.getSize().getHeight();
+            int cropWidth = Math.min(sourceWidth, sourceHeight / 2);
+            if (cropWidth <= 0)
+                throw new IllegalArgumentException("Image is too small");
+
+            int cropHeight = cropWidth * 2;
+            int left = (sourceWidth - cropWidth) / 2;
+            int top = (sourceHeight - cropHeight) / 2;
+            int targetWidth = Math.min(cropWidth, MAX_BACKGROUND_WIDTH);
+            decoder.setCrop(new Rect(left, top, left + cropWidth, top + cropHeight));
+            decoder.setTargetSize(targetWidth, targetWidth * 2);
+            decoder.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE);
+        });
+    }
+
+    private static void replaceBackgroundFile(File temporary, File target) throws IOException {
+        try {
+            Files.move(temporary.toPath(), target.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException ignored) {
+            Files.move(temporary.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    private static void importBackground(Context context, Uri imageUri) {
+        File temporary = null;
+        Bitmap background = null;
+        try {
+            background = decodeBackground(context, imageUri);
+            if (background == null || background.getWidth() == 0 || background.getHeight() == 0)
+                throw new IOException("Image decode failed");
+
+            temporary = File.createTempFile("bg-", ".jpg", context.getFilesDir());
+            try (FileOutputStream output = new FileOutputStream(temporary)) {
+                if (!background.compress(Bitmap.CompressFormat.JPEG, 90, output))
+                    throw new IOException("Image compression failed");
+                output.flush();
+                output.getFD().sync();
+            }
+
+            replaceBackgroundFile(temporary,
+                    new File(context.getFilesDir(), StaticData.bgFileName));
+            final Bitmap importedBackground = background;
+            if (!MAIN_HANDLER.post(() -> {
+                StaticData.bg = new BitmapDrawable(context.getResources(), importedBackground);
+                StaticData.bg.setAlpha(56);
+            })) {
+                throw new IllegalStateException("Main handler is unavailable");
+            }
+            background = null;
+        } catch (Exception | OutOfMemoryError e) {
+            Log.e(TAG, "Import background failed", e);
+            MAIN_HANDLER.post(() -> Toast.makeText(context, R.string.update_fail,
+                    Toast.LENGTH_LONG).show());
+        } finally {
+            if (temporary != null && temporary.exists() && !temporary.delete())
+                Log.w(TAG, "Could not delete temporary background image");
+            if (background != null && !background.isRecycled())
+                background.recycle();
+        }
+    }
 
     private void restoreSettingControl(int index) {
         switch (index) {
@@ -389,9 +506,17 @@ public class Settings extends AppCompatActivity implements View.OnClickListener 
         } else if (id == R.id.log_level_title) {
             Utils.textDialog(this, R.string.log_level_title, R.string.log_level_tips);
         } else if (id == R.id.set_bg) {
-            Intent intent = new Intent("android.intent.action.GET_CONTENT");
+            Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
             intent.setType("image/*");
-            pickPicture.launch(intent);
+            if (intent.resolveActivity(getPackageManager()) == null) {
+                Toast.makeText(this, R.string.update_fail, Toast.LENGTH_LONG).show();
+                return;
+            }
+            try {
+                pickPicture.launch(intent);
+            } catch (ActivityNotFoundException e) {
+                Toast.makeText(this, R.string.update_fail, Toast.LENGTH_LONG).show();
+            }
         }
     }
 }

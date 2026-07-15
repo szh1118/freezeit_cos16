@@ -27,6 +27,41 @@ pub fn send_signal(pid: i32, action: SignalAction) -> Result<(), crate::app::err
         ));
     }
 
+    match action {
+        SignalAction::Stop => {
+            send_raw_signal(pid, SignalAction::Stop)?;
+            if let Err(ledger_error) = crate::sys::procfs::record_freezeit_signal_stop(pid) {
+                let rollback_error = send_raw_signal(pid, SignalAction::Continue).err();
+                return Err(crate::app::error::DaemonError::system(match rollback_error {
+                    Some(rollback_error) => format!(
+                        "SIGSTOP succeeded but ownership ledger failed: {ledger_error}; SIGCONT rollback failed: {rollback_error}"
+                    ),
+                    None => format!(
+                        "SIGSTOP succeeded but ownership ledger failed: {ledger_error}; SIGCONT rollback succeeded"
+                    ),
+                }));
+            }
+            Ok(())
+        }
+        SignalAction::Continue => {
+            let was_owned_stop = crate::sys::procfs::take_freezeit_signal_stop(pid)?;
+            if let Err(signal_error) = send_raw_signal(pid, SignalAction::Continue) {
+                if was_owned_stop {
+                    if let Err(restore_error) = crate::sys::procfs::record_freezeit_signal_stop(pid)
+                    {
+                        return Err(crate::app::error::DaemonError::system(format!(
+                            "SIGCONT failed: {signal_error}; failed to restore ownership ledger: {restore_error}"
+                        )));
+                    }
+                }
+                return Err(signal_error);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn send_raw_signal(pid: i32, action: SignalAction) -> Result<(), crate::app::error::DaemonError> {
     let result = unsafe { libc::kill(pid, action.signal_number()) };
     if result == 0 {
         Ok(())

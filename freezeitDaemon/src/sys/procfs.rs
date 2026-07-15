@@ -2,13 +2,20 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
 
 use crate::{app::error::DaemonError, domain::runtime::RuntimeProcess};
 
 pub const PROC_ROOT: &str = "/proc";
+pub const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 pub const CGROUP_APPS_ROOT: &str = "/sys/fs/cgroup/apps";
 pub const CGROUP_SYSTEM_ROOT: &str = "/sys/fs/cgroup/system";
+const BINDER_DEBUG_PROC_ROOT: &str = "/sys/kernel/debug/binder/proc";
+const BINDERFS_PROC_ROOT: &str = "/dev/binderfs/proc";
+const SIGNAL_STOP_LEDGER_FILE: &str = ".freezeit-sigstop-ledger";
+
+static SIGNAL_STOP_LEDGER_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub fn pid_exists(proc_root: impl AsRef<Path>, pid: i32) -> bool {
     proc_root.as_ref().join(pid.to_string()).exists()
@@ -74,14 +81,39 @@ pub fn parse_proc_state_char(stat_text: &str) -> Result<char, DaemonError> {
         .ok_or_else(|| DaemonError::system("proc stat did not contain a readable state field"))
 }
 
-/// 进程是否处于被信号停止的状态（'T'/'t'），需要 SIGCONT 恢复。
+/// 进程是否处于由本守护进程记录的 SIGSTOP 状态。
+///
+/// `/proc/<pid>/stat` 只能说明进程被停止，不能说明是谁停止的。仅凭 `T`/`t` 恢复会
+/// 覆盖调试器、job-control 或其他 root 工具的决定，因此必须匹配持久化的 PID/start-time
+/// 记录；tracing stop (`t`) 从不视为 Freezeit 所有。
 pub fn proc_state_is_stopped(stat_text: &str) -> bool {
-    matches!(parse_proc_state_char(stat_text), Ok('T') | Ok('t'))
+    is_freezeit_owned_stop_from_ledger(stat_text, &signal_stop_ledger_path())
 }
 
 pub fn read_proc_state_char(proc_root: impl AsRef<Path>, pid: i32) -> Result<char, DaemonError> {
     let stat = fs::read_to_string(proc_root.as_ref().join(pid.to_string()).join("stat"))?;
     parse_proc_state_char(&stat)
+}
+
+pub fn record_freezeit_signal_stop(pid: i32) -> Result<(), DaemonError> {
+    let start_time_ticks = read_process_start_time(PROC_ROOT, pid)?;
+    update_signal_stop_ledger(&signal_stop_ledger_path(), |records| {
+        records.insert((pid, start_time_ticks));
+    })
+}
+
+pub fn clear_freezeit_signal_stop(pid: i32) -> Result<(), DaemonError> {
+    let _ = take_freezeit_signal_stop(pid)?;
+    Ok(())
+}
+
+pub fn take_freezeit_signal_stop(pid: i32) -> Result<bool, DaemonError> {
+    let mut removed = false;
+    update_signal_stop_ledger(&signal_stop_ledger_path(), |records| {
+        removed = records.iter().any(|(recorded_pid, _)| *recorded_pid == pid);
+        records.retain(|(recorded_pid, _)| *recorded_pid != pid);
+    })?;
+    Ok(removed)
 }
 
 pub fn process_context_switch_evidence(status_text: &str) -> Option<String> {
@@ -101,10 +133,19 @@ pub fn recheck_process_identity(
         return Ok(false);
     }
 
-    if read_process_uid(proc_root.as_ref(), process.pid)? != process.uid {
+    let actual_uid = match read_process_uid(proc_root.as_ref(), process.pid) {
+        Ok(uid) => uid,
+        Err(error) if is_disappeared_process_error(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if actual_uid != process.uid {
         return Ok(false);
     }
-    let cmdline = read_process_cmdline(proc_root.as_ref(), process.pid)?;
+    let cmdline = match read_process_cmdline(proc_root.as_ref(), process.pid) {
+        Ok(cmdline) => cmdline,
+        Err(error) if is_disappeared_process_error(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
     if cmdline != process.process_name
         || !(cmdline == process.package_name
             || cmdline.starts_with(&format!("{}:", process.package_name)))
@@ -112,7 +153,11 @@ pub fn recheck_process_identity(
         return Ok(false);
     }
     match process.start_time_ticks {
-        Some(expected) => Ok(read_process_start_time(proc_root, process.pid)? == expected),
+        Some(expected) => match read_process_start_time(proc_root, process.pid) {
+            Ok(actual) => Ok(actual == expected),
+            Err(error) if is_disappeared_process_error(&error) => Ok(false),
+            Err(error) => Err(error),
+        },
         None => Ok(false),
     }
 }
@@ -162,7 +207,7 @@ pub fn discover_package_processes(
                 proc_state: crate::domain::runtime::ProcessState::Unknown,
                 control_state: crate::domain::runtime::ControlState::Unknown,
                 cgroup_freeze_path: None,
-                binder_state: process_context_switch_evidence(&status_text),
+                binder_state: Some(binder_control_evidence(pid, &status_text)),
                 start_time_ticks: read_process_start_time(proc_root, pid).ok(),
                 last_seen_at_ms: 0,
             });
@@ -176,11 +221,7 @@ pub fn discover_uid_processes(
     proc_root: impl AsRef<Path>,
     uid: u32,
 ) -> Result<Vec<RuntimeProcess>, DaemonError> {
-    discover_uid_processes_with_cgroup_roots(
-        proc_root,
-        &[Path::new(CGROUP_APPS_ROOT), Path::new(CGROUP_SYSTEM_ROOT)],
-        uid,
-    )
+    discover_uid_processes_with_cgroup_roots(proc_root, &runtime_cgroup_roots(), uid)
 }
 
 pub fn discover_uid_processes_with_cgroup_root(
@@ -244,7 +285,7 @@ pub fn discover_uid_processes_with_cgroup_roots(
             proc_state: crate::domain::runtime::ProcessState::Cached,
             control_state: crate::domain::runtime::ControlState::Running,
             cgroup_freeze_path: cgroup_freeze_path(cgroup_roots, uid, pid),
-            binder_state: process_context_switch_evidence(&status_text),
+            binder_state: Some(binder_control_evidence(pid, &status_text)),
             start_time_ticks: read_process_start_time(proc_root, pid).ok(),
             last_seen_at_ms: 0,
         });
@@ -259,7 +300,7 @@ pub fn discover_managed_uid_processes(
 ) -> Result<BTreeMap<u32, Vec<RuntimeProcess>>, DaemonError> {
     discover_managed_uid_processes_with_cgroup_roots(
         proc_root,
-        &[Path::new(CGROUP_APPS_ROOT), Path::new(CGROUP_SYSTEM_ROOT)],
+        &runtime_cgroup_roots(),
         managed_uids,
     )
 }
@@ -320,7 +361,7 @@ pub fn discover_managed_uid_processes_with_cgroup_roots(
                 proc_state: crate::domain::runtime::ProcessState::Cached,
                 control_state: crate::domain::runtime::ControlState::Running,
                 cgroup_freeze_path: cgroup_freeze_path(cgroup_roots, process_uid, pid),
-                binder_state: process_context_switch_evidence(&status_text),
+                binder_state: Some(binder_control_evidence(pid, &status_text)),
                 start_time_ticks: read_process_start_time(proc_root, pid).ok(),
                 last_seen_at_ms: 0,
             });
@@ -337,6 +378,135 @@ fn read_status_u64(status_text: &str, field: &str) -> Option<u64> {
     })
 }
 
+fn runtime_cgroup_roots() -> [&'static Path; 3] {
+    [
+        Path::new(CGROUP_APPS_ROOT),
+        Path::new(CGROUP_SYSTEM_ROOT),
+        Path::new(CGROUP_ROOT),
+    ]
+}
+
+fn is_disappeared_process_error(error: &DaemonError) -> bool {
+    matches!(
+        error,
+        DaemonError::Io(io_error) if io_error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+fn binder_transaction_evidence(pid: i32) -> Option<String> {
+    let roots = [
+        Path::new(BINDER_DEBUG_PROC_ROOT),
+        Path::new(BINDERFS_PROC_ROOT),
+    ];
+    roots
+        .iter()
+        .find_map(|root| fs::read_to_string(root.join(pid.to_string())).ok())
+        .map(|snapshot| classify_binder_transaction_snapshot(&snapshot))
+}
+
+fn binder_control_evidence(pid: i32, status_text: &str) -> String {
+    binder_transaction_evidence(pid).unwrap_or_else(|| {
+        let context = process_context_switch_evidence(status_text)
+            .unwrap_or_else(|| "context_switches unavailable".to_owned());
+        format!("binder_queue unknown {context}")
+    })
+}
+
+fn classify_binder_transaction_snapshot(snapshot: &str) -> String {
+    let normalized = snapshot.to_ascii_lowercase();
+    if normalized.contains("transaction stack")
+        || normalized.contains("transaction_stack")
+        || normalized.contains("sync_txn")
+    {
+        "binder_queue active_sync_transaction".to_owned()
+    } else if normalized.contains("proc ") || normalized.contains("thread ") {
+        "binder_queue idle".to_owned()
+    } else {
+        "binder_queue unknown".to_owned()
+    }
+}
+
+fn signal_stop_ledger_path() -> PathBuf {
+    let configured_module_dir = std::env::var(crate::config::loader::MODULE_DIR_ENV).ok();
+    let module_dir = crate::config::loader::resolve_module_dir(
+        std::env::args(),
+        configured_module_dir.as_deref(),
+    )
+    .unwrap_or_else(|_| crate::config::loader::DEFAULT_MODULE_DIR.to_owned());
+    PathBuf::from(module_dir).join(SIGNAL_STOP_LEDGER_FILE)
+}
+
+fn is_freezeit_owned_stop_from_ledger(stat_text: &str, ledger_path: &Path) -> bool {
+    if !matches!(parse_proc_state_char(stat_text), Ok('T')) {
+        return false;
+    }
+    let Some(pid) = parse_process_pid(stat_text) else {
+        return false;
+    };
+    let Ok(start_time_ticks) = parse_process_start_time(stat_text) else {
+        return false;
+    };
+    read_signal_stop_ledger(ledger_path)
+        .is_ok_and(|records| records.contains(&(pid, start_time_ticks)))
+}
+
+fn parse_process_pid(stat_text: &str) -> Option<i32> {
+    stat_text.split_whitespace().next()?.parse().ok()
+}
+
+fn update_signal_stop_ledger(
+    ledger_path: &Path,
+    update: impl FnOnce(&mut BTreeSet<(i32, u64)>),
+) -> Result<(), DaemonError> {
+    let lock = SIGNAL_STOP_LEDGER_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut records = read_signal_stop_ledger(ledger_path)?;
+    update(&mut records);
+    write_signal_stop_ledger(ledger_path, &records)
+}
+
+fn read_signal_stop_ledger(ledger_path: &Path) -> Result<BTreeSet<(i32, u64)>, DaemonError> {
+    let text = match fs::read_to_string(ledger_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(text
+        .lines()
+        .filter_map(|line| {
+            let (pid, start_time_ticks) = line.split_once(' ')?;
+            Some((pid.parse().ok()?, start_time_ticks.parse().ok()?))
+        })
+        .collect())
+}
+
+fn write_signal_stop_ledger(
+    ledger_path: &Path,
+    records: &BTreeSet<(i32, u64)>,
+) -> Result<(), DaemonError> {
+    if records.is_empty() {
+        match fs::remove_file(ledger_path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    let parent = ledger_path
+        .parent()
+        .ok_or_else(|| DaemonError::system("signal stop ledger has no parent directory"))?;
+    fs::create_dir_all(parent)?;
+    let temporary_path = ledger_path.with_extension(format!("tmp-{}", std::process::id()));
+    let text = records
+        .iter()
+        .map(|(pid, start_time_ticks)| format!("{pid} {start_time_ticks}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&temporary_path, format!("{text}\n"))?;
+    fs::rename(temporary_path, ledger_path)?;
+    Ok(())
+}
+
 fn cgroup_freeze_path(cgroup_roots: &[&Path], uid: u32, pid: i32) -> Option<String> {
     cgroup_roots.iter().find_map(|cgroup_root| {
         let path = cgroup_root
@@ -349,4 +519,91 @@ fn cgroup_freeze_path(cgroup_roots: &[&Path], uid: u32, pid: i32) -> Option<Stri
             None
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    #[test]
+    fn identity_recheck_treats_a_disappeared_proc_entry_as_a_mismatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let proc_root = temp.path().join("proc");
+        let pid_dir = proc_root.join("123");
+        fs::create_dir_all(&pid_dir).expect("pid directory");
+        fs::write(
+            pid_dir.join("status"),
+            "Name:\texample\nUid:\t10123\t10123\t10123\t10123\n",
+        )
+        .expect("status");
+        fs::write(pid_dir.join("cmdline"), "com.example.app\0").expect("cmdline");
+        fs::write(
+            pid_dir.join("stat"),
+            "123 (example) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 4242\n",
+        )
+        .expect("stat");
+
+        let process = discover_package_processes(&proc_root, "com.example.app", 10_123)
+            .expect("discover")
+            .remove(0);
+        fs::remove_file(pid_dir.join("status")).expect("remove status");
+
+        assert!(matches!(
+            recheck_process_identity(&proc_root, &process),
+            Ok(false)
+        ));
+    }
+
+    #[test]
+    fn runtime_discovery_checks_the_generic_cgroup_hierarchy_last() {
+        assert_eq!(runtime_cgroup_roots()[2], Path::new(CGROUP_ROOT));
+    }
+
+    #[test]
+    fn binder_debug_snapshot_distinguishes_active_transaction_from_idle_state() {
+        assert_eq!(
+            classify_binder_transaction_snapshot("proc 123\n  thread 123\n  transaction stack:\n"),
+            "binder_queue active_sync_transaction"
+        );
+        assert_eq!(
+            classify_binder_transaction_snapshot("proc 123\n  thread 123\n"),
+            "binder_queue idle"
+        );
+    }
+
+    #[test]
+    fn stopped_process_without_a_freezeit_ledger_entry_is_not_owned() {
+        assert!(!proc_state_is_stopped(
+            "123 (example) T 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 4242\n"
+        ));
+    }
+
+    #[test]
+    fn matching_signal_stop_ledger_entry_is_required_for_restart_recovery() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = temp.path().join("sigstop-ledger");
+        fs::write(&ledger, "123 4242\n").expect("ledger");
+
+        assert!(is_freezeit_owned_stop_from_ledger(
+            &stat_with_state('T', 4242),
+            &ledger
+        ));
+        assert!(!is_freezeit_owned_stop_from_ledger(
+            &stat_with_state('t', 4242),
+            &ledger
+        ));
+        assert!(!is_freezeit_owned_stop_from_ledger(
+            &stat_with_state('T', 9999),
+            &ledger
+        ));
+    }
+
+    fn stat_with_state(state: char, start_time_ticks: u64) -> String {
+        let mut fields = vec!["0".to_owned(); 20];
+        fields[0] = state.to_string();
+        fields[19] = start_time_ticks.to_string();
+        format!("123 (example) {}\n", fields.join(" "))
+    }
 }

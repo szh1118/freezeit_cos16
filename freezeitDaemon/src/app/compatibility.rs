@@ -70,7 +70,7 @@ impl RuntimeEnvironment {
     }
 
     pub fn runtime_compatible(&self) -> bool {
-        self.sdk >= 31 && !self.kernel.trim().is_empty()
+        self.sdk >= 31 && has_kernel_release(&self.kernel)
     }
 
     pub fn compatibility_json(&self, capabilities: &[ControlCapability]) -> String {
@@ -156,8 +156,7 @@ pub fn load_verified_targets(
     allowlist_path: impl AsRef<Path>,
 ) -> Result<Vec<VerifiedTarget>, DaemonError> {
     let mut targets = Vec::new();
-    if baseline_path.as_ref().exists() {
-        let text = fs::read_to_string(baseline_path)?;
+    if let Ok(text) = fs::read_to_string(baseline_path) {
         let model = property(
             &text,
             &["rom.product", "ro.product.model", "ro.product.device"],
@@ -214,6 +213,24 @@ fn android_version_sdk(version: &str) -> Option<u32> {
     }
 }
 
+fn has_kernel_release(kernel: &str) -> bool {
+    kernel.split_whitespace().any(|token| {
+        let version = token.trim_start_matches('v');
+        let mut components = version.split('.');
+        let Some(major) = components.next() else {
+            return false;
+        };
+        let Some(minor) = components.next() else {
+            return false;
+        };
+        major.parse::<u32>().is_ok()
+            && minor
+                .split(|character: char| !character.is_ascii_digit())
+                .next()
+                .is_some_and(|value| !value.is_empty() && value.parse::<u32>().is_ok())
+    })
+}
+
 fn capability_name(name: CapabilityName) -> &'static str {
     match name {
         CapabilityName::Root => "root",
@@ -245,10 +262,46 @@ fn escape_json(value: &str) -> String {
             '\n' => "\\n".chars().collect(),
             '\r' => "\\r".chars().collect(),
             '\t' => "\\t".chars().collect(),
-            c if (c as u32) < 0x20 => {
-                format!("\\u{:04x}", c as u32).chars().collect::<Vec<_>>()
-            }
+            c if (c as u32) < 0x20 => format!("\\u{:04x}", c as u32).chars().collect::<Vec<_>>(),
             other => vec![other],
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    #[test]
+    fn architecture_name_is_not_accepted_as_kernel_evidence() {
+        let runtime = RuntimeEnvironment::new(
+            "CPH2653",
+            "16",
+            36,
+            "fingerprint",
+            "aarch64",
+            true,
+            true,
+            true,
+        )
+        .with_verified_targets(vec![VerifiedTarget::new("CPH2653", 36)]);
+
+        assert!(!runtime.runtime_compatible());
+        assert!(!runtime.allows_control(&[]));
+    }
+
+    #[test]
+    fn unreadable_optional_baseline_does_not_hide_a_valid_allowlist() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let baseline = temp.path().join("rom_baseline.prop");
+        let allowlist = temp.path().join("verified_targets.txt");
+        fs::create_dir(&baseline).expect("directory baseline");
+        fs::write(&allowlist, "CPH2653 sdk=36\n").expect("allowlist");
+
+        let targets = load_verified_targets(&baseline, &allowlist).expect("load allowlist");
+
+        assert_eq!(targets, vec![VerifiedTarget::new("CPH2653", 36)]);
+    }
 }

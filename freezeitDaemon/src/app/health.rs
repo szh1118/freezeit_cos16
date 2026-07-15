@@ -131,10 +131,11 @@ impl ModuleHealth {
             hook_ready,
             root_ready,
             freezer_ready,
-            package_inventory_ready,
+            true,
         );
 
         if !package_inventory_ready {
+            downgrade_active_health(&mut health);
             health
                 .degraded_reasons
                 .push("package inventory unavailable".to_owned());
@@ -150,11 +151,50 @@ impl ModuleHealth {
                 .push("wake-lock control unavailable".to_owned());
         }
         if !screen_state_ready {
+            downgrade_active_health(&mut health);
             health
                 .degraded_reasons
                 .push("screen-state detection unavailable".to_owned());
         }
 
         health
+    }
+}
+
+fn downgrade_active_health(health: &mut ModuleHealth) {
+    if health.status == HealthStatus::Active {
+        health.status = HealthStatus::Degraded;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_screen_state_evidence_is_not_safe_for_control() {
+        let health = ModuleHealth::with_capability_failures(
+            true, true, true, true, true, true, true, true, false,
+        );
+
+        assert_eq!(health.status, HealthStatus::Degraded);
+        assert!(!health.is_safe_for_control());
+    }
+
+    #[test]
+    fn package_inventory_failure_does_not_relabel_policy_as_unavailable() {
+        let health = ModuleHealth::with_capability_failures(
+            true, true, true, true, false, true, true, true, true,
+        );
+
+        assert!(health.policy_ready);
+        assert!(health
+            .degraded_reasons
+            .iter()
+            .any(|reason| reason.contains("package inventory")));
+        assert!(!health
+            .degraded_reasons
+            .iter()
+            .any(|reason| reason.contains("policy unavailable")));
     }
 }

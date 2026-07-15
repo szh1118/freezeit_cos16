@@ -14,6 +14,7 @@ public class Enum {
     public final static class Class {
         public final static String self = BuildConfig.APPLICATION_ID + ".fragment.Home";
 
+        public final static String Instrumentation = "android.app.Instrumentation";
         public final static String BroadcastQueue = "com.android.server.am.BroadcastQueue";
         public final static String BroadcastQueueImpl = "com.android.server.am.BroadcastQueueImpl"; //SDK 34+
         public final static String BroadcastQueueModernImpl = "com.android.server.am.BroadcastQueueModernImpl"; //SDK 34+
@@ -90,6 +91,7 @@ public class Enum {
     public final static class Method {
         public final static String isXposedActive = "isXposedActive";
 
+        public final static String callApplicationOnCreate = "callApplicationOnCreate";
         public final static String add = "add";
         public final static String deliverToRegisteredReceiverLocked = "deliverToRegisteredReceiverLocked";
         public final static String appNotResponding = "appNotResponding";

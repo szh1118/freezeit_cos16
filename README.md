@@ -4,13 +4,13 @@
 
 ## 当前版本
 
-- 模块版本：`3.3.2SelfUse`，版本号：`303002`。
-- `freezeitRelease/update.json` 仍指向已验证的 `v3.3.1SelfUse`；完成 `3.3.2SelfUse` 真机验收后再更新。
+- 模块版本：`3.3.4SelfUse`，版本号：`303004`。
+- `freezeitRelease/update.json` 在 ZIP 完成同次构建、完整校验并上传前继续指向已验证的上一版。
 - 新版本仅支持 ARM64，且只包含一个由 `freezeitDaemon/` 为 `aarch64-linux-android` 构建的 Rust 守护进程 `freezeit`。
 - 不提供 C++、x64 或旧守护进程回退。
 - Magisk 源模板位于 `magisk/`，仓库中的模板不保存守护进程、APK 等构建产物。
 
-`3.3.2SelfUse` 修复管理器配置保存、冻结状态、共享 UID、下载延迟和并发响应问题；日志页提供 `INFO / WARN / ERROR / CRITICAL / DEBUG` 五档等级，其中 `INFO` 严格保持旧版 C++ 管理器的简洁格式，`DEBUG` 才显示 Rust 诊断字段。清空日志需要二次确认，清空后的旧操作不会再次出现。
+`3.3.4SelfUse` 修复 Binder 调试信息不可读时把所有候选应用永久卡在等待冻结状态的问题，并保留明确的活跃 Binder 事务阻断；在 Binder freezer 降级时，实际走 SIGSTOP 回退的操作会准确记录为 `signal.stop`。Android 16 上暂未适配的 `BroadcastQueueModernImpl` 广播抑制按可选能力降级，核心冻结控制不会因此关闭。该版本同时收敛守护进程、Xposed bridge、控制状态恢复、配置协议、管理器并发与发布验证链的稳定性修复。
 
 ## 构建与打包
 
@@ -23,7 +23,7 @@ scripts/build-release.sh
 脚本会构建 ARM64 Rust 守护进程与正式版管理器，核对二者版本，随后调用 `scripts/package-release.sh`。打包在临时的 `.release-staging/` 中进行，输出：
 
 ```text
-freezeitRelease/freezeit_oneplus13_android16_selfuse_v3.3.2SelfUse_303002.zip
+freezeitRelease/freezeit_oneplus13_android16_selfuse_v3.3.4SelfUse_303004.zip
 ```
 
 脏工作树测试包可显式提供已构建并核验的文件：
@@ -53,13 +53,13 @@ scripts/package-release.sh
 ```sh
 scripts/test-release-pipeline.sh
 scripts/test-release-metadata.sh planned
-scripts/validate-release-zip.sh /path/to/release.zip 3.3.2SelfUse 303002
+scripts/validate-release-zip.sh /path/to/release.zip 3.3.4SelfUse 303004
 ```
 
 只有待发布 ZIP 通过完整校验后，才能修改 `freezeitRelease/update.json`。发布后再执行：
 
 ```sh
-scripts/test-release-metadata.sh released 3.3.2SelfUse 303002
+scripts/test-release-metadata.sh released 3.3.4SelfUse 303004
 ```
 
 ## 项目来源

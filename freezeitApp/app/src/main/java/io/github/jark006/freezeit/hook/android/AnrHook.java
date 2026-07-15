@@ -67,7 +67,7 @@ public class AnrHook {
                         " Annotation:" + param.args[5]);
 
             final int uid = aInfo.uid;
-            if (!config.managedApp.contains(uid))
+            if (!FreezeitService.shouldSuppressBackgroundWork(config, uid))
                 return;
 
             param.setResult(null);
@@ -90,7 +90,7 @@ public class AnrHook {
                         " Annotation:" + param.args[6]);
 
             final int uid = config.getProcessRecordUid(processRecord);// processRecord
-            if (!config.managedApp.contains(uid))
+            if (!FreezeitService.shouldSuppressBackgroundWork(config, uid))
                 return;
 
             param.setResult(null);
@@ -108,7 +108,7 @@ public class AnrHook {
             final var processRecord = param.args[0];
 
             final int uid = config.getProcessRecordUid(processRecord);// processRecord
-            if (!config.managedApp.contains(uid))
+            if (!FreezeitService.shouldSuppressBackgroundWork(config, uid))
                 return;
 
             param.setResult(null);
@@ -125,7 +125,7 @@ public class AnrHook {
             final var serviceRecord = param.args[0];
 
             final int uid = config.getServiceRecordDefiningUid(serviceRecord);
-            if (!config.managedApp.contains(uid))
+            if (!FreezeitService.shouldSuppressBackgroundWork(config, uid))
                 return;
 
             param.setResult(null);

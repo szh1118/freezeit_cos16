@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+root="${FREEZEIT_TEST_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 home="$root/freezeitApp/app/src/main/java/io/github/jark006/freezeit/fragment/Home.java"
 logcat="$root/freezeitApp/app/src/main/java/io/github/jark006/freezeit/fragment/Logcat.java"
 
 fail=0
 
-if grep -q 'Utils\.freezeitTask(ManagerCmd\.getHealthReport' "$home"; then
-  echo "FAIL: Home must not call unsupported ManagerCmd.getHealthReport against the shipped legacy daemon."
+if tr -d '[:space:]' < "$home" | grep -Eq 'Utils\.freezeitTask(Result)?\(ManagerCmd\.getHealthReport,'; then
+  echo "FAIL: Home must not call unsupported ManagerCmd.getHealthReport through a daemon socket helper."
   fail=1
 fi
 

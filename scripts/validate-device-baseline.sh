@@ -5,17 +5,20 @@ SERIAL_ARG="${1:-}"
 ADB="${ADB:-adb}"
 
 if [ -n "$SERIAL_ARG" ] && command -v "$ADB" >/dev/null 2>&1; then
-    ADB_CMD="$ADB -s $SERIAL_ARG shell"
+    USE_ADB=1
 elif command -v getprop >/dev/null 2>&1; then
-    ADB_CMD=""
+    USE_ADB=0
 else
-    ADB_CMD="$ADB shell"
+    USE_ADB=1
 fi
 
 run_device() {
-    if [ -n "$ADB_CMD" ]; then
-        # shellcheck disable=SC2086
-        $ADB_CMD "$1"
+    if [ "$USE_ADB" -eq 1 ]; then
+        if [ -n "$SERIAL_ARG" ]; then
+            "$ADB" -s "$SERIAL_ARG" shell "$1"
+        else
+            "$ADB" shell "$1"
+        fi
     else
         sh -c "$1"
     fi
@@ -33,20 +36,29 @@ echo "kernel=$(run_device 'uname -r')"
 echo "arch=$(run_device 'uname -m')"
 echo "magisk_context=$(run_device 'su -c id -Z 2>/dev/null || id -Z 2>/dev/null || true')"
 
+validation_failed=0
+
 if [ "$(run_device 'su -c "test -d /data/adb/modules/freezeit && echo present || echo missing"')" = "present" ]; then
     echo "module_dir=present"
 else
     echo "module_dir=missing"
+    validation_failed=1
 fi
 
 if [ "$(run_device 'test -e /dev/binder -o -e /dev/binderfs/binder && echo present || echo missing')" = "present" ]; then
     echo "binder_device=present"
 else
     echo "binder_device=missing"
+    validation_failed=1
 fi
 
 if [ "$(run_device 'test -e /sys/fs/cgroup/cgroup.controllers && echo present || echo missing')" = "present" ]; then
     echo "cgroup_v2=present"
 else
     echo "cgroup_v2=missing"
+    validation_failed=1
+fi
+
+if [ "$validation_failed" -ne 0 ]; then
+    exit 1
 fi

@@ -2,6 +2,8 @@ package io.github.jark006.freezeit.fragment;
 
 import android.annotation.SuppressLint;
 import android.app.ActivityManager;
+import android.content.ActivityNotFoundException;
+import android.content.Context;
 import android.content.Intent;
 import android.graphics.Bitmap;
 import android.net.Uri;
@@ -27,10 +29,16 @@ import androidx.fragment.app.Fragment;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.nio.ByteBuffer;
 import java.util.Locale;
 import java.util.Timer;
 import java.util.TimerTask;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import io.github.jark006.freezeit.BuildConfig;
 import io.github.jark006.freezeit.ManagerCmd;
@@ -47,21 +55,55 @@ public class Home extends Fragment implements View.OnClickListener {
     private FragmentHomeBinding binding;
 
     Timer timer;
-    ActivityManager.MemoryInfo memoryInfo = new ActivityManager.MemoryInfo();
 
     final int realTimeInfoIntLen = 23;
     int[] realTimeInfo = new int[realTimeInfoIntLen]; //ARM64和X64  Native层均为小端
-    byte[] realTimeRequest = new byte[12];
     boolean hasHealthStatus = false;
     String daemonHealth = "Unknown";
     String hookHealth = "Unknown";
     ImageView realTimeLayoutTarget;
     ViewTreeObserver.OnGlobalLayoutListener realTimeLayoutListener;
+    private final AtomicBoolean onlineInfoInFlight = new AtomicBoolean(false);
+    private volatile boolean viewResumed;
+    private volatile int realTimeGeneration;
+    private int statusGeneration;
+
+    private static final class ModuleInfo {
+        final int moduleVersionCode;
+        final int clusterType;
+        final int extMemory;
+        final String moduleVersion;
+        final String moduleEnv;
+        final String workMode;
+        final String androidVer;
+        final String kernelVer;
+        final boolean hasHealthStatus;
+        final String daemonHealth;
+        final String hookHealth;
+
+        ModuleInfo(int moduleVersionCode, int clusterType, int extMemory,
+                   String moduleVersion, String moduleEnv, String workMode,
+                   String androidVer, String kernelVer, boolean hasHealthStatus,
+                   String daemonHealth, String hookHealth) {
+            this.moduleVersionCode = moduleVersionCode;
+            this.clusterType = clusterType;
+            this.extMemory = extMemory;
+            this.moduleVersion = moduleVersion;
+            this.moduleEnv = moduleEnv;
+            this.workMode = workMode;
+            this.androidVer = androidVer;
+            this.kernelVer = kernelVer;
+            this.hasHealthStatus = hasHealthStatus;
+            this.daemonHealth = daemonHealth;
+            this.hookHealth = hookHealth;
+        }
+    }
 
     public View onCreateView(@NonNull LayoutInflater inflater,
                              ViewGroup container, Bundle savedInstanceState) {
 
         binding = FragmentHomeBinding.inflate(inflater, container, false);
+        binding.cpuImg.setScaleType(ImageView.ScaleType.FIT_XY);
 
         binding.downloadButton.setOnClickListener(this);
         binding.realtimeLayout.setOnClickListener(this);
@@ -101,6 +143,8 @@ public class Home extends Fragment implements View.OnClickListener {
 
     @Override
     public void onPause() {
+        viewResumed = false;
+        statusGeneration++;
         super.onPause();
         cancelRealTimeTimer();
     }
@@ -108,11 +152,14 @@ public class Home extends Fragment implements View.OnClickListener {
     @Override
     public void onResume() {
         super.onResume();
+        viewResumed = true;
         refreshStatus();
     }
 
     @Override
     public void onDestroyView() {
+        viewResumed = false;
+        statusGeneration++;
         super.onDestroyView();
         cancelRealTimeTimer();
         clearRealTimeLayoutListener();
@@ -128,8 +175,9 @@ public class Home extends Fragment implements View.OnClickListener {
             UPDATE_LOCAL_CHANGELOG = 8;
 
     void refreshStatus() {
-        if (StaticData.hasGetPropInfo) handler.sendEmptyMessage(HAS_MODULE_INFO);
-        else new Thread(() -> {
+        final int requestGeneration = ++statusGeneration;
+        StaticData.hasGetPropInfo = false;
+        new Thread(() -> {
             Utils.TaskResult result = Utils.freezeitTaskResult(ManagerCmd.getPropInfo, null);
 
             // info [0]:moduleID [1]:moduleName [2]:moduleVersion [3]:moduleVersionCode [4]:moduleAuthor
@@ -141,71 +189,156 @@ public class Home extends Fragment implements View.OnClickListener {
             //      [10]:extMemory: 内存扩展 MiB
             //      [11]:daemonHealth: Rust daemon active/degraded/inactive
             //      [12]:hookHealth: LSPosed bridge active/degraded/inactive/unknown
-            String[] info = result.length() == 0 ? null : new String(result.payload()).split("\n");
-            if (info == null || info.length < 5) {
-                handler.sendEmptyMessage(NO_MODULE_INFO);
-                return;
-            }
-
-            try {
-                StaticData.moduleVersionCode = Integer.parseInt(info[3]);
-                StaticData.clusterType = info.length > 5 ? Integer.parseInt(info[5]) : 0;
-                StaticData.extMemory = info.length > 10 ? Integer.parseInt(info[10]) : 0;
-            } catch (Exception ignored) {
-            }
-            StaticData.moduleVersion = info[2];
-            StaticData.moduleEnv = info.length > 6 ? info[6] : "Unknown";
-            StaticData.workMode = info.length > 7 ? info[7] : "Unknown";
-            StaticData.androidVer = info.length > 8 ? info[8] : "Unknown";
-            StaticData.kernelVer = info.length > 9 ? info[9] : "Unknown";
-            hasHealthStatus = info.length > 11;
-            daemonHealth = hasHealthStatus ? info[11] : "Unknown";
-            hookHealth = info.length > 12 ? info[12] : "Unknown";
-            StaticData.hasGetPropInfo = true;
-            handler.sendEmptyMessage(HAS_MODULE_INFO);
+            ModuleInfo moduleInfo = parseModuleInfo(result);
+            Message message = handler.obtainMessage(
+                    moduleInfo == null ? NO_MODULE_INFO : HAS_MODULE_INFO,
+                    moduleInfo);
+            message.arg1 = requestGeneration;
+            message.sendToTarget();
         }).start();
+    }
+
+    private static ModuleInfo parseModuleInfo(Utils.TaskResult result) {
+        if (result.length() == 0)
+            return null;
+
+        String[] info = new String(result.payload()).split("\n");
+        if (info.length < 5)
+            return null;
+
+        int moduleVersionCode = 0;
+        int clusterType = 0;
+        int extMemory = 0;
+        try {
+            moduleVersionCode = Integer.parseInt(info[3]);
+            clusterType = info.length > 5 ? Integer.parseInt(info[5]) : 0;
+            extMemory = info.length > 10 ? Integer.parseInt(info[10]) : 0;
+        } catch (Exception ignored) {
+        }
+        return new ModuleInfo(
+                moduleVersionCode,
+                clusterType,
+                extMemory,
+                info[2],
+                info.length > 6 ? info[6] : "Unknown",
+                info.length > 7 ? info[7] : "Unknown",
+                info.length > 8 ? info[8] : "Unknown",
+                info.length > 9 ? info[9] : "Unknown",
+                info.length > 11,
+                info.length > 11 ? info[11] : "Unknown",
+                info.length > 12 ? info[12] : "Unknown"
+        );
+    }
+
+    private void applyModuleInfo(ModuleInfo moduleInfo) {
+        StaticData.moduleVersionCode = moduleInfo.moduleVersionCode;
+        StaticData.clusterType = moduleInfo.clusterType;
+        StaticData.extMemory = moduleInfo.extMemory;
+        StaticData.moduleVersion = moduleInfo.moduleVersion;
+        StaticData.moduleEnv = moduleInfo.moduleEnv;
+        StaticData.workMode = moduleInfo.workMode;
+        StaticData.androidVer = moduleInfo.androidVer;
+        StaticData.kernelVer = moduleInfo.kernelVer;
+        hasHealthStatus = moduleInfo.hasHealthStatus;
+        daemonHealth = moduleInfo.daemonHealth;
+        hookHealth = moduleInfo.hookHealth;
+        StaticData.hasGetPropInfo = true;
     }
 
     void getOnlineInfoTask() {
-        if (StaticData.hasOnlineInfo)
+        if (StaticData.hasOnlineInfo) {
             handler.sendEmptyMessage(HANDLE_ONLINE_INFO);
-        else new Thread(() -> {
-            var response = Utils.getNetworkData(getString(R.string.update_json_link));
-            if (response == null || response.length == 0)
-                return;
+            return;
+        }
+        if (!onlineInfoInFlight.compareAndSet(false, true))
+            return;
+
+        Context context = getContext();
+        if (context == null) {
+            onlineInfoInFlight.set(false);
+            return;
+        }
+        final String updateJsonLink = context.getString(R.string.update_json_link);
+        new Thread(() -> {
             try {
-                JSONObject json = new JSONObject(new String(response));
-                StaticData.onlineVersion = json.getString("version");
-                StaticData.onlineVersionCode = json.getInt("versionCode");
-                StaticData.zipUrl = json.getString("zipUrl");
-                StaticData.changelogUrl = json.getString("changelog");
-                StaticData.hasOnlineInfo = true;
-                handler.sendEmptyMessage(HANDLE_ONLINE_INFO);
-            } catch (JSONException e) {
-                Log.e(TAG, e.toString());
+                byte[] response = getNetworkDataWithTimeout(updateJsonLink);
+                if (response == null || response.length == 0)
+                    return;
+                try {
+                    JSONObject json = new JSONObject(new String(response));
+                    StaticData.onlineVersion = json.getString("version");
+                    StaticData.onlineVersionCode = json.getInt("versionCode");
+                    StaticData.zipUrl = json.getString("zipUrl");
+                    StaticData.changelogUrl = json.getString("changelog");
+                    StaticData.hasOnlineInfo = true;
+                    handler.sendEmptyMessage(HANDLE_ONLINE_INFO);
+                } catch (JSONException e) {
+                    Log.e(TAG, e.toString());
+                }
+            } finally {
+                onlineInfoInFlight.set(false);
             }
         }).start();
     }
 
+    private static byte[] getNetworkDataWithTimeout(String link) {
+        HttpURLConnection connection = null;
+        try {
+            connection = (HttpURLConnection) new URL(link).openConnection();
+            connection.setConnectTimeout(5 * 1000);
+            connection.setReadTimeout(10 * 1000);
+            connection.setRequestMethod("GET");
+            connection.connect();
+            if (connection.getResponseCode() != HttpURLConnection.HTTP_OK)
+                return null;
+
+            try (InputStream input = connection.getInputStream();
+                 ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+                byte[] buffer = new byte[4096];
+                int length;
+                while ((length = input.read(buffer)) != -1)
+                    output.write(buffer, 0, length);
+                return output.toByteArray();
+            }
+        } catch (IOException | ClassCastException e) {
+            Log.e(TAG, "Network request failed", e);
+            return null;
+        } finally {
+            if (connection != null)
+                connection.disconnect();
+        }
+    }
+
     void initRealTimeInfoTimer() {
-        if (timer != null || StaticData.imgHeight == 0 || StaticData.imgWidth == 0)
+        if (!viewResumed || timer != null || StaticData.imgHeight == 0 || StaticData.imgWidth == 0)
             return;
 
+        final byte[] realTimeRequest = new byte[12];
         Utils.Int2Byte(StaticData.imgHeight, realTimeRequest, 0);
         Utils.Int2Byte(StaticData.imgWidth, realTimeRequest, 4);
 
+        final int requestGeneration = ++realTimeGeneration;
         timer = new Timer();
         timer.schedule(new TimerTask() {
             @Override
             public void run() {
+                if (!viewResumed || requestGeneration != realTimeGeneration || StaticData.am == null)
+                    return;
+
+                ActivityManager.MemoryInfo memoryInfo = new ActivityManager.MemoryInfo();
                 StaticData.am.getMemoryInfo(memoryInfo); // 底层 /proc/meminfo 的 MemAvailable 不可靠
                 Utils.Int2Byte((int) (memoryInfo.availMem >> 20), realTimeRequest, 8); //Unit: MiB
 
+                if (!viewResumed || requestGeneration != realTimeGeneration)
+                    return;
                 Utils.TaskResult result = Utils.freezeitTaskResult(
                         ManagerCmd.getRealTimeInfo,
                         realTimeRequest);
-                if (result.length() > 0)
-                    handler.sendMessage(Message.obtain(handler, HANDLE_REALTIME_INFO, result.payload()));
+                if (result.length() > 0 && viewResumed && requestGeneration == realTimeGeneration) {
+                    Message message = handler.obtainMessage(HANDLE_REALTIME_INFO, result.payload());
+                    message.arg1 = requestGeneration;
+                    message.sendToTarget();
+                }
             }
         }, 0, 3000);
     }
@@ -215,12 +348,14 @@ public class Home extends Fragment implements View.OnClickListener {
         @Override
         public void handleMessage(@NonNull Message msg) {
             super.handleMessage(msg);
-            if (binding == null)
+            if (binding == null || !viewResumed)
                 return;
 
             // 状态机
             switch (msg.what) {
                 case NO_MODULE_INFO: {
+                    if (msg.arg1 != statusGeneration)
+                        return;
                     binding.swipeRefreshLayout.setRefreshing(false);
                     binding.stateLayout.setBackgroundResource(R.color.warn_red);
                     binding.statusText.setText(R.string.freezeit_error_tips);
@@ -247,7 +382,7 @@ public class Home extends Fragment implements View.OnClickListener {
                             binding.changelogText.setText(StaticData.onlineChangelog);
                         else if (StaticData.changelogUrl.length() > 0)
                             new Thread(() -> {
-                                var response = Utils.getNetworkData(StaticData.changelogUrl);
+                                var response = getNetworkDataWithTimeout(StaticData.changelogUrl);
                                 if (response == null || response.length == 0)
                                     return;
 
@@ -294,6 +429,9 @@ public class Home extends Fragment implements View.OnClickListener {
                     break;
 
                 case HAS_MODULE_INFO: {
+                    if (msg.arg1 != statusGeneration)
+                        return;
+                    applyModuleInfo((ModuleInfo) msg.obj);
                     binding.swipeRefreshLayout.setRefreshing(false);
                     binding.freezeitLogo.setVisibility(View.VISIBLE);
                     binding.realtimeLayout.setVisibility(View.VISIBLE);
@@ -354,13 +492,15 @@ public class Home extends Fragment implements View.OnClickListener {
                 break;
 
                 case HANDLE_REALTIME_INFO:
-                    realTimeHandleFunc((byte[]) msg.obj);
+                    if (msg.arg1 == realTimeGeneration)
+                        realTimeHandleFunc((byte[]) msg.obj);
                     break;
             }
         }
     };
 
     private void cancelRealTimeTimer() {
+        realTimeGeneration++;
         if (timer != null) {
             timer.cancel();
             timer = null;
@@ -429,7 +569,7 @@ public class Home extends Fragment implements View.OnClickListener {
             StaticData.bitmap = Bitmap.createBitmap(StaticData.imgWidth, StaticData.imgHeight, Bitmap.Config.ARGB_8888);
 
         StaticData.bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(response, 0, imgBuffBytes));
-        binding.cpuImg.setImageBitmap(Utils.resize(StaticData.bitmap, StaticData.imgScale));
+        binding.cpuImg.setImageBitmap(StaticData.bitmap);
 
         int realTimeInfoByteLen = response.length - imgBuffBytes;
         if (realTimeInfoByteLen != 4 * realTimeInfoIntLen) {
@@ -484,8 +624,31 @@ public class Home extends Fragment implements View.OnClickListener {
         if (id == R.id.realtimeLayout) {
             startActivity(new Intent(requireContext(), AppTime.class));
         } else if (id == R.id.download_button) {
-            if (StaticData.zipUrl.length() > 2)
-                startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(StaticData.zipUrl)));
+            openDownload();
+        }
+    }
+
+    private void openDownload() {
+        Context context = getContext();
+        if (context == null)
+            return;
+
+        try {
+            Uri uri = Uri.parse(StaticData.zipUrl);
+            String scheme = uri.getScheme();
+            if (uri.getHost() == null || (!"https".equalsIgnoreCase(scheme) &&
+                    !"http".equalsIgnoreCase(scheme))) {
+                Toast.makeText(context, R.string.update_fail, Toast.LENGTH_LONG).show();
+                return;
+            }
+            Intent intent = new Intent(Intent.ACTION_VIEW, uri);
+            if (intent.resolveActivity(context.getPackageManager()) == null) {
+                Toast.makeText(context, R.string.update_fail, Toast.LENGTH_LONG).show();
+                return;
+            }
+            startActivity(intent);
+        } catch (ActivityNotFoundException | SecurityException | IllegalArgumentException e) {
+            Toast.makeText(context, R.string.update_fail, Toast.LENGTH_LONG).show();
         }
     }
 

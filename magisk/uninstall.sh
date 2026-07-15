@@ -10,19 +10,32 @@ wait_until_login() {
     # we doesn't have the permission to rw "/sdcard" before the user unlocks the screen
     # shellcheck disable=SC2039
     local test_file="/sdcard/Android/.PERMISSION_TEST_FREEZEIT"
-    true >"$test_file"
-    while [ ! -f "$test_file" ]; do
-        true >"$test_file"
+    while :; do
+        rm -f "$test_file" 2>/dev/null
+        if [ -e "$test_file" ]; then
+            sleep 1
+            continue
+        fi
+
+        if true >"$test_file" 2>/dev/null &&
+                [ -f "$test_file" ] &&
+                rm -f "$test_file" 2>/dev/null &&
+                [ ! -e "$test_file" ]; then
+            break
+        fi
+
+        rm -f "$test_file" 2>/dev/null
         sleep 1
     done
-    rm "$test_file"
 }
 
 remove_freezeit(){
     wait_until_login
 
     pm uninstall io.github.jark006.freezeit
-    rm -rf /sdcard/Android/freezeit*
+    rm -f /sdcard/Android/.PERMISSION_TEST_FREEZEIT
+    rm -f /sdcard/Android/freezeit_crash_log.txt
+    rm -f /sdcard/Android/freezeit.log
 }
 
 (remove_freezeit &)

@@ -1,10 +1,11 @@
 package io.github.jark006.freezeit.hook;
 
-import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 public final class HookHealthRegistry {
-    private static final Map<String, HookHealth> HOOKS = new LinkedHashMap<>();
+    private static final Map<String, HookHealth> HOOKS = new ConcurrentHashMap<>();
     private static String scope = "uninitialized";
     private static String process = "unknown";
 
@@ -51,8 +52,15 @@ public final class HookHealthRegistry {
         get(hookId).fail("registration", error);
     }
 
-    public static synchronized void recordRuntimeInvocation(String hookId) {
-        get(hookId).runtimeInvocations++;
+    public static void recordRuntimeInvocation(String hookId) {
+        HookHealth health = HOOKS.get(hookId);
+        if (health != null) {
+            health.runtimeInvocations.incrementAndGet();
+        }
+    }
+
+    public static synchronized void recordRuntimeFailure(String hookId, Throwable error) {
+        get(hookId).fail("runtime", error);
     }
 
     public static synchronized boolean hasSuccessfulRegistration(String hookId) {
@@ -83,7 +91,7 @@ public final class HookHealthRegistry {
             hooks.append(health.toJson());
             degraded |= health.critical && health.failureStage != null;
             registered += health.registered;
-            runtimeInvocations += health.runtimeInvocations;
+            runtimeInvocations += health.runtimeInvocations.get();
         }
         hooks.append(']');
         return "{"
@@ -114,8 +122,43 @@ public final class HookHealthRegistry {
 
     private static String escape(String value) {
         if (value == null) return "";
-        return value.replace("\\", "\\\\").replace("\"", "\\\"")
-                .replace("\n", "\\n").replace("\r", "\\r");
+        StringBuilder escaped = new StringBuilder(value.length() + 16);
+        for (int index = 0; index < value.length(); index++) {
+            char character = value.charAt(index);
+            switch (character) {
+                case '\b':
+                    escaped.append("\\b");
+                    break;
+                case '\t':
+                    escaped.append("\\t");
+                    break;
+                case '\n':
+                    escaped.append("\\n");
+                    break;
+                case '\f':
+                    escaped.append("\\f");
+                    break;
+                case '\r':
+                    escaped.append("\\r");
+                    break;
+                case '\"':
+                    escaped.append("\\\"");
+                    break;
+                case '\\':
+                    escaped.append("\\\\");
+                    break;
+                default:
+                    if (character < 0x20) {
+                        escaped.append("\\u00")
+                                .append(Character.forDigit((character >>> 4) & 0x0f, 16))
+                                .append(Character.forDigit(character & 0x0f, 16));
+                    } else {
+                        escaped.append(character);
+                    }
+                    break;
+            }
+        }
+        return escaped.toString();
     }
 
     private static String safeIdentity(String value, String fallback) {
@@ -128,7 +171,7 @@ public final class HookHealthRegistry {
         private int classResolved;
         private int methodMatched;
         private int registered;
-        private long runtimeInvocations;
+        private final AtomicLong runtimeInvocations = new AtomicLong();
         private String failureStage;
         private String errorType;
         private String errorMessage;
@@ -157,7 +200,7 @@ public final class HookHealthRegistry {
                     + "\"class_resolved\":" + classResolved + ','
                     + "\"method_matched\":" + methodMatched + ','
                     + "\"registered\":" + registered + ','
-                    + "\"runtime_invocations\":" + runtimeInvocations + ','
+                    + "\"runtime_invocations\":" + runtimeInvocations.get() + ','
                     + "\"stage\":\"" + escape(failureStage) + "\","
                     + "\"error_type\":\"" + escape(errorType) + "\","
                     + "\"error_message\":\"" + escape(errorMessage) + "\""

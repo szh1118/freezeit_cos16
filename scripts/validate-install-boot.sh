@@ -8,20 +8,38 @@ HOST="${FREEZEIT_HOST:-127.0.0.1}"
 PORT="${FREEZEIT_PORT:-60613}"
 
 if [ -n "$SERIAL_ARG" ] && command -v "$ADB" >/dev/null 2>&1; then
-    ADB_CMD="$ADB -s $SERIAL_ARG shell"
+    USE_ADB=1
 elif command -v getprop >/dev/null 2>&1; then
-    ADB_CMD=""
+    USE_ADB=0
 else
-    ADB_CMD="$ADB shell"
+    USE_ADB=1
 fi
 
 run_device() {
-    if [ -n "$ADB_CMD" ]; then
-        # shellcheck disable=SC2086
-        $ADB_CMD "$1"
+    if [ "$USE_ADB" -eq 1 ]; then
+        if [ -n "$SERIAL_ARG" ]; then
+            "$ADB" -s "$SERIAL_ARG" shell "$1"
+        else
+            "$ADB" shell "$1"
+        fi
     else
         sh -c "$1"
     fi
+}
+
+shell_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+run_root_script() {
+    root_script=$1
+    shift
+
+    root_command="sh -c $(shell_quote "$root_script") sh"
+    for root_arg in "$@"; do
+        root_command="$root_command $(shell_quote "$root_arg")"
+    done
+    run_device "su -c $(shell_quote "$root_command")"
 }
 
 echo "freezeit install boot validation"
@@ -29,37 +47,48 @@ echo "timestamp=$(date '+%Y-%m-%d %H:%M:%S')"
 echo "boot_completed=$(run_device 'getprop sys.boot_completed')"
 echo "module_dir=$MODDIR"
 
-if [ "$(run_device "su -c 'test -d \"$MODDIR\" && echo present || echo missing'")" != "present" ]; then
+# shellcheck disable=SC2016
+if run_root_script 'test -d "$1"' "$MODDIR"; then
+    echo "module_dir=present"
+else
     echo "module_dir=missing"
     exit 1
 fi
 
-if [ "$(run_device "su -c 'test -e \"$MODDIR/disable\" -o -e \"$MODDIR/remove\" && echo blocked || echo enabled'")" = "blocked" ]; then
+# shellcheck disable=SC2016
+if run_root_script 'test -e "$1/disable" || test -e "$1/remove"' "$MODDIR"; then
     echo "module_state=disabled_or_remove_pending"
     exit 1
 fi
 
-if [ "$(run_device "su -c 'test -x \"$MODDIR/freezeit\" && echo executable || echo missing'")" = "executable" ]; then
+# shellcheck disable=SC2016
+if run_root_script 'test -x "$1/freezeit"' "$MODDIR"; then
     echo "daemon_binary=executable"
 else
     echo "daemon_binary=missing_or_not_executable"
     exit 1
 fi
 
-if [ "$(run_device "command -v nc >/dev/null 2>&1 && echo present || echo missing")" = "present" ]; then
-    if [ "$(run_device "nc -z '$HOST' '$PORT' >/dev/null 2>&1 && echo reachable || echo unreachable")" = "reachable" ]; then
-        echo "daemon_socket=reachable"
-    else
-        echo "daemon_socket=unreachable"
-        exit 1
-    fi
-else
-    echo "daemon_socket=not_checked_nc_missing"
+if [ "$(run_device 'command -v nc >/dev/null 2>&1 && echo present || echo missing')" != "present" ]; then
+    echo "daemon_socket=check_failed_nc_missing"
+    exit 1
 fi
 
-if [ "$(run_device "su -c 'test -f \"$MODDIR/boot.log\" && echo present || echo missing'")" = "present" ]; then
+remote_host="$(shell_quote "$HOST")"
+remote_port="$(shell_quote "$PORT")"
+if [ "$(run_device "nc -z $remote_host $remote_port >/dev/null 2>&1 && echo reachable || echo unreachable")" = "reachable" ]; then
+    echo "daemon_socket=reachable"
+else
+    echo "daemon_socket=unreachable"
+    exit 1
+fi
+
+# shellcheck disable=SC2016
+if run_root_script 'test -f "$1/boot.log"' "$MODDIR"; then
     echo "boot_log=present"
-    run_device "su -c 'tail -n 20 \"$MODDIR/boot.log\"'"
+    # shellcheck disable=SC2016
+    run_root_script 'tail -n 20 "$1/boot.log"' "$MODDIR"
 else
     echo "boot_log=missing"
+    exit 1
 fi

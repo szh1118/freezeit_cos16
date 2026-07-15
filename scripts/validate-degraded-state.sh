@@ -1,16 +1,15 @@
-#!/system/bin/sh
+#!/usr/bin/env sh
 set -eu
 
 SERIAL_ARG="${1:-}"
 ADB="${ADB:-adb}"
 
-if [ -n "$SERIAL_ARG" ]; then
-  ADB="$ADB -s $SERIAL_ARG"
-fi
-
 run_shell() {
-  # shellcheck disable=SC2086
-  $ADB shell "$1"
+  if [ -n "$SERIAL_ARG" ]; then
+    "$ADB" -s "$SERIAL_ARG" shell "$1"
+  else
+    "$ADB" shell "$1"
+  fi
 }
 
 echo "== freezeit degraded-state read-only validation =="

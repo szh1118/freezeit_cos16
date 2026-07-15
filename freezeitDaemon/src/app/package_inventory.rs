@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 
 use crate::domain::policy::{ManagedApp, ProtectedReason};
 
+const ANDROID_PER_USER_RANGE: u32 = 100_000;
+const ANDROID_FIRST_APPLICATION_UID: u32 = 10_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageRecord {
     pub package_name: String,
@@ -26,13 +29,13 @@ pub fn parse_cmd_package_list(output: &str) -> Vec<PackageRecord> {
             let line = line.trim();
             let package = line.strip_prefix("package:")?;
             let (package_name, uid_text) = package.split_once(" uid:")?;
-            let uid = uid_text.parse().ok()?;
+            let uid = uid_text.split_whitespace().next()?.parse::<u32>().ok()?;
             Some(PackageRecord {
                 package_name: package_name.to_owned(),
-                user_id: 0,
+                user_id: uid / ANDROID_PER_USER_RANGE,
                 uid,
                 label: package_name.to_owned(),
-                is_system_app: false,
+                is_system_app: uid % ANDROID_PER_USER_RANGE < ANDROID_FIRST_APPLICATION_UID,
             })
         })
         .collect()
@@ -131,4 +134,30 @@ pub fn reconcile_uid(app: &ManagedApp, current: &PackageRecord) -> Result<(), St
         return Err("uid changed; package inventory reconciliation required".to_owned());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parser_derives_android_user_and_system_app_id() {
+        let records = parse_cmd_package_list(
+            "package:com.example.app uid:10123\npackage:com.example.app uid:1010123\npackage:com.android.settings uid:1000\n",
+        );
+
+        assert_eq!(records[0].user_id, 0);
+        assert_eq!(records[1].user_id, 10);
+        assert!(records[2].is_system_app);
+
+        let inventory = build_inventory(records);
+        assert!(inventory.contains_key(&("com.example.app".to_owned(), 0)));
+        assert!(inventory.contains_key(&("com.example.app".to_owned(), 10)));
+        assert_eq!(
+            inventory
+                .get(&("com.android.settings".to_owned(), 0))
+                .and_then(|app| app.protected_reason),
+            Some(ProtectedReason::SystemCritical)
+        );
+    }
 }

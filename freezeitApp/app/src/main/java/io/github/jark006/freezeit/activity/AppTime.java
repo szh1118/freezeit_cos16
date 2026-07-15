@@ -14,6 +14,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ImageView;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
@@ -32,10 +33,14 @@ import io.github.jark006.freezeit.StaticData;
 import io.github.jark006.freezeit.Utils;
 
 public class AppTime extends AppCompatActivity {
+    private static final String TAG = "Freezeit[AppTime]";
+    private static final int UPDATE_DATA_SET = 1;
+    private static final int STATUS_REQUEST_FAILED = 2;
+
     FreezeStatusAdapter recycleAdapter = new FreezeStatusAdapter();
     Timer timer;
-    final int UPDATE_DATA_SET = 1;
-
+    private int statusGeneration;
+    private boolean hasShownStatusError;
     @SuppressLint("MissingInflatedId")
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -72,11 +77,13 @@ public class AppTime extends AppCompatActivity {
     @Override
     public void onPause() {
         super.onPause();
+        statusGeneration++;
         if (timer != null) {
             timer.cancel();
             timer = null;
         }
         handler.removeMessages(UPDATE_DATA_SET);
+        handler.removeMessages(STATUS_REQUEST_FAILED);
     }
 
     @Override
@@ -86,20 +93,27 @@ public class AppTime extends AppCompatActivity {
 
         if (timer != null)
             timer.cancel();
-        timer = new Timer();
-        timer.schedule(new TimerTask() {
+        hasShownStatusError = false;
+        final int generation = ++statusGeneration;
+        Timer pollTimer = new Timer();
+        timer = pollTimer;
+        pollTimer.schedule(new TimerTask() {
             @Override
             public void run() {
                 Utils.TaskResult result = Utils.freezeitTaskResult(ManagerCmd.getFreezeStatus, null);
 
                 // 每行状态为5个int32 [0-4]:[uid foreground state seconds processCount], 共20字节
-                if (result.length() == 0 || result.length() % FreezeStatusAdapter.ROW_BYTE_LEN != 0) {
-                    handler.sendMessage(Message.obtain(handler, UPDATE_DATA_SET, new int[0]));
+                // 用 success() 区分 RPC 失败（守护进程未运行/超时，length()==0 但非合法空）
+                // 与合法状态；失败时提示而非清空列表。
+                if (!result.success() || result.length() % FreezeStatusAdapter.ROW_BYTE_LEN != 0) {
+                    handler.sendMessage(Message.obtain(handler, STATUS_REQUEST_FAILED,
+                            generation, 0, null));
                     return;
                 }
                 int[] statusRows = new int[result.length() / 4];
                 Utils.Byte2Int(result.payload(), 0, result.length(), statusRows, 0);
-                handler.sendMessage(Message.obtain(handler, UPDATE_DATA_SET, statusRows));
+                handler.sendMessage(Message.obtain(handler, UPDATE_DATA_SET,
+                        generation, 0, statusRows));
             }
         }, 0, 2000);
     }
@@ -109,11 +123,18 @@ public class AppTime extends AppCompatActivity {
         @Override
         public void handleMessage(@NonNull Message msg) {
             super.handleMessage(msg);
-            if (msg.what == UPDATE_DATA_SET)
+            if (msg.arg1 != statusGeneration)
+                return;
+
+            if (msg.what == UPDATE_DATA_SET) {
+                hasShownStatusError = false;
                 recycleAdapter.updateDataSet((int[]) msg.obj);
+            } else if (msg.what == STATUS_REQUEST_FAILED && !hasShownStatusError) {
+                hasShownStatusError = true;
+                Toast.makeText(AppTime.this, R.string.no_response, Toast.LENGTH_SHORT).show();
+            }
         }
     };
-
 
     static class FreezeStatusAdapter extends RecyclerView.Adapter<FreezeStatusAdapter.MyViewHolder> {
         static final int ROW_INT_LEN = 5;
@@ -142,15 +163,13 @@ public class AppTime extends AppCompatActivity {
             position *= ROW_INT_LEN;
             final int uid = statusRows[position];
 
-            if (holder.uid != uid) {
-                holder.uid = uid;
-                var info = AppInfoCache.get(uid);
-                if (info != null) {
-                    holder.app_icon.setImageDrawable(info.icon);
-                    holder.app_label.setText(info.label);
-                } else {
-                    holder.app_label.setText(String.valueOf(uid));
-                }
+            var info = AppInfoCache.get(uid);
+            if (info != null) {
+                holder.app_icon.setImageDrawable(info.icon);
+                holder.app_label.setText(info.label);
+            } else {
+                holder.app_icon.setImageDrawable(null);
+                holder.app_label.setText(String.valueOf(uid));
             }
 
             final Context context = holder.itemView.getContext();
@@ -255,8 +274,11 @@ public class AppTime extends AppCompatActivity {
                         statusRows[i + 1] == newStatusRows[i + 1] &&
                         statusRows[i + 2] == newStatusRows[i + 2] &&
                         statusRows[i + 3] == newStatusRows[i + 3] &&
-                        statusRows[i + 4] == newStatusRows[i + 4])
+                        statusRows[i + 4] == newStatusRows[i + 4]) {
+                    // Rebind unchanged rows so a cache refresh can replace a UID fallback.
+                    notifyItemChanged(i / ROW_INT_LEN);
                     continue;
+                }
                 statusRows[i] = newStatusRows[i];
                 statusRows[i + 1] = newStatusRows[i + 1];
                 statusRows[i + 2] = newStatusRows[i + 2];
@@ -270,8 +292,6 @@ public class AppTime extends AppCompatActivity {
 
             ImageView app_icon;
             TextView app_label, state, time;
-            int uid = 0;
-
             public MyViewHolder(View view) {
                 super(view);
 

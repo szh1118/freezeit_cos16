@@ -3,7 +3,12 @@ use crate::app::error::DaemonError;
 pub const XPOSED_SOCKET_NAME: &str = "\0FreezeitXposedServer";
 pub const FREEZEIT_COMMAND_BASE: i32 = 1_359_322_925;
 pub const HEADER_LEN: usize = 8;
+/// Legacy upper bound for raw bridge responses such as the Xposed log.
 pub const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
+/// FreezeitService allocates a 128 KiB request buffer and rejects payloadLen
+/// >= its length. Keep Rust's framed request limit one byte below it.
+pub const MAX_REQUEST_PAYLOAD_LEN: usize = 128 * 1024 - 1;
+const MAX_HEALTH_JSON_NESTING: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
@@ -82,12 +87,208 @@ pub fn classify_bridge_error(error: &DaemonError) -> HookBridgeStatus {
 }
 
 pub fn classify_hook_health_payload(payload: &str) -> HookBridgeStatus {
-    if payload.contains("\"status\":\"active\"") {
-        HookBridgeStatus::Active
-    } else if payload.contains("\"status\":\"degraded\"") {
-        HookBridgeStatus::Degraded(payload.to_owned())
-    } else {
-        HookBridgeStatus::Degraded(format!("unrecognized hook health payload: {payload}"))
+    // Modern hook reports intentionally keep the aggregate `status` degraded
+    // when optional scopes are unavailable. The control-relevant value is the
+    // explicit top-level system_control_status. Older hooks only expose status.
+    let status = match top_level_json_string_field(payload, "system_control_status") {
+        Ok(Some(status)) => Some(status),
+        Ok(None) => match top_level_json_string_field(payload, "status") {
+            Ok(status) => status,
+            Err(()) => {
+                return HookBridgeStatus::Degraded(format!(
+                    "unrecognized hook health payload: {payload}"
+                ));
+            }
+        },
+        Err(()) => {
+            return HookBridgeStatus::Degraded(format!(
+                "unrecognized hook health payload: {payload}"
+            ));
+        }
+    };
+
+    match status.as_deref() {
+        Some("active") => HookBridgeStatus::Active,
+        Some("degraded") | Some("inactive") | Some("missing") => {
+            HookBridgeStatus::Degraded(payload.to_owned())
+        }
+        _ => HookBridgeStatus::Degraded(format!("unrecognized hook health payload: {payload}")),
+    }
+}
+
+fn top_level_json_string_field(payload: &str, field: &str) -> Result<Option<String>, ()> {
+    let bytes = payload.as_bytes();
+    let mut index = 0;
+    skip_json_whitespace(bytes, &mut index);
+    if bytes.get(index) != Some(&b'{') {
+        return Err(());
+    }
+    index += 1;
+    let mut value = None;
+
+    loop {
+        skip_json_whitespace(bytes, &mut index);
+        if bytes.get(index) == Some(&b'}') {
+            index += 1;
+            skip_json_whitespace(bytes, &mut index);
+            return (index == bytes.len()).then_some(value).ok_or(());
+        }
+
+        let key = parse_json_string(bytes, &mut index)?;
+        skip_json_whitespace(bytes, &mut index);
+        if bytes.get(index) != Some(&b':') {
+            return Err(());
+        }
+        index += 1;
+        skip_json_whitespace(bytes, &mut index);
+        if key == field {
+            value = Some(parse_json_string(bytes, &mut index)?);
+        } else {
+            skip_json_value(bytes, &mut index, 0)?;
+        }
+
+        skip_json_whitespace(bytes, &mut index);
+        match bytes.get(index) {
+            Some(b',') => index += 1,
+            Some(b'}') => {
+                index += 1;
+                skip_json_whitespace(bytes, &mut index);
+                return (index == bytes.len()).then_some(value).ok_or(());
+            }
+            _ => return Err(()),
+        }
+    }
+}
+
+fn skip_json_value(bytes: &[u8], index: &mut usize, depth: usize) -> Result<(), ()> {
+    skip_json_whitespace(bytes, index);
+    match bytes.get(*index).copied() {
+        Some(b'"') => {
+            let _ = parse_json_string(bytes, index)?;
+            Ok(())
+        }
+        Some(b'{') => {
+            if depth >= MAX_HEALTH_JSON_NESTING {
+                return Err(());
+            }
+            *index += 1;
+            skip_json_whitespace(bytes, index);
+            if bytes.get(*index) == Some(&b'}') {
+                *index += 1;
+                return Ok(());
+            }
+            loop {
+                let _ = parse_json_string(bytes, index)?;
+                skip_json_whitespace(bytes, index);
+                if bytes.get(*index) != Some(&b':') {
+                    return Err(());
+                }
+                *index += 1;
+                skip_json_value(bytes, index, depth + 1)?;
+                skip_json_whitespace(bytes, index);
+                match bytes.get(*index) {
+                    Some(b',') => *index += 1,
+                    Some(b'}') => {
+                        *index += 1;
+                        return Ok(());
+                    }
+                    _ => return Err(()),
+                }
+                skip_json_whitespace(bytes, index);
+            }
+        }
+        Some(b'[') => {
+            if depth >= MAX_HEALTH_JSON_NESTING {
+                return Err(());
+            }
+            *index += 1;
+            skip_json_whitespace(bytes, index);
+            if bytes.get(*index) == Some(&b']') {
+                *index += 1;
+                return Ok(());
+            }
+            loop {
+                skip_json_value(bytes, index, depth + 1)?;
+                skip_json_whitespace(bytes, index);
+                match bytes.get(*index) {
+                    Some(b',') => *index += 1,
+                    Some(b']') => {
+                        *index += 1;
+                        return Ok(());
+                    }
+                    _ => return Err(()),
+                }
+                skip_json_whitespace(bytes, index);
+            }
+        }
+        Some(b't') => consume_json_literal(bytes, index, b"true"),
+        Some(b'f') => consume_json_literal(bytes, index, b"false"),
+        Some(b'n') => consume_json_literal(bytes, index, b"null"),
+        Some(b'-' | b'0'..=b'9') => {
+            let start = *index;
+            while matches!(
+                bytes.get(*index),
+                Some(b'0'..=b'9' | b'+' | b'-' | b'.' | b'e' | b'E')
+            ) {
+                *index += 1;
+            }
+            (start != *index).then_some(()).ok_or(())
+        }
+        _ => Err(()),
+    }
+}
+
+fn consume_json_literal(bytes: &[u8], index: &mut usize, literal: &[u8]) -> Result<(), ()> {
+    let end = index.checked_add(literal.len()).ok_or(())?;
+    if bytes.get(*index..end) != Some(literal) {
+        return Err(());
+    }
+    *index = end;
+    Ok(())
+}
+
+fn parse_json_string(bytes: &[u8], index: &mut usize) -> Result<String, ()> {
+    if bytes.get(*index) != Some(&b'"') {
+        return Err(());
+    }
+    *index += 1;
+    let mut value = String::new();
+    while let Some(byte) = bytes.get(*index).copied() {
+        *index += 1;
+        match byte {
+            b'"' => return Ok(value),
+            b'\\' => {
+                let escaped = bytes.get(*index).copied().ok_or(())?;
+                *index += 1;
+                match escaped {
+                    b'"' | b'\\' | b'/' => value.push(escaped as char),
+                    b'b' => value.push('\u{0008}'),
+                    b'f' => value.push('\u{000c}'),
+                    b'n' => value.push('\n'),
+                    b'r' => value.push('\r'),
+                    b't' => value.push('\t'),
+                    b'u' => {
+                        let end = index.checked_add(4).ok_or(())?;
+                        let hex = bytes.get(*index..end).ok_or(())?;
+                        if !hex.iter().all(u8::is_ascii_hexdigit) {
+                            return Err(());
+                        }
+                        *index = end;
+                        value.push('?');
+                    }
+                    _ => return Err(()),
+                }
+            }
+            0..=0x1f => return Err(()),
+            other => value.push(other as char),
+        }
+    }
+    Err(())
+}
+
+fn skip_json_whitespace(bytes: &[u8], index: &mut usize) {
+    while matches!(bytes.get(*index), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+        *index += 1;
     }
 }
 
@@ -141,7 +342,7 @@ pub fn parse_frame(bytes: &[u8]) -> Result<XposedFrame, DaemonError> {
     }
 
     let payload_len = payload_len as usize;
-    if payload_len > MAX_PAYLOAD_LEN {
+    if payload_len > MAX_REQUEST_PAYLOAD_LEN {
         return Err(DaemonError::protocol("xposed frame payload is too large"));
     }
 
@@ -160,7 +361,7 @@ pub fn parse_frame(bytes: &[u8]) -> Result<XposedFrame, DaemonError> {
 }
 
 pub fn encode_frame(command: XposedCommand, payload: &[u8]) -> Result<Vec<u8>, DaemonError> {
-    if payload.len() > MAX_PAYLOAD_LEN {
+    if payload.len() > MAX_REQUEST_PAYLOAD_LEN {
         return Err(DaemonError::protocol("xposed frame payload is too large"));
     }
 
@@ -169,4 +370,57 @@ pub fn encode_frame(command: XposedCommand, payload: &[u8]) -> Result<Vec<u8>, D
     bytes.extend_from_slice(&(payload.len() as i32).to_le_bytes());
     bytes.extend_from_slice(payload);
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_hook_status_is_not_overridden_by_nested_active_hook_status() {
+        let payload = r#"{"status":"degraded","system_control_status":"degraded","hooks":[{"status":"active"}]}"#;
+
+        assert!(matches!(
+            classify_hook_health_payload(payload),
+            HookBridgeStatus::Degraded(_)
+        ));
+    }
+
+    #[test]
+    fn system_control_status_takes_priority_over_aggregate_status() {
+        let payload = r#"{"status":"degraded","system_control_status":"active","hooks":[{"status":"degraded"}]}"#;
+
+        assert_eq!(
+            classify_hook_health_payload(payload),
+            HookBridgeStatus::Active
+        );
+    }
+
+    #[test]
+    fn excessively_nested_hook_health_payload_fails_closed() {
+        let nesting = 80;
+        let payload = format!(
+            "{{\"system_control_status\":\"active\",\"nested\":{}0{}}}",
+            "[".repeat(nesting),
+            "]".repeat(nesting)
+        );
+
+        assert!(matches!(
+            classify_hook_health_payload(&payload),
+            HookBridgeStatus::Degraded(_)
+        ));
+    }
+
+    #[test]
+    fn rejects_frames_that_the_java_hook_buffer_cannot_accept() {
+        let payload = vec![0_u8; 128 * 1024];
+
+        assert!(encode_frame(XposedCommand::SetConfig, &payload).is_err());
+    }
+
+    #[test]
+    fn request_limit_does_not_shrink_the_legacy_bridge_response_budget() {
+        assert_eq!(MAX_REQUEST_PAYLOAD_LEN, 128 * 1024 - 1);
+        assert_eq!(MAX_PAYLOAD_LEN, 1024 * 1024);
+    }
 }

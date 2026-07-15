@@ -2,8 +2,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-EXPECTED_VERSION="${EXPECTED_VERSION:-3.3.3SelfUse}"
-EXPECTED_VERSION_CODE="${EXPECTED_VERSION_CODE:-303003}"
+module_prop() {
+  awk -F= -v key="$1" '$1 == key {print substr($0, index($0, "=") + 1); exit}' "$ROOT/magisk/module.prop"
+}
+EXPECTED_VERSION="${EXPECTED_VERSION:-$(module_prop version)}"
+EXPECTED_VERSION_CODE="${EXPECTED_VERSION_CODE:-$(module_prop versionCode)}"
 RELEASE_KIND="${RELEASE_KIND:-released}"
 ALLOW_DIRTY="${ALLOW_DIRTY:-0}"
 BUILD_SESSION_ROOT="${BUILD_SESSION_ROOT:-$ROOT/.release-staging}"
@@ -13,14 +16,17 @@ APK_OUTPUT_DIR="$ROOT/freezeitApp/app/build/outputs/apk/release"
 fail() { echo "release build failed: $*" >&2; exit 1; }
 [[ "$RELEASE_KIND" == released || "$RELEASE_KIND" == candidate ]] \
   || fail "RELEASE_KIND must be released or candidate"
+initial_dirty_status="$(git -C "$ROOT" status --porcelain=v1 --untracked-files=all)"
+if [[ -n "$initial_dirty_status" ]]; then
+  [[ "$RELEASE_KIND" == candidate && "$ALLOW_DIRTY" == 1 ]] \
+    || fail "working tree is dirty; only RELEASE_KIND=candidate ALLOW_DIRTY=1 may build it"
+fi
 if [[ "$RELEASE_KIND" == released ]]; then
   [[ -n "${FREEZEIT_EXPECTED_APK_SIGNER_SHA256:-}" ]] \
     || fail "RELEASE_KIND=released requires FREEZEIT_EXPECTED_APK_SIGNER_SHA256"
   normalized_signer="$(printf '%s' "$FREEZEIT_EXPECTED_APK_SIGNER_SHA256" | tr -d '[:space:]:' | tr '[:upper:]' '[:lower:]')"
   [[ "$normalized_signer" =~ ^[0-9a-f]{64}$ ]] \
     || fail "FREEZEIT_EXPECTED_APK_SIGNER_SHA256 must be a SHA-256 certificate digest"
-  [[ -z "$(git -C "$ROOT" status --porcelain=v1 --untracked-files=all)" ]] \
-    || fail "RELEASE_KIND=released requires a clean working tree"
 fi
 
 start_commit="$(git -C "$ROOT" rev-parse HEAD)"
@@ -67,6 +73,8 @@ format=freezeit-build-session-v1
 sessionId=$session_id
 gitCommit=$end_commit
 releaseKind=$RELEASE_KIND
+version=$EXPECTED_VERSION
+versionCode=$EXPECTED_VERSION_CODE
 daemonPath=$daemon_path
 daemonSha256=$daemon_sha
 apkPath=$apk_path

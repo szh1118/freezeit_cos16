@@ -8,7 +8,7 @@ use crate::{
         legacy_timestamped_line, operation_is_legacy_info, operation_to_debug_text,
         operation_to_legacy_text,
     },
-    domain::operation::ControlOperation,
+    domain::operation::{ControlOperation, OperationResult},
 };
 
 pub const LOG_LEVEL_SETTING_INDEX: usize = 30;
@@ -98,7 +98,7 @@ impl LogRecord {
 
     pub fn operation(operation: ControlOperation) -> Self {
         Self {
-            level: LogLevel::Info,
+            level: operation_log_level(&operation),
             category: LogCategory::LegacyOperation,
             timestamp_ms: operation.timestamp_ms,
             payload: LogPayload::Operation(operation),
@@ -124,6 +124,8 @@ pub struct ManagerLog {
     capacity: usize,
     records: VecDeque<LogRecord>,
     highest_operation_id: u64,
+    operation_timestamp_cutoff_ms: Option<u128>,
+    content_version: u64,
 }
 
 impl ManagerLog {
@@ -132,11 +134,19 @@ impl ManagerLog {
             capacity: capacity.max(1),
             records: VecDeque::new(),
             highest_operation_id: 0,
+            operation_timestamp_cutoff_ms: None,
+            content_version: 0,
         }
     }
 
     pub fn push(&mut self, record: LogRecord) {
         if let LogPayload::Operation(operation) = &record.payload {
+            if self
+                .operation_timestamp_cutoff_ms
+                .is_some_and(|cutoff| operation.timestamp_ms <= cutoff)
+            {
+                return;
+            }
             if operation.operation_id != 0 {
                 if operation.operation_id <= self.highest_operation_id {
                     return;
@@ -160,6 +170,7 @@ impl ManagerLog {
             self.records.pop_front();
         }
         self.records.push_back(record);
+        self.bump_content_version();
     }
 
     pub fn push_once(&mut self, record: LogRecord) {
@@ -174,11 +185,24 @@ impl ManagerLog {
     }
 
     pub fn clear(&mut self) {
+        self.operation_timestamp_cutoff_ms = Some(now_ms());
+        let had_records = !self.records.is_empty();
         self.records.clear();
+        if had_records {
+            self.bump_content_version();
+        }
     }
 
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
+    }
+
+    /// Monotonically advances whenever the rendered record buffer changes.
+    ///
+    /// The legacy manager protocol currently compares only response lengths, so callers that
+    /// can negotiate a version-aware response can use this to detect same-length replacements.
+    pub fn content_version(&self) -> u64 {
+        self.content_version
     }
 
     pub fn render(&self, view: LogView) -> String {
@@ -187,6 +211,10 @@ impl ManagerLog {
             .filter(|record| record_is_visible(record, view))
             .map(|record| render_record(record, view))
             .collect()
+    }
+
+    fn bump_content_version(&mut self) {
+        self.content_version = self.content_version.saturating_add(1);
     }
 }
 
@@ -212,6 +240,16 @@ fn record_is_visible(record: &LogRecord, view: LogView) -> bool {
         LogView::Error => matches!(record.level, LogLevel::Error | LogLevel::Critical),
         LogView::Critical => record.level == LogLevel::Critical,
         LogView::Debug => true,
+    }
+}
+
+fn operation_log_level(operation: &ControlOperation) -> LogLevel {
+    match operation.result {
+        OperationResult::Partial => LogLevel::Warn,
+        OperationResult::Failed => LogLevel::Error,
+        OperationResult::Success | OperationResult::Skipped | OperationResult::Postponed => {
+            LogLevel::Info
+        }
     }
 }
 
@@ -289,4 +327,108 @@ fn now_ms() -> u128 {
 
 pub fn startup_message() -> LogRecord {
     LogRecord::diagnostic(LogLevel::Debug, now_ms(), "freezeit daemon starting")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::operation::{ControlAction, OperationResult};
+
+    fn operation(
+        operation_id: u64,
+        timestamp_ms: u128,
+        package_name: &str,
+        result: OperationResult,
+    ) -> ControlOperation {
+        ControlOperation {
+            operation_id,
+            timestamp_ms,
+            package_name: package_name.to_owned(),
+            uid: 10_123,
+            pid_list: vec![123],
+            action: ControlAction::Freeze,
+            backend: "cgroup.freeze".to_owned(),
+            reason: "control pass".to_owned(),
+            result,
+            details: String::new(),
+        }
+    }
+
+    #[test]
+    fn clear_rejects_operation_stamped_before_the_clear_boundary() {
+        let stale_timestamp = now_ms().saturating_sub(1);
+        let mut log = ManagerLog::new(8);
+        log.push(LogRecord::operation(operation(
+            1,
+            stale_timestamp,
+            "com.example.before",
+            OperationResult::Success,
+        )));
+
+        log.clear();
+        log.push(LogRecord::operation(operation(
+            2,
+            stale_timestamp,
+            "com.example.stale",
+            OperationResult::Success,
+        )));
+
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn clear_accepts_operation_stamped_after_the_clear_boundary() {
+        let mut log = ManagerLog::new(8);
+        log.clear();
+        let fresh_timestamp = log
+            .operation_timestamp_cutoff_ms
+            .expect("clear records an operation cutoff")
+            .saturating_add(1);
+
+        log.push(LogRecord::operation(operation(
+            1,
+            fresh_timestamp,
+            "com.example.fresh",
+            OperationResult::Success,
+        )));
+
+        assert!(log.render(LogView::Info).contains("com.example.fresh"));
+    }
+
+    #[test]
+    fn content_version_advances_for_equal_length_replacement() {
+        let mut log = ManagerLog::new(1);
+        log.push(LogRecord::legacy_text(1_000, "first"));
+        let first_length = log.render(LogView::Info).len();
+        let first_version = log.content_version();
+
+        log.push(LogRecord::legacy_text(2_000, "other"));
+
+        assert_eq!(log.render(LogView::Info).len(), first_length);
+        assert!(log.content_version() > first_version);
+    }
+
+    #[test]
+    fn partial_and_failed_operations_are_visible_in_severity_views() {
+        let mut log = ManagerLog::new(8);
+        log.push(LogRecord::operation(operation(
+            1,
+            1_000,
+            "com.example.partial",
+            OperationResult::Partial,
+        )));
+        log.push(LogRecord::operation(operation(
+            2,
+            2_000,
+            "com.example.failed",
+            OperationResult::Failed,
+        )));
+
+        let warnings = log.render(LogView::Warn);
+        assert!(warnings.contains("com.example.partial"));
+        assert!(warnings.contains("com.example.failed"));
+        assert!(!log.render(LogView::Error).contains("com.example.partial"));
+        assert!(log.render(LogView::Error).contains("com.example.failed"));
+        assert!(!log.render(LogView::Critical).contains("com.example.failed"));
+    }
 }

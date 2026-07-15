@@ -20,20 +20,72 @@ import io.github.jark006.freezeit.hook.XpUtils;
 public class OplusAthena {
     private static final String TAG = "Freezeit[OplusAthena]:";
     private static final String SIGNATURE_HOOK_ID = "athena#signature_selection";
+    private static final String INSTRUMENTATION_CLASS = "android.app.Instrumentation";
+    private static final String CALL_APPLICATION_ON_CREATE = "callApplicationOnCreate";
+    private static final int MAX_LOG_VALUE_LENGTH = 96;
+    private static final Object INSTALL_LOCK = new Object();
+
+    private static boolean athenaHooksInstalled;
+    private static boolean lifecycleHookRegistrationStarted;
 
     public static void Hook(ClassLoader classLoader) {
         HookHealthRegistry.declareHook(SIGNATURE_HOOK_ID, true);
-        AthenaIdentity identity = AthenaIdentity.read();
-        AthenaSignatureTable.Selection selection = AthenaSignatureTable.select(
-                identity.versionName, identity.apkSha256, identity.romFingerprint);
-        if (!selection.isHookingAllowed()) {
-            IllegalStateException failure = new IllegalStateException(selection.getReason());
-            HookHealthRegistry.recordRegistrationFailure(SIGNATURE_HOOK_ID, failure);
-            XpUtils.log(TAG, "Fail-closed: " + selection.getReason());
+        Application application = AthenaIdentity.currentApplication();
+        if (application == null) {
+            registerApplicationLifecycleHook(classLoader);
             return;
         }
-        HookHealthRegistry.recordRegistered(SIGNATURE_HOOK_ID);
-        AthenaSignatureTable.SignatureSet signatures = selection.getSignatureSet();
+
+        installAthenaHooks(classLoader, application);
+    }
+
+    private static void registerApplicationLifecycleHook(final ClassLoader classLoader) {
+        synchronized (INSTALL_LOCK) {
+            if (athenaHooksInstalled || lifecycleHookRegistrationStarted) return;
+            lifecycleHookRegistrationStarted = true;
+        }
+
+        boolean registered = hook(true, classLoader, new XpUtils.MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(XpUtils.MethodHookParam param) {
+                        if (param.args == null || param.args.length == 0
+                                || !(param.args[0] instanceof Application)) {
+                            XpUtils.log(TAG, "Application lifecycle callback has no Application argument");
+                            return;
+                        }
+                        installAthenaHooks(classLoader, (Application) param.args[0]);
+                    }
+                }, INSTRUMENTATION_CLASS, CALL_APPLICATION_ON_CREATE, Application.class);
+        if (!registered) {
+            synchronized (INSTALL_LOCK) {
+                lifecycleHookRegistrationStarted = false;
+            }
+            HookHealthRegistry.recordRegistrationFailure(SIGNATURE_HOOK_ID,
+                    new IllegalStateException("Cannot register Instrumentation.callApplicationOnCreate"));
+        }
+    }
+
+    private static void installAthenaHooks(ClassLoader classLoader, Application application) {
+        synchronized (INSTALL_LOCK) {
+            if (athenaHooksInstalled) return;
+
+            AthenaIdentity identity = AthenaIdentity.read(application);
+            AthenaSignatureTable.Selection selection = AthenaSignatureTable.select(
+                    identity.versionName, identity.apkSha256, identity.romFingerprint);
+            if (!selection.isHookingAllowed()) {
+                IllegalStateException failure = new IllegalStateException(selection.getReason());
+                HookHealthRegistry.recordRegistrationFailure(SIGNATURE_HOOK_ID, failure);
+                XpUtils.log(TAG, "Fail-closed: " + selection.getReason());
+                return;
+            }
+            HookHealthRegistry.recordRegistered(SIGNATURE_HOOK_ID);
+            athenaHooksInstalled = true;
+            installHookRegistrations(classLoader, selection.getSignatureSet());
+        }
+    }
+
+    private static void installHookRegistrations(ClassLoader classLoader,
+                                                 AthenaSignatureTable.SignatureSet signatures) {
 
         hookExternalClearStrategy(classLoader, signatures, Enum.Class.OplusForceStopStrategy);
         hookExternalClearStrategy(classLoader, signatures, Enum.Class.OplusKillPidStrategy);
@@ -150,9 +202,19 @@ public class OplusAthena {
 
     private static String describe(Object arg) {
         if (arg == null) return "null";
+        if (arg instanceof List<?>) {
+            return "List(size=" + ((List<?>) arg).size() + ')';
+        }
+        if (arg instanceof CharSequence) {
+            CharSequence value = (CharSequence) arg;
+            int length = value.length();
+            int prefixLength = Math.min(length, MAX_LOG_VALUE_LENGTH);
+            String prefix = value.subSequence(0, prefixLength).toString();
+            return length > prefixLength ? prefix + "..." : prefix;
+        }
         String value = String.valueOf(arg);
-        if (value.length() > 96) {
-            value = value.substring(0, 96) + "...";
+        if (value.length() > MAX_LOG_VALUE_LENGTH) {
+            value = value.substring(0, MAX_LOG_VALUE_LENGTH) + "...";
         }
         return value;
     }
@@ -173,21 +235,26 @@ public class OplusAthena {
             this.romFingerprint = romFingerprint;
         }
 
-        private static AthenaIdentity read() {
+        private static Application currentApplication() {
+            try {
+                return (Application) Class.forName("android.app.ActivityThread")
+                        .getDeclaredMethod("currentApplication").invoke(null);
+            } catch (Throwable error) {
+                XpUtils.log(TAG, "Cannot resolve current Athena Application: " + error);
+                return null;
+            }
+        }
+
+        private static AthenaIdentity read(Application application) {
             String versionName = "unknown";
             String apkSha256 = "unknown";
             try {
-                Class<?> activityThread = Class.forName("android.app.ActivityThread");
-                Application application = (Application) activityThread
-                        .getDeclaredMethod("currentApplication").invoke(null);
-                if (application != null) {
-                    PackageInfo packageInfo = application.getPackageManager()
-                            .getPackageInfo(Enum.Package.oplusAthena, 0);
-                    versionName = String.valueOf(packageInfo.versionName);
-                    ApplicationInfo applicationInfo = packageInfo.applicationInfo;
-                    if (applicationInfo != null) {
-                        apkSha256 = sha256(applicationInfo.sourceDir);
-                    }
+                PackageInfo packageInfo = application.getPackageManager()
+                        .getPackageInfo(Enum.Package.oplusAthena, 0);
+                versionName = String.valueOf(packageInfo.versionName);
+                ApplicationInfo applicationInfo = packageInfo.applicationInfo;
+                if (applicationInfo != null) {
+                    apkSha256 = sha256(applicationInfo.sourceDir);
                 }
             } catch (Throwable error) {
                 XpUtils.log(TAG, "Cannot resolve Athena APK identity: " + error);

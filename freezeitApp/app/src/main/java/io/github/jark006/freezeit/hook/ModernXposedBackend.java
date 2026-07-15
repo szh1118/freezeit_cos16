@@ -86,13 +86,27 @@ public class ModernXposedBackend implements XpUtils.HookBackend {
         Object[] args = chain.getArgs().toArray(new Object[0]);
         XpUtils.MethodHookParam param = new XpUtils.MethodHookParam(chain.getThisObject(), args);
 
-        callback.beforeHookedMethod(param);
-        if (param.hasThrowable()) throw param.getThrowable();
+        try {
+            callback.beforeHookedMethod(param);
+        } catch (Throwable error) {
+            HookHealthRegistry.recordRuntimeFailure(hookId, error);
+            throw error;
+        }
 
-        Object result = param.isReturnEarly() ? param.getResult() : chain.proceed(param.args);
-        param.setProceedResult(result);
+        if (!param.isReturnEarly()) {
+            try {
+                param.setProceedResult(chain.proceed(param.args));
+            } catch (Throwable error) {
+                param.setThrowable(error);
+            }
+        }
 
-        callback.afterHookedMethod(param);
+        try {
+            callback.afterHookedMethod(param);
+        } catch (Throwable error) {
+            HookHealthRegistry.recordRuntimeFailure(hookId, error);
+            throw error;
+        }
         if (param.hasThrowable()) throw param.getThrowable();
         return param.getResult();
     }

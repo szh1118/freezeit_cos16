@@ -1,7 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -20,32 +21,69 @@ use crate::{
         health::ModuleHealth,
         logging::{LogLevel, LogRecord},
         operation_log::OperationLog,
-        package_inventory::{parse_cmd_package_list, reconcile_uid, PackageRecord},
+        package_inventory::{
+            parse_cmd_package_list, protected_reason_for, reconcile_uid, PackageRecord,
+        },
     },
     config::{
         loader::{load_policy_files, load_policy_files_recovering, DaemonPaths, LoadedPolicyFiles},
-        migration::parse_legacy_policy_line,
+        migration::{parse_legacy_policy_line, parse_legacy_policy_target, LegacyPolicyTarget},
     },
     domain::{
         capability::ControlCapability,
         operation::{ControlAction, ControlOperation, OperationResult},
-        policy::{FallbackAction, ForegroundStrategy, FreezeMode, FreezePolicy, ManagedApp},
-        runtime::RuntimeProcess,
+        policy::{
+            FallbackAction, ForegroundStrategy, FreezeMode, FreezePolicy, ManagedApp,
+            ProtectedReason,
+        },
+        runtime::{ControlState, RuntimeProcess},
     },
     protocol::{
         manager_v1::{
             encode_app_config, encode_xposed_config_payload, handle_read_only_command,
-            normalize_settings, ManagerAppConfigRecord, ManagerCommand, ManagerFreezeStatusRecord,
-            ReadOnlyState,
+            normalize_settings, source_tokens_from_legacy_config, ManagerAppConfigRecord,
+            ManagerCommand, ManagerFreezeStatusRecord, ReadOnlyState,
         },
         manager_v2::{
             capability_report_json, compatibility_report_json, health_report_json,
-            operation_log_json, self_check_json,
+            operation_log_json, self_check_json, self_check_json_for_runtime,
         },
         xposed::{classify_bridge_error, classify_hook_health_payload},
     },
-    sys::{procfs, signal, socket, xposed_bridge},
+    sys::{binder, cgroup, procfs, signal, socket, xposed_bridge},
 };
+
+const CAPABILITY_CACHE_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct CachedCapabilities {
+    observed_at: Instant,
+    values: Vec<ControlCapability>,
+}
+
+static RUNTIME_CAPABILITY_CACHE: OnceLock<Mutex<Option<CachedCapabilities>>> = OnceLock::new();
+
+fn discover_runtime_capabilities() -> Vec<ControlCapability> {
+    let cache = RUNTIME_CAPABILITY_CACHE.get_or_init(|| Mutex::new(None));
+    let now = Instant::now();
+    if let Ok(guard) = cache.lock() {
+        if let Some(cached) = guard.as_ref() {
+            if now.duration_since(cached.observed_at) < CAPABILITY_CACHE_TTL {
+                return cached.values.clone();
+            }
+        }
+    }
+
+    let capabilities =
+        SystemAwareCgroupBinderBackend::new(BackendEnvironment::detect()).discover_capabilities();
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(CachedCapabilities {
+            observed_at: now,
+            values: capabilities.clone(),
+        });
+    }
+    capabilities
+}
 
 pub fn run() -> Result<(), DaemonError> {
     run_with_paths(&DaemonPaths::from_module_dir(
@@ -100,6 +138,13 @@ pub fn startup_read_only_state_from_paths(paths: &DaemonPaths) -> ReadOnlyState 
     let package_records = load_package_records();
     state.app_config =
         load_manager_app_config_records(policy.app_config.as_deref(), &package_records);
+    state.app_config_source_tokens =
+        source_tokens_from_legacy_config(policy.app_config.as_deref(), |package_name| {
+            package_records
+                .iter()
+                .find(|record| record.package_name == package_name)
+                .map(|record| record.uid)
+        });
     let mut runtime = detect_runtime_environment();
     runtime.verified_targets =
         load_verified_targets(&paths.rom_baseline, &paths.verified_targets).unwrap_or_default();
@@ -115,8 +160,7 @@ pub fn startup_read_only_state_from_paths(paths: &DaemonPaths) -> ReadOnlyState 
     state.work_mode = "FreezerV2 / Rust daemon".to_owned();
     state.daemon_health = "active".to_owned();
     append_daemon_status_log(&mut state);
-    let capabilities =
-        SystemAwareCgroupBinderBackend::new(BackendEnvironment::detect()).discover_capabilities();
+    let capabilities = discover_runtime_capabilities();
     runtime.freezer_ready = capabilities.iter().any(|capability| {
         capability.name == crate::domain::capability::CapabilityName::CgroupV2Freezer
             && capability.status == crate::domain::capability::CapabilityStatus::Available
@@ -289,8 +333,12 @@ fn load_manager_app_config_records(
         .flat_map(str::lines)
         .filter_map(parse_legacy_policy_line)
         .filter_map(|record| {
-            let uid = parse_legacy_uid_token(&record.package_or_uid)
-                .or_else(|| package_uids.get(record.package_or_uid.as_str()).copied())?;
+            // A package name may legitimately contain "uid" followed by digits. Resolve exact
+            // inventory names first, then only accept the canonical numeric legacy encodings.
+            let uid = package_uids
+                .get(record.package_or_uid.as_str())
+                .copied()
+                .or_else(|| parse_legacy_uid_token(&record.package_or_uid))?;
             Some(ManagerAppConfigRecord {
                 uid,
                 mode: record.mode,
@@ -301,12 +349,10 @@ fn load_manager_app_config_records(
 }
 
 fn parse_legacy_uid_token(token: &str) -> Option<u32> {
-    if let Ok(uid) = token.parse::<u32>() {
-        return Some(uid);
+    match parse_legacy_policy_target(token) {
+        Some(LegacyPolicyTarget::Uid(uid)) => Some(uid),
+        Some(LegacyPolicyTarget::PackageName(_)) | None => None,
     }
-    token
-        .split_once("uid")
-        .and_then(|(_, uid)| uid.parse::<u32>().ok())
 }
 
 fn detect_android_version() -> String {
@@ -345,14 +391,13 @@ fn update_diagnostics(
         policy_ready,
     );
     state.health_report_json = health_report_json(&health);
-    state.self_check_json = self_check_json(&health, capabilities);
+    state.self_check_json = self_check_json_for_runtime(&health, capabilities, runtime);
     state.compatibility_report_json = compatibility_report_json(runtime, capabilities);
     state.control_allowed = runtime.allows_control(capabilities);
 }
 
 pub fn refresh_runtime_diagnostics(state: &mut ReadOnlyState) {
-    let capabilities =
-        SystemAwareCgroupBinderBackend::new(BackendEnvironment::detect()).discover_capabilities();
+    let capabilities = discover_runtime_capabilities();
     let mut runtime = detect_runtime_environment();
     runtime.verified_targets = state
         .verified_targets
@@ -463,7 +508,9 @@ pub fn read_only_state_with_diagnostics(diagnostics: &DiagnosticState) -> ReadOn
 pub struct RuntimeControlState {
     pub operation_log: OperationLog,
     frozen_apps: std::collections::BTreeSet<(String, u32)>,
+    frozen_since_ms: BTreeMap<RuntimeIdentity, u128>,
     pending_freezes: BTreeMap<(String, u32), u128>,
+    network_restriction_requests: BTreeSet<u32>,
     next_operation_id: u64,
     status_since_ms: BTreeMap<u32, (i32, u128)>,
     blocked_process_signatures: BTreeMap<RuntimeIdentity, ProcessSignature>,
@@ -475,12 +522,48 @@ pub struct RuntimeControlState {
 type RuntimeIdentity = (String, u32);
 type ProcessSignature = Vec<(i32, String, Option<u64>)>;
 
+/// Reconcile live process control state from kernel-visible evidence before a control pass.
+///
+/// Proc discovery starts with `Running` because it cannot read every per-process state while
+/// walking `/proc`. A cgroup read failure or a raced-out proc entry must not turn that default
+/// into evidence that the process was thawed, so uncertain observations remain `Unknown`.
+pub fn reconcile_live_process_control_states(
+    processes: &mut [RuntimeProcess],
+    mut read_cgroup_state: impl FnMut(&str) -> Result<cgroup::FreezeState, DaemonError>,
+    mut read_proc_state: impl FnMut(i32) -> Result<char, DaemonError>,
+) {
+    for process in processes {
+        let cgroup_state = match process.cgroup_freeze_path.as_deref() {
+            Some(path) => read_cgroup_state(path).ok(),
+            // No cgroup freezer is attached to this process, so only the signal state can
+            // establish that it is frozen.
+            None => Some(cgroup::FreezeState::Thawed),
+        };
+
+        if cgroup_state == Some(cgroup::FreezeState::Frozen) {
+            process.control_state = ControlState::Frozen;
+            continue;
+        }
+
+        let proc_state = read_proc_state(process.pid).ok();
+        process.control_state = if matches!(proc_state, Some('T' | 't')) {
+            ControlState::Frozen
+        } else if cgroup_state == Some(cgroup::FreezeState::Thawed) && proc_state.is_some() {
+            ControlState::Running
+        } else {
+            ControlState::Unknown
+        };
+    }
+}
+
 impl Default for RuntimeControlState {
     fn default() -> Self {
         Self {
             operation_log: OperationLog::new(128),
             frozen_apps: std::collections::BTreeSet::new(),
+            frozen_since_ms: BTreeMap::new(),
             pending_freezes: BTreeMap::new(),
+            network_restriction_requests: BTreeSet::new(),
             next_operation_id: 1,
             status_since_ms: BTreeMap::new(),
             blocked_process_signatures: BTreeMap::new(),
@@ -492,6 +575,70 @@ impl Default for RuntimeControlState {
 }
 
 impl RuntimeControlState {
+    fn track_frozen(&mut self, identity: RuntimeIdentity, timestamp_ms: u128) {
+        self.frozen_apps.insert(identity.clone());
+        self.frozen_since_ms.entry(identity).or_insert(timestamp_ms);
+    }
+
+    fn clear_frozen(&mut self, identity: &RuntimeIdentity) {
+        self.frozen_apps.remove(identity);
+        self.frozen_since_ms.remove(identity);
+    }
+
+    pub fn pending_freeze_uids(&self) -> Vec<u32> {
+        self.pending_freezes
+            .keys()
+            .map(|(_, uid)| *uid)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    pub fn take_network_restriction_uids(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.network_restriction_requests)
+            .into_iter()
+            .collect()
+    }
+
+    pub fn requeue_network_restriction_uid(&mut self, uid: u32) {
+        self.network_restriction_requests.insert(uid);
+    }
+
+    fn clear_transient_control_state_for_uid(&mut self, uid: u32) {
+        self.pending_freezes
+            .retain(|(_, pending_uid), _| *pending_uid != uid);
+        self.network_restriction_requests.remove(&uid);
+        self.blocked_process_signatures
+            .retain(|(_, blocked_uid), _| *blocked_uid != uid);
+        self.download_deferral.clear_uid(uid);
+        self.status_since_ms.remove(&uid);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn thaw_all_frozen(
+        &mut self,
+        mut discover_processes: impl FnMut(&str, u32) -> Result<Vec<RuntimeProcess>, DaemonError>,
+        mut unfreeze_process: impl FnMut(&RuntimeProcess) -> Result<(), DaemonError>,
+        mut validate_process: impl FnMut(&RuntimeProcess) -> Result<bool, DaemonError>,
+        timestamp_ms: u128,
+    ) -> Result<(), DaemonError> {
+        let identities = self.frozen_apps.iter().cloned().collect::<Vec<_>>();
+        let result = thaw_frozen_identities(
+            self,
+            &identities,
+            &mut discover_processes,
+            &mut unfreeze_process,
+            &mut validate_process,
+            timestamp_ms,
+            "control disabled",
+        );
+        self.pending_freezes.clear();
+        self.network_restriction_requests.clear();
+        self.blocked_process_signatures.clear();
+        self.download_deferral = DownloadDeferral::default();
+        result
+    }
+
     pub fn freeze_status_records(
         &mut self,
         app_config: &[ManagerAppConfigRecord],
@@ -591,6 +738,213 @@ impl RuntimeControlState {
     }
 }
 
+#[derive(Debug, Default)]
+struct UnfreezeOutcome {
+    applied: usize,
+    failures: Vec<String>,
+}
+
+fn unfreeze_identity_processes(
+    expected_package: &str,
+    processes: &[RuntimeProcess],
+    validate_process: &mut impl FnMut(&RuntimeProcess) -> Result<bool, DaemonError>,
+    unfreeze_process: &mut impl FnMut(&RuntimeProcess) -> Result<(), DaemonError>,
+) -> UnfreezeOutcome {
+    if processes
+        .iter()
+        .any(|process| process.package_name != expected_package)
+    {
+        return UnfreezeOutcome {
+            applied: 0,
+            failures: vec!["shared uid contains multiple package identities".to_owned()],
+        };
+    }
+
+    let mut outcome = UnfreezeOutcome::default();
+    for process in processes {
+        match validate_process(process) {
+            Ok(true) => {}
+            Ok(false) => {
+                outcome.failures.push(format!(
+                    "identity validation failed before unfreeze for pid {}",
+                    process.pid
+                ));
+                continue;
+            }
+            Err(error) => {
+                outcome.failures.push(format!(
+                    "identity validation failed before unfreeze for pid {}: {error}",
+                    process.pid
+                ));
+                continue;
+            }
+        }
+        match unfreeze_process(process) {
+            Ok(()) => outcome.applied += 1,
+            Err(error) => outcome
+                .failures
+                .push(format!("unfreeze failed for pid {}: {error}", process.pid)),
+        }
+    }
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+fn thaw_frozen_identities(
+    state: &mut RuntimeControlState,
+    identities: &[RuntimeIdentity],
+    discover_processes: &mut impl FnMut(&str, u32) -> Result<Vec<RuntimeProcess>, DaemonError>,
+    unfreeze_process: &mut impl FnMut(&RuntimeProcess) -> Result<(), DaemonError>,
+    validate_process: &mut impl FnMut(&RuntimeProcess) -> Result<bool, DaemonError>,
+    timestamp_ms: u128,
+    reason: &str,
+) -> Result<(), DaemonError> {
+    let mut failures = Vec::new();
+    for identity @ (package_name, uid) in identities {
+        let fallback_package_name = format!("uid{uid}");
+        let processes = match discover_processes(&fallback_package_name, *uid) {
+            Ok(processes) => processes,
+            Err(error) => {
+                let message = format!("{reason}; process discovery failed: {error}");
+                let mut operation = ControlOperation {
+                    operation_id: 0,
+                    timestamp_ms: 0,
+                    package_name: package_name.clone(),
+                    uid: *uid,
+                    pid_list: Vec::new(),
+                    action: ControlAction::Unfreeze,
+                    backend: "recovery".to_owned(),
+                    reason: message.clone(),
+                    result: OperationResult::Failed,
+                    details: "process_count=0".to_owned(),
+                };
+                stamp_operation(&mut operation, state, timestamp_ms);
+                state.operation_log.push(operation);
+                failures.push(message);
+                continue;
+            }
+        };
+        if processes.is_empty() {
+            state.clear_frozen(identity);
+            continue;
+        }
+
+        let outcome = unfreeze_identity_processes(
+            package_name,
+            &processes,
+            validate_process,
+            unfreeze_process,
+        );
+        let succeeded = outcome.failures.is_empty();
+        if succeeded {
+            state.clear_frozen(identity);
+        }
+        let result = if succeeded {
+            OperationResult::Success
+        } else if outcome.applied == 0 {
+            OperationResult::Failed
+        } else {
+            OperationResult::Partial
+        };
+        let mut operation = ControlOperation {
+            operation_id: 0,
+            timestamp_ms: 0,
+            package_name: package_name.clone(),
+            uid: *uid,
+            pid_list: processes.iter().map(|process| process.pid).collect(),
+            action: ControlAction::Unfreeze,
+            backend: backend_name(&processes).to_owned(),
+            reason: if succeeded {
+                reason.to_owned()
+            } else {
+                format!("{reason}; {}", outcome.failures.join("; "))
+            },
+            result,
+            details: operation_details(&processes),
+        };
+        stamp_operation(&mut operation, state, timestamp_ms);
+        state.operation_log.push(operation);
+        if !succeeded {
+            failures.extend(outcome.failures);
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(DaemonError::system(failures.join("; ")))
+    }
+}
+
+fn manager_wakeup_interval_ms(settings: &[u8]) -> Option<u128> {
+    match settings.get(3).copied().unwrap_or(0) {
+        1 => Some(5 * 60_000),
+        2 => Some(15 * 60_000),
+        3 => Some(30 * 60_000),
+        4 => Some(60 * 60_000),
+        5 => Some(120 * 60_000),
+        _ => None,
+    }
+}
+
+fn manager_wakeup_duration_ms(settings: &[u8]) -> u128 {
+    u128::from(settings.get(2).copied().unwrap_or(0)) * 1_000
+}
+
+fn periodic_wakeup_due(
+    state: &RuntimeControlState,
+    identity: &RuntimeIdentity,
+    settings: &[u8],
+    timestamp_ms: u128,
+) -> bool {
+    let Some(interval_ms) = manager_wakeup_interval_ms(settings) else {
+        return false;
+    };
+    let Some(frozen_since_ms) = state.frozen_since_ms.get(identity).copied() else {
+        return false;
+    };
+    timestamp_ms >= frozen_since_ms.saturating_add(interval_ms)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestedControlBackend {
+    Terminate,
+    Signal,
+    Freezer,
+}
+
+impl RequestedControlBackend {
+    fn operation_backend(self, processes: &[RuntimeProcess]) -> &'static str {
+        match self {
+            Self::Terminate => "signal.kill",
+            Self::Signal => "signal.stop",
+            Self::Freezer => backend_name(processes),
+        }
+    }
+}
+
+fn requested_control_backend(
+    record: &ManagerAppConfigRecord,
+    settings: &[u8],
+) -> RequestedControlBackend {
+    match record.mode {
+        10 => RequestedControlBackend::Terminate,
+        20 | 21 => RequestedControlBackend::Signal,
+        30 | 31 if settings.get(5).copied() == Some(2) => RequestedControlBackend::Signal,
+        _ => RequestedControlBackend::Freezer,
+    }
+}
+
+fn mode_has_network_restriction(mode: i32) -> bool {
+    matches!(mode, 21 | 31)
+}
+
+fn signal_control_process(process: &RuntimeProcess) -> RuntimeProcess {
+    let mut signal_process = process.clone();
+    signal_process.cgroup_freeze_path = None;
+    signal_process
+}
+
 pub fn run_control_pass(
     state: &mut RuntimeControlState,
     app_config: &[ManagerAppConfigRecord],
@@ -675,6 +1029,81 @@ pub fn run_control_pass_with_sampling(
     foreground_uids: &[u32],
     timestamp_ms: u128,
 ) -> Result<(), DaemonError> {
+    let mut terminate_process = terminate_runtime_process;
+    run_control_pass_with_sampling_and_terminate(
+        state,
+        app_config,
+        settings,
+        &mut discover_processes,
+        &mut freeze_process,
+        &mut unfreeze_process,
+        &mut validate_process,
+        &mut sample_rx_bytes,
+        &mut terminate_process,
+        foreground_uids,
+        timestamp_ms,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_control_pass_with_sampling_and_terminate(
+    state: &mut RuntimeControlState,
+    app_config: &[ManagerAppConfigRecord],
+    settings: &[u8],
+    mut discover_processes: impl FnMut(&str, u32) -> Result<Vec<RuntimeProcess>, DaemonError>,
+    mut freeze_process: impl FnMut(&RuntimeProcess) -> Result<(), DaemonError>,
+    mut unfreeze_process: impl FnMut(&RuntimeProcess) -> Result<(), DaemonError>,
+    mut validate_process: impl FnMut(&RuntimeProcess) -> Result<bool, DaemonError>,
+    mut sample_rx_bytes: impl FnMut(u32, &str) -> Result<Option<u64>, DaemonError>,
+    mut terminate_process: impl FnMut(&RuntimeProcess) -> Result<(), DaemonError>,
+    foreground_uids: &[u32],
+    timestamp_ms: u128,
+) -> Result<(), DaemonError> {
+    let controlled_uids = app_config
+        .iter()
+        .filter(|record| is_control_policy_mode(record.mode))
+        .map(|record| record.uid)
+        .collect::<BTreeSet<_>>();
+    let stale_frozen_identities = state
+        .frozen_apps
+        .iter()
+        .filter(|(_, uid)| !controlled_uids.contains(uid))
+        .cloned()
+        .collect::<Vec<_>>();
+    let stale_uids = state
+        .pending_freezes
+        .keys()
+        .map(|(_, uid)| *uid)
+        .chain(stale_frozen_identities.iter().map(|(_, uid)| *uid))
+        .filter(|uid| !controlled_uids.contains(uid))
+        .collect::<BTreeSet<_>>();
+    state
+        .pending_freezes
+        .retain(|(_, uid), _| controlled_uids.contains(uid));
+    state
+        .blocked_process_signatures
+        .retain(|(_, uid), _| controlled_uids.contains(uid));
+    state
+        .network_restriction_requests
+        .retain(|uid| controlled_uids.contains(uid));
+    state
+        .status_since_ms
+        .retain(|uid, _| controlled_uids.contains(uid));
+    for uid in stale_uids {
+        state.download_deferral.clear_uid(uid);
+    }
+    // A record that became Free/whitelisted or was removed no longer participates in
+    // the main loop. Thaw it before processing the remaining controlled records.
+    let _ = thaw_frozen_identities(
+        state,
+        &stale_frozen_identities,
+        &mut discover_processes,
+        &mut unfreeze_process,
+        &mut validate_process,
+        timestamp_ms,
+        "control policy removed",
+    );
+
     let audit_due = refreeze_audit_due(state, settings, timestamp_ms);
     for record in app_config {
         if !is_control_policy_mode(record.mode) {
@@ -683,15 +1112,16 @@ pub fn run_control_pass_with_sampling(
         let fallback_package_name = format!("uid{}", record.uid);
         let processes = discover_processes(&fallback_package_name, record.uid)?;
         if processes.is_empty() {
-            state
-                .pending_freezes
-                .retain(|(_, uid), _| *uid != record.uid);
-            state.frozen_apps.retain(|(_, uid)| *uid != record.uid);
-            state
-                .blocked_process_signatures
-                .retain(|(_, uid), _| *uid != record.uid);
-            state.download_deferral.clear_uid(record.uid);
-            state.status_since_ms.remove(&record.uid);
+            state.clear_transient_control_state_for_uid(record.uid);
+            let frozen_identities = state
+                .frozen_apps
+                .iter()
+                .filter(|(_, uid)| *uid == record.uid)
+                .cloned()
+                .collect::<Vec<_>>();
+            for identity in frozen_identities {
+                state.clear_frozen(&identity);
+            }
             continue;
         }
         let package_name = processes
@@ -703,6 +1133,25 @@ pub fn run_control_pass_with_sampling(
         let app = managed_app_from_record(&package_name, record.uid);
         let policy = policy_from_record(record);
         let identity = (package_name.clone(), record.uid);
+        if !policy.is_control_allowed_for(&app) {
+            state.clear_transient_control_state_for_uid(record.uid);
+            let frozen_identities = state
+                .frozen_apps
+                .iter()
+                .filter(|(_, uid)| *uid == record.uid)
+                .cloned()
+                .collect::<Vec<_>>();
+            let _ = thaw_frozen_identities(
+                state,
+                &frozen_identities,
+                &mut discover_processes,
+                &mut unfreeze_process,
+                &mut validate_process,
+                timestamp_ms,
+                "policy or protected package blocks control",
+            );
+            continue;
+        }
         let mut process_signature = processes
             .iter()
             .map(|process| {
@@ -725,59 +1174,38 @@ pub fn run_control_pass_with_sampling(
         if foreground_uids.contains(&record.uid) {
             state.pending_freezes.remove(&identity);
             if state.frozen_apps.contains(&identity) {
-                let mut failure = None;
-                if processes
-                    .iter()
-                    .any(|process| process.package_name != package_name)
-                {
-                    failure = Some("shared uid contains multiple package identities".to_owned());
+                let outcome = unfreeze_identity_processes(
+                    &package_name,
+                    &processes,
+                    &mut validate_process,
+                    &mut unfreeze_process,
+                );
+                let succeeded = outcome.failures.is_empty();
+                if succeeded {
+                    state.clear_frozen(&identity);
                 }
-                for process in &processes {
-                    if failure.is_none() && !validate_process(process)? {
-                        failure = Some(format!(
-                            "identity validation failed before unfreeze for pid {}",
-                            process.pid
-                        ));
-                    }
-                }
-                if failure.is_none() {
-                    for process in &processes {
-                        if !validate_process(process)? {
-                            failure = Some(format!(
-                                "identity validation failed before unfreeze signal for pid {}",
-                                process.pid
-                            ));
-                            break;
-                        }
-                        if let Err(error) = unfreeze_process(process) {
-                            failure =
-                                Some(format!("unfreeze failed for pid {}: {error}", process.pid));
-                            break;
-                        }
-                    }
-                }
-                if let Some(reason) = failure {
-                    let mut operation = ControlOperation {
-                        operation_id: 0,
-                        timestamp_ms: 0,
-                        package_name: package_name.clone(),
-                        uid: record.uid,
-                        pid_list: processes.iter().map(|process| process.pid).collect(),
-                        action: ControlAction::Unfreeze,
-                        backend: backend_name(&processes).to_owned(),
-                        reason,
-                        result: OperationResult::Failed,
-                        details: operation_details(&processes),
-                    };
-                    stamp_operation(&mut operation, state, timestamp_ms);
-                    state.operation_log.push(operation);
-                    continue;
-                }
-                state.frozen_apps.remove(&identity);
-                let mut operation =
-                    SystemAwareCgroupBinderBackend::new(backend_environment(&processes))
-                        .unfreeze_operation(&app, &processes, "foreground uid active");
-                operation.backend = backend_name(&processes).to_owned();
+                let mut operation = ControlOperation {
+                    operation_id: 0,
+                    timestamp_ms: 0,
+                    package_name: package_name.clone(),
+                    uid: record.uid,
+                    pid_list: processes.iter().map(|process| process.pid).collect(),
+                    action: ControlAction::Unfreeze,
+                    backend: backend_name(&processes).to_owned(),
+                    reason: if succeeded {
+                        "foreground uid active".to_owned()
+                    } else {
+                        outcome.failures.join("; ")
+                    },
+                    result: if succeeded {
+                        OperationResult::Success
+                    } else if outcome.applied == 0 {
+                        OperationResult::Failed
+                    } else {
+                        OperationResult::Partial
+                    },
+                    details: operation_details(&processes),
+                };
                 stamp_operation(&mut operation, state, timestamp_ms);
                 state.operation_log.push(operation);
             }
@@ -786,14 +1214,59 @@ pub fn run_control_pass_with_sampling(
 
         let mut abnormal_thaw = false;
         if state.frozen_apps.contains(&identity) {
+            if periodic_wakeup_due(state, &identity, settings, timestamp_ms) {
+                let outcome = unfreeze_identity_processes(
+                    &package_name,
+                    &processes,
+                    &mut validate_process,
+                    &mut unfreeze_process,
+                );
+                let succeeded = outcome.failures.is_empty();
+                if succeeded {
+                    state.clear_frozen(&identity);
+                    state.pending_freezes.insert(
+                        identity.clone(),
+                        timestamp_ms.saturating_add(manager_wakeup_duration_ms(settings)),
+                    );
+                }
+                let mut operation = ControlOperation {
+                    operation_id: 0,
+                    timestamp_ms: 0,
+                    package_name: package_name.clone(),
+                    uid: record.uid,
+                    pid_list: processes.iter().map(|process| process.pid).collect(),
+                    action: ControlAction::Unfreeze,
+                    backend: backend_name(&processes).to_owned(),
+                    reason: if succeeded {
+                        format!(
+                            "periodic wakeup after {}ms; refreeze in {}ms",
+                            manager_wakeup_interval_ms(settings).unwrap_or_default(),
+                            manager_wakeup_duration_ms(settings)
+                        )
+                    } else {
+                        format!("periodic wakeup failed; {}", outcome.failures.join("; "))
+                    },
+                    result: if succeeded {
+                        OperationResult::Success
+                    } else if outcome.applied == 0 {
+                        OperationResult::Failed
+                    } else {
+                        OperationResult::Partial
+                    },
+                    details: operation_details(&processes),
+                };
+                stamp_operation(&mut operation, state, timestamp_ms);
+                state.operation_log.push(operation);
+                continue;
+            }
             if !audit_due
-                || processes.iter().all(|process| {
-                    process.control_state == crate::domain::runtime::ControlState::Frozen
-                })
+                || !processes
+                    .iter()
+                    .any(|process| process.control_state == ControlState::Running)
             {
                 continue;
             }
-            state.frozen_apps.remove(&identity);
+            state.clear_frozen(&identity);
             abnormal_thaw = true;
         }
 
@@ -820,6 +1293,9 @@ pub fn run_control_pass_with_sampling(
                     };
                     stamp_operation(&mut operation, state, timestamp_ms);
                     state.operation_log.push(operation);
+                    if !state.frozen_apps.contains(&identity) {
+                        state.frozen_since_ms.remove(&identity);
+                    }
                     continue;
                 }
             }
@@ -874,6 +1350,9 @@ pub fn run_control_pass_with_sampling(
                     stamp_operation(&mut operation, state, timestamp_ms);
                     state.operation_log.push(operation);
                 }
+                if !state.frozen_apps.contains(&identity) {
+                    state.frozen_since_ms.remove(&identity);
+                }
                 continue;
             }
         }
@@ -883,7 +1362,31 @@ pub fn run_control_pass_with_sampling(
             process.control_state = crate::domain::runtime::ControlState::PendingFreeze;
         }
         let backend = SystemAwareCgroupBinderBackend::new(backend_environment(&pending_processes));
-        let decision = backend.can_freeze(&app, &policy, &pending_processes);
+        let requested_backend = requested_control_backend(record, settings);
+        let decision = if !policy.is_control_allowed_for(&app) {
+            FreezeDecision {
+                action: DecisionAction::Skip,
+                reason: "policy or protected package blocks control".to_owned(),
+            }
+        } else {
+            match requested_backend {
+                RequestedControlBackend::Terminate => FreezeDecision {
+                    action: DecisionAction::Terminate,
+                    reason: "SIGKILL selected by manager policy".to_owned(),
+                },
+                RequestedControlBackend::Signal => FreezeDecision {
+                    action: DecisionAction::Signal,
+                    reason: if record.mode == 20 || record.mode == 21 {
+                        "SIGSTOP selected by manager policy".to_owned()
+                    } else {
+                        "global SIGSTOP selected for freezer policy".to_owned()
+                    },
+                },
+                RequestedControlBackend::Freezer => {
+                    backend.can_freeze(&app, &policy, &pending_processes)
+                }
+            }
+        };
         let (action, result) = match decision.action {
             DecisionAction::Freeze => {
                 let freeze_outcome = apply_freeze_transaction(
@@ -899,7 +1402,7 @@ pub fn run_control_pass_with_sampling(
                             .insert(identity.clone(), process_signature.clone());
                     }
                     if freeze_outcome.residual_possible {
-                        state.frozen_apps.insert(identity.clone());
+                        state.track_frozen(identity.clone(), timestamp_ms);
                     }
                     let error = DaemonError::system(failure.clone());
                     let fallback = backend.fallback_after_freeze_apply_error(&policy, &error);
@@ -923,7 +1426,10 @@ pub fn run_control_pass_with_sampling(
                                 },
                             );
                             if outcome.failure.is_none() {
-                                state.frozen_apps.insert(identity.clone());
+                                state.track_frozen(identity.clone(), timestamp_ms);
+                                if mode_has_network_restriction(record.mode) {
+                                    state.network_restriction_requests.insert(record.uid);
+                                }
                                 (
                                     ControlAction::Freeze,
                                     OperationResult::Success,
@@ -932,7 +1438,7 @@ pub fn run_control_pass_with_sampling(
                                 )
                             } else {
                                 if outcome.rollback_failures > 0 {
-                                    state.frozen_apps.insert(identity.clone());
+                                    state.track_frozen(identity.clone(), timestamp_ms);
                                 }
                                 (
                                     ControlAction::Fallback,
@@ -962,6 +1468,12 @@ pub fn run_control_pass_with_sampling(
                             )
                         }
                     };
+                    if result == OperationResult::Success
+                        && action == ControlAction::Freeze
+                        && mode_has_network_restriction(record.mode)
+                    {
+                        state.network_restriction_requests.insert(record.uid);
+                    }
                     state.pending_freezes.remove(&identity);
                     let mut operation = ControlOperation {
                         operation_id: 0,
@@ -990,6 +1502,9 @@ pub fn run_control_pass_with_sampling(
                     };
                     stamp_operation(&mut operation, state, timestamp_ms);
                     state.operation_log.push(operation);
+                    if !state.frozen_apps.contains(&identity) {
+                        state.frozen_since_ms.remove(&identity);
+                    }
                     continue;
                 }
 
@@ -1006,8 +1521,18 @@ pub fn run_control_pass_with_sampling(
                     .map(|process| process.pid)
                     .collect::<Vec<_>>();
                 if !new_pids.is_empty() {
-                    for process in &post_freeze_processes {
-                        let _ = unfreeze_process(process);
+                    let rollback = unfreeze_identity_processes(
+                        &package_name,
+                        &post_freeze_processes,
+                        &mut validate_process,
+                        &mut unfreeze_process,
+                    );
+                    if rollback.failures.is_empty() {
+                        state.clear_frozen(&identity);
+                    } else {
+                        // The process rescan invalidates the original freeze transaction. Keep
+                        // the identity tracked until every attempted thaw has actually succeeded.
+                        state.track_frozen(identity.clone(), timestamp_ms);
                     }
                     state.pending_freezes.remove(&identity);
                     let mut operation = ControlOperation {
@@ -1027,15 +1552,27 @@ pub fn run_control_pass_with_sampling(
                         ),
                         result: OperationResult::Partial,
                         details: format!(
-                            "{} new_pids={new_pids:?}",
-                            operation_details(&post_freeze_processes)
+                            "{} new_pids={new_pids:?} rollback_applied={} rollback_failures={}",
+                            operation_details(&post_freeze_processes),
+                            rollback.applied,
+                            if rollback.failures.is_empty() {
+                                "none".to_owned()
+                            } else {
+                                rollback.failures.join("; ")
+                            }
                         ),
                     };
                     stamp_operation(&mut operation, state, timestamp_ms);
                     state.operation_log.push(operation);
+                    if !state.frozen_apps.contains(&identity) {
+                        state.frozen_since_ms.remove(&identity);
+                    }
                     continue;
                 }
-                state.frozen_apps.insert(identity);
+                state.track_frozen(identity.clone(), timestamp_ms);
+                if mode_has_network_restriction(record.mode) {
+                    state.network_restriction_requests.insert(record.uid);
+                }
                 state
                     .pending_freezes
                     .remove(&(package_name.clone(), record.uid));
@@ -1047,8 +1584,14 @@ pub fn run_control_pass_with_sampling(
                 let outcome = apply_freeze_transaction(
                     &pending_processes,
                     &mut validate_process,
-                    &mut freeze_process,
-                    &mut unfreeze_process,
+                    &mut |process| {
+                        let signal_process = signal_control_process(process);
+                        freeze_process(&signal_process)
+                    },
+                    &mut |process| {
+                        let signal_process = signal_control_process(process);
+                        unfreeze_process(&signal_process)
+                    },
                 );
                 if let Some(failure) = outcome.failure {
                     if failure.contains("shared uid contains multiple package identities") {
@@ -1057,7 +1600,7 @@ pub fn run_control_pass_with_sampling(
                             .insert(identity.clone(), process_signature.clone());
                     }
                     if outcome.rollback_failures > 0 {
-                        state.frozen_apps.insert(identity.clone());
+                        state.track_frozen(identity.clone(), timestamp_ms);
                     }
                     let mut operation = ControlOperation {
                         operation_id: 0,
@@ -1069,7 +1612,7 @@ pub fn run_control_pass_with_sampling(
                             .map(|process| process.pid)
                             .collect(),
                         action: ControlAction::Freeze,
-                        backend: backend_name(&pending_processes).to_owned(),
+                        backend: "signal.stop".to_owned(),
                         reason: format!("{}; {failure}", decision.reason),
                         result: if outcome.rollback_failures == 0 {
                             OperationResult::Failed
@@ -1087,18 +1630,69 @@ pub fn run_control_pass_with_sampling(
                     stamp_operation(&mut operation, state, timestamp_ms);
                     state.operation_log.push(operation);
                     state.pending_freezes.remove(&identity);
+                    if !state.frozen_apps.contains(&identity) {
+                        state.frozen_since_ms.remove(&identity);
+                    }
                     continue;
                 }
-                state.frozen_apps.insert(identity);
+                state.track_frozen(identity.clone(), timestamp_ms);
+                if mode_has_network_restriction(record.mode) {
+                    state.network_restriction_requests.insert(record.uid);
+                }
                 state
                     .pending_freezes
                     .remove(&(package_name.clone(), record.uid));
                 (ControlAction::Freeze, OperationResult::Success)
             }
-            DecisionAction::Terminate => (ControlAction::Terminate, OperationResult::Failed),
+            DecisionAction::Terminate => {
+                let outcome = apply_terminate_transaction(
+                    &pending_processes,
+                    &mut validate_process,
+                    &mut terminate_process,
+                );
+                if let Some(failure) = outcome.failure {
+                    let mut operation = ControlOperation {
+                        operation_id: 0,
+                        timestamp_ms: 0,
+                        package_name,
+                        uid: record.uid,
+                        pid_list: pending_processes
+                            .iter()
+                            .map(|process| process.pid)
+                            .collect(),
+                        action: ControlAction::Terminate,
+                        backend: "signal.kill".to_owned(),
+                        reason: format!("{}; {failure}", decision.reason),
+                        result: if outcome.applied == 0 {
+                            OperationResult::Failed
+                        } else {
+                            OperationResult::Partial
+                        },
+                        details: format!(
+                            "{} sigkill_applied={}",
+                            operation_details(&pending_processes),
+                            outcome.applied
+                        ),
+                    };
+                    stamp_operation(&mut operation, state, timestamp_ms);
+                    state.operation_log.push(operation);
+                    continue;
+                }
+                state.pending_freezes.remove(&identity);
+                state.clear_frozen(&identity);
+                (ControlAction::Terminate, OperationResult::Success)
+            }
             DecisionAction::Skip => (ControlAction::Skip, OperationResult::Skipped),
         };
 
+        if !state.frozen_apps.contains(&identity) {
+            state.frozen_since_ms.remove(&identity);
+        }
+
+        let operation_backend = match decision.action {
+            DecisionAction::Signal => "signal.stop",
+            _ => requested_backend.operation_backend(&pending_processes),
+        };
         let mut operation = ControlOperation {
             operation_id: 0,
             timestamp_ms: 0,
@@ -1109,7 +1703,7 @@ pub fn run_control_pass_with_sampling(
                 .map(|process| process.pid)
                 .collect(),
             action,
-            backend: backend_name(&pending_processes).to_owned(),
+            backend: operation_backend.to_owned(),
             reason: if abnormal_thaw {
                 format!("abnormal thaw audit; {}", decision.reason)
             } else {
@@ -1131,12 +1725,6 @@ fn refreeze_audit_due(
     timestamp_ms: u128,
 ) -> bool {
     let started_at = *state.audit_started_at_ms.get_or_insert(timestamp_ms);
-    let next = state
-        .next_refreeze_audit_at_ms
-        .get_or_insert(started_at + 60_000);
-    if timestamp_ms < *next {
-        return false;
-    }
     let elapsed = timestamp_ms.saturating_sub(started_at);
     let interval_ms = if elapsed < 15 * 60_000 {
         Some(60_000)
@@ -1148,7 +1736,19 @@ fn refreeze_audit_due(
             _ => None,
         }
     };
-    state.next_refreeze_audit_at_ms = interval_ms.map(|interval| timestamp_ms + interval);
+    let Some(interval_ms) = interval_ms else {
+        // Do not leave this as `None`: get_or_insert on the next pass would recreate
+        // the startup deadline, which is already long expired after the 15-minute phase.
+        state.next_refreeze_audit_at_ms = None;
+        return false;
+    };
+    let next = state
+        .next_refreeze_audit_at_ms
+        .get_or_insert(started_at + 60_000);
+    if timestamp_ms < *next {
+        return false;
+    }
+    state.next_refreeze_audit_at_ms = Some(timestamp_ms + interval_ms);
     true
 }
 
@@ -1159,6 +1759,104 @@ struct FreezeTransactionOutcome {
     rollback_failures: usize,
     residual_possible: bool,
     failure: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminateTransactionOutcome {
+    applied: usize,
+    failure: Option<String>,
+}
+
+fn terminate_runtime_process(process: &RuntimeProcess) -> Result<(), DaemonError> {
+    if process.pid <= 0 {
+        return Err(DaemonError::system("refusing to SIGKILL non-positive pid"));
+    }
+    // SAFETY: the PID was identity-validated immediately before this call; libc::kill
+    // performs no memory access and SIGKILL is the configured terminate backend.
+    let result = unsafe { libc::kill(process.pid, libc::SIGKILL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(DaemonError::from(std::io::Error::last_os_error()))
+    }
+}
+
+fn apply_terminate_transaction(
+    processes: &[RuntimeProcess],
+    validate_process: &mut impl FnMut(&RuntimeProcess) -> Result<bool, DaemonError>,
+    terminate_process: &mut impl FnMut(&RuntimeProcess) -> Result<(), DaemonError>,
+) -> TerminateTransactionOutcome {
+    let expected_package = processes
+        .first()
+        .map(|process| process.package_name.as_str());
+    for process in processes {
+        if Some(process.package_name.as_str()) != expected_package {
+            return TerminateTransactionOutcome {
+                applied: 0,
+                failure: Some(format!(
+                    "shared uid contains multiple package identities; refusing pid {}",
+                    process.pid
+                )),
+            };
+        }
+        match validate_process(process) {
+            Ok(true) => {}
+            Ok(false) => {
+                return TerminateTransactionOutcome {
+                    applied: 0,
+                    failure: Some(format!(
+                        "identity validation failed before SIGKILL for pid {}",
+                        process.pid
+                    )),
+                };
+            }
+            Err(error) => {
+                return TerminateTransactionOutcome {
+                    applied: 0,
+                    failure: Some(format!(
+                        "identity validation failed before SIGKILL for pid {}: {error}",
+                        process.pid
+                    )),
+                };
+            }
+        }
+    }
+
+    let mut applied = 0;
+    for process in processes {
+        match validate_process(process) {
+            Ok(true) => {}
+            Ok(false) => {
+                return TerminateTransactionOutcome {
+                    applied,
+                    failure: Some(format!(
+                        "identity validation failed immediately before SIGKILL for pid {}",
+                        process.pid
+                    )),
+                };
+            }
+            Err(error) => {
+                return TerminateTransactionOutcome {
+                    applied,
+                    failure: Some(format!(
+                        "identity validation failed immediately before SIGKILL for pid {}: {error}",
+                        process.pid
+                    )),
+                };
+            }
+        }
+        if let Err(error) = terminate_process(process) {
+            return TerminateTransactionOutcome {
+                applied,
+                failure: Some(format!("SIGKILL failed for pid {}: {error}", process.pid)),
+            };
+        }
+        applied += 1;
+    }
+    TerminateTransactionOutcome {
+        applied,
+        failure: None,
+    }
 }
 
 fn apply_freeze_transaction(
@@ -1299,10 +1997,10 @@ fn backend_environment(processes: &[RuntimeProcess]) -> BackendEnvironment {
     // 始终为 None，走真实 binder 检测；仅测试通过 set_test_binder_available 注入。
     let binder_available = match TEST_BINDER_AVAILABLE.with(|cell| cell.get()) {
         Some(value) => value,
-        None => {
-            crate::sys::binder::detect_binder_freezer_capability().status
-                == crate::domain::capability::CapabilityStatus::Available
-        }
+        None => discover_runtime_capabilities().iter().any(|capability| {
+            capability.name == crate::domain::capability::CapabilityName::BinderFreezer
+                && capability.status == crate::domain::capability::CapabilityStatus::Available
+        }),
     };
     BackendEnvironment {
         cgroup_available: !processes.is_empty()
@@ -1358,13 +2056,17 @@ fn stamp_operation(
 }
 
 fn managed_app_from_record(package_name: &str, uid: u32) -> ManagedApp {
+    const PER_USER_RANGE: u32 = 100_000;
+    const FIRST_APPLICATION_UID: u32 = 10_000;
+    let is_system_app = uid % PER_USER_RANGE < FIRST_APPLICATION_UID;
     ManagedApp {
         package_name: package_name.to_owned(),
         user_id: 0,
         uid,
         label: package_name.to_owned(),
-        is_system_app: false,
-        protected_reason: None,
+        is_system_app,
+        protected_reason: protected_reason_for(package_name, is_system_app)
+            .or(is_system_app.then_some(ProtectedReason::SystemCritical)),
         policy_id: "manager-v1".to_owned(),
         last_seen_baseline: "runtime".to_owned(),
     }
@@ -1373,7 +2075,8 @@ fn managed_app_from_record(package_name: &str, uid: u32) -> ManagedApp {
 fn policy_from_record(record: &ManagerAppConfigRecord) -> FreezePolicy {
     let mode = match record.mode {
         10 => FreezeMode::Terminate,
-        20 | 21 | 30 | 31 => FreezeMode::Freeze,
+        20 | 30 => FreezeMode::Freeze,
+        21 | 31 => FreezeMode::FreezeWithRestrictions,
         40 | 50 => FreezeMode::Protected,
         _ => FreezeMode::Free,
     };
@@ -1386,7 +2089,7 @@ fn policy_from_record(record: &ManagerAppConfigRecord) -> FreezePolicy {
         } else {
             ForegroundStrategy::Strict
         },
-        allow_network_restriction: record.mode == 31,
+        allow_network_restriction: mode_has_network_restriction(record.mode),
         allow_wakelock_restriction: false,
         fallback_strategy: vec![FallbackAction::Signal, FallbackAction::Skip],
         updated_at_ms: 0,
@@ -1494,11 +2197,94 @@ pub fn recover_after_restart(
     }
 }
 
+#[derive(Debug, Default)]
+struct RestartRecoveryOutcome {
+    cgroup_thawed: bool,
+    signal_resumed: bool,
+    failures: Vec<String>,
+}
+
+fn restart_identity_is_current(
+    process: &RuntimeProcess,
+    phase: &str,
+    validate_process: &mut impl FnMut(&RuntimeProcess) -> Result<bool, DaemonError>,
+) -> Result<(), String> {
+    match validate_process(process) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!(
+            "identity validation failed {phase} for pid {}",
+            process.pid
+        )),
+        Err(error) => Err(format!(
+            "identity validation failed {phase} for pid {}: {error}",
+            process.pid
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_process_after_restart(
+    process: &RuntimeProcess,
+    signal_stopped: bool,
+    validate_process: &mut impl FnMut(&RuntimeProcess) -> Result<bool, DaemonError>,
+    thaw_cgroup: &mut impl FnMut(&str) -> Result<(), DaemonError>,
+    unfreeze_binder: &mut impl FnMut(&RuntimeProcess) -> Result<(), DaemonError>,
+    resume_signal: &mut impl FnMut(&RuntimeProcess) -> Result<(), DaemonError>,
+) -> RestartRecoveryOutcome {
+    let mut outcome = RestartRecoveryOutcome::default();
+    if let Some(cgroup_path) = process.cgroup_freeze_path.as_deref() {
+        if let Err(error) =
+            restart_identity_is_current(process, "before cgroup thaw", validate_process)
+        {
+            outcome.failures.push(error);
+            return outcome;
+        }
+        match thaw_cgroup(cgroup_path) {
+            Ok(()) => outcome.cgroup_thawed = true,
+            Err(error) => outcome.failures.push(format!(
+                "cgroup thaw failed for pid {}: {error}",
+                process.pid
+            )),
+        }
+
+        if let Err(error) =
+            restart_identity_is_current(process, "before binder unfreeze", validate_process)
+        {
+            outcome.failures.push(error);
+            return outcome;
+        }
+        if let Err(error) = unfreeze_binder(process) {
+            outcome.failures.push(format!(
+                "binder unfreeze failed for pid {}: {error}",
+                process.pid
+            ));
+        }
+    } else if !signal_stopped {
+        return outcome;
+    }
+
+    if signal_stopped {
+        if let Err(error) =
+            restart_identity_is_current(process, "immediately before SIGCONT", validate_process)
+        {
+            outcome.failures.push(error);
+            return outcome;
+        }
+        match resume_signal(process) {
+            Ok(()) => outcome.signal_resumed = true,
+            Err(error) => outcome
+                .failures
+                .push(format!("SIGCONT failed for pid {}: {error}", process.pid)),
+        }
+    }
+    outcome
+}
+
 /// 守护进程重启后，上一轮用信号回退（SIGSTOP）冻结的进程仍处于 T 状态：
 /// `frozen_apps` 仅存内存未持久化，新实例不知道哪些进程曾被 SIGSTOP，
 /// discover 又把 control_state 硬编码为 Running，导致前台解冻路径不会发 SIGCONT。
-/// 这里在进入 server 前，扫描所有受管 uid 中处于停止状态的进程并补发 SIGCONT，
-/// 让这些应用在重启后能被正常使用，再由后续控制循环决定是否重新冻结。
+/// 这里在进入 server 前，逐个重验 PID/UID/start-time，恢复 cgroup/binder 冻结并在
+/// 进程仍处于 T/t 时补发 SIGCONT，让这些应用能被正常使用后再由控制循环决定是否冻结。
 pub fn recover_stopped_managed_processes_after_restart(state: &mut ReadOnlyState) {
     let managed_uids: BTreeSet<u32> = state
         .app_config
@@ -1511,54 +2297,750 @@ pub fn recover_stopped_managed_processes_after_restart(state: &mut ReadOnlyState
     }
 
     let timestamp_ms = current_timestamp_ms();
-    let processes_by_uid = match procfs::discover_managed_uid_processes(
-        procfs::PROC_ROOT,
-        &managed_uids,
-    ) {
-        Ok(map) => map,
-        Err(error) => {
-            state.manager_log.push_once(LogRecord::fault(
-                LogLevel::Error,
-                timestamp_ms,
-                format!("restart recovery: process discovery failed: {error}"),
-            ));
-            return;
-        }
-    };
+    let processes_by_uid =
+        match procfs::discover_managed_uid_processes(procfs::PROC_ROOT, &managed_uids) {
+            Ok(map) => map,
+            Err(error) => {
+                state.manager_log.push_once(LogRecord::fault(
+                    LogLevel::Error,
+                    timestamp_ms,
+                    format!("restart recovery: process discovery failed: {error}"),
+                ));
+                return;
+            }
+        };
 
-    let mut recovered = 0u32;
+    let mut cgroup_thawed = 0u32;
+    let mut signal_resumed = 0u32;
     let mut failed = 0u32;
     for (_uid, processes) in &processes_by_uid {
         for process in processes {
-            // 只恢复被信号停止（T/t）的进程；cgroup 冻结的进程由 cgroup.freeze
-            // 自行管理状态，且这里没有 cgroup 路径上下文去解冻，故跳过。
-            if process.cgroup_freeze_path.is_some() {
+            let signal_stopped =
+                fs::read_to_string(format!("{}/{}/stat", procfs::PROC_ROOT, process.pid))
+                    .ok()
+                    .is_some_and(|stat| procfs::proc_state_is_stopped(&stat));
+            if process.cgroup_freeze_path.is_none() && !signal_stopped {
                 continue;
             }
-            if !procfs::proc_state_is_stopped(
-                &match fs::read_to_string(format!(
-                    "{}/{}/stat",
-                    procfs::PROC_ROOT,
-                    process.pid
-                )) {
-                    Ok(stat) => stat,
-                    Err(_) => continue,
+
+            let outcome = recover_process_after_restart(
+                process,
+                signal_stopped,
+                &mut |candidate| procfs::recheck_process_identity(procfs::PROC_ROOT, candidate),
+                &mut |path| cgroup::write_freeze_state(path, cgroup::FreezeState::Thawed),
+                &mut |candidate| {
+                    let binder_pid = u32::try_from(candidate.pid).map_err(|_| {
+                        DaemonError::system(format!("invalid binder pid {}", candidate.pid))
+                    })?;
+                    let binder_path = binder::discover_binder_device().ok_or_else(|| {
+                        DaemonError::system("binder device disappeared during restart recovery")
+                    })?;
+                    Ok(binder::set_binder_freeze(
+                        binder_path,
+                        binder_pid,
+                        binder::BinderFreezeRequest::Unfreeze,
+                        0,
+                    )?)
                 },
-            ) {
-                continue;
+                &mut |candidate| signal::send_signal(candidate.pid, signal::SignalAction::Continue),
+            );
+            if outcome.cgroup_thawed {
+                cgroup_thawed += 1;
             }
-            match signal::send_signal(process.pid, signal::SignalAction::Continue) {
-                Ok(()) => recovered += 1,
-                Err(_) => failed += 1,
+            if outcome.signal_resumed {
+                signal_resumed += 1;
+            }
+            if !outcome.failures.is_empty() {
+                failed += 1;
             }
         }
     }
 
-    if recovered > 0 || failed > 0 {
+    if cgroup_thawed > 0 || signal_resumed > 0 || failed > 0 {
         state.manager_log.push_once(LogRecord::fault(
             LogLevel::Info,
             timestamp_ms,
-            format!("restart recovery: SIGCONT recovered={recovered} failed={failed}"),
+            format!(
+                "restart recovery: cgroup_thawed={cgroup_thawed} sigcont_resumed={signal_resumed} failed={failed}"
+            ),
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+
+    use super::{
+        managed_app_from_record, manager_wakeup_interval_ms, parse_legacy_uid_token,
+        policy_from_record, reconcile_live_process_control_states, recover_process_after_restart,
+        refreeze_audit_due, requested_control_backend, run_control_pass,
+        run_control_pass_with_sampling_and_terminate, run_control_pass_with_settings,
+        RequestedControlBackend, RuntimeControlState,
+    };
+    use crate::{
+        app::{controller::set_test_binder_available, error::DaemonError},
+        domain::{
+            policy::ProtectedReason,
+            runtime::{ControlState, ProcessState, RuntimeProcess},
+        },
+        protocol::manager_v1::ManagerAppConfigRecord,
+        sys::cgroup::FreezeState,
+    };
+
+    fn process(uid: u32, pid: i32, control_state: ControlState) -> RuntimeProcess {
+        RuntimeProcess {
+            pid,
+            uid,
+            package_name: "com.example.app".to_owned(),
+            process_name: "com.example.app".to_owned(),
+            proc_state: ProcessState::Cached,
+            control_state,
+            cgroup_freeze_path: None,
+            binder_state: None,
+            start_time_ticks: Some(1),
+            last_seen_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn live_control_state_reconciliation_uses_cgroup_and_stop_evidence() {
+        let uid = 10_123;
+        let mut cgroup_frozen = process(uid, 123, ControlState::Running);
+        cgroup_frozen.cgroup_freeze_path = Some("/cgroup/frozen".to_owned());
+        let stopped = process(uid, 124, ControlState::Running);
+        let tracing_stopped = process(uid, 125, ControlState::Running);
+        let mut cgroup_thawed = process(uid, 126, ControlState::Frozen);
+        cgroup_thawed.cgroup_freeze_path = Some("/cgroup/thawed".to_owned());
+        let mut processes = vec![cgroup_frozen, stopped, tracing_stopped, cgroup_thawed];
+
+        reconcile_live_process_control_states(
+            &mut processes,
+            |path| match path {
+                "/cgroup/frozen" => Ok(FreezeState::Frozen),
+                "/cgroup/thawed" => Ok(FreezeState::Thawed),
+                unexpected => Err(DaemonError::system(format!(
+                    "unexpected cgroup path {unexpected}"
+                ))),
+            },
+            |pid| match pid {
+                123 | 126 => Ok('S'),
+                124 => Ok('T'),
+                125 => Ok('t'),
+                unexpected => Err(DaemonError::system(format!("unexpected pid {unexpected}"))),
+            },
+        );
+
+        assert_eq!(processes[0].control_state, ControlState::Frozen);
+        assert_eq!(processes[1].control_state, ControlState::Frozen);
+        assert_eq!(processes[2].control_state, ControlState::Frozen);
+        assert_eq!(processes[3].control_state, ControlState::Running);
+    }
+
+    #[test]
+    fn live_control_state_reconciliation_keeps_uncertain_processes_unknown() {
+        let uid = 10_123;
+        let mut unreadable_cgroup = process(uid, 123, ControlState::Running);
+        unreadable_cgroup.cgroup_freeze_path = Some("/cgroup/unreadable".to_owned());
+        let unreadable_proc = process(uid, 124, ControlState::Running);
+        let mut processes = vec![unreadable_cgroup, unreadable_proc];
+
+        reconcile_live_process_control_states(
+            &mut processes,
+            |_| Err(DaemonError::system("cgroup state unavailable")),
+            |pid| match pid {
+                123 => Ok('S'),
+                124 => Err(DaemonError::system("proc state unavailable")),
+                unexpected => Err(DaemonError::system(format!("unexpected pid {unexpected}"))),
+            },
+        );
+
+        assert_eq!(processes[0].control_state, ControlState::Unknown);
+        assert_eq!(processes[1].control_state, ControlState::Unknown);
+    }
+
+    #[test]
+    fn refreeze_audit_keeps_unknown_processes_tracked_without_refreezing() {
+        let uid = 10_123;
+        let mut state = RuntimeControlState::default();
+        let freeze_calls = RefCell::new(0);
+
+        run_control_pass(
+            &mut state,
+            &[config(uid, 30)],
+            |_, _| Ok(vec![process(uid, 123, ControlState::Running)]),
+            |_| {
+                *freeze_calls.borrow_mut() += 1;
+                Ok(())
+            },
+            |_| Ok(()),
+            &[],
+            0,
+        )
+        .expect("initial freeze succeeds");
+
+        run_control_pass(
+            &mut state,
+            &[config(uid, 30)],
+            |_, _| Ok(vec![process(uid, 123, ControlState::Unknown)]),
+            |_| {
+                *freeze_calls.borrow_mut() += 1;
+                Ok(())
+            },
+            |_| Ok(()),
+            &[],
+            60_000,
+        )
+        .expect("uncertain audit observation is not treated as a thaw");
+
+        assert_eq!(*freeze_calls.borrow(), 1);
+        let rows = state.freeze_status_records(
+            &[config(uid, 30)],
+            &BTreeMap::from([(uid, vec![process(uid, 123, ControlState::Unknown)])]),
+            &[],
+            60_000,
+        );
+        assert_eq!(rows[0].state, 3, "unknown state remains tracked as frozen");
+    }
+
+    fn config(uid: u32, mode: i32) -> ManagerAppConfigRecord {
+        ManagerAppConfigRecord {
+            uid,
+            mode,
+            permissive: false,
+        }
+    }
+
+    #[test]
+    fn legacy_uid_tokens_require_a_canonical_numeric_format() {
+        assert_eq!(parse_legacy_uid_token("10000"), Some(10_000));
+        assert_eq!(parse_legacy_uid_token("10000uid10000"), Some(10_000));
+        assert_eq!(parse_legacy_uid_token("110000uid110000"), Some(110_000));
+        assert_eq!(parse_legacy_uid_token("com.example.uid1000"), None);
+        assert_eq!(parse_legacy_uid_token("10000uid10001"), None);
+    }
+
+    #[test]
+    fn runtime_system_uids_are_protected_from_control() {
+        let app = managed_app_from_record("android", 1_000);
+
+        assert!(app.is_system_app);
+        assert_eq!(app.protected_reason, Some(ProtectedReason::SystemCritical));
+    }
+
+    #[test]
+    fn system_uid_signal_policy_is_skipped_before_any_signal_is_sent() {
+        let uid = 1_000;
+        let mut state = RuntimeControlState::default();
+        let mut settings = vec![0; 256];
+        settings[2] = 10;
+        let signal_calls = RefCell::new(0);
+
+        run_control_pass_with_settings(
+            &mut state,
+            &[config(uid, 20)],
+            &settings,
+            |_, _| Ok(vec![process(uid, 123, ControlState::Running)]),
+            |_| {
+                *signal_calls.borrow_mut() += 1;
+                Ok(())
+            },
+            |_| Ok(()),
+            &[],
+            0,
+        )
+        .expect("system uid policy is evaluated without a backend error");
+
+        assert_eq!(*signal_calls.borrow(), 0);
+        assert!(
+            state.pending_freeze_uids().is_empty(),
+            "protected system UID must not be exposed to the hook as pending"
+        );
+    }
+
+    #[test]
+    fn protected_system_uid_thaws_historical_freeze_tracking() {
+        let uid = 1_000;
+        let mut state = RuntimeControlState::default();
+        state.track_frozen(("com.example.app".to_owned(), uid), 0);
+        let unfreezes = RefCell::new(Vec::new());
+
+        run_control_pass(
+            &mut state,
+            &[config(uid, 20)],
+            |_, _| Ok(vec![process(uid, 123, ControlState::Frozen)]),
+            |_| panic!("protected system UID must never freeze again"),
+            |process| {
+                unfreezes.borrow_mut().push(process.pid);
+                Ok(())
+            },
+            &[],
+            1,
+        )
+        .expect("protected system UID recovery");
+
+        assert_eq!(&*unfreezes.borrow(), &[123]);
+        assert!(state.pending_freeze_uids().is_empty());
+    }
+
+    #[test]
+    fn sigstop_mode_uses_the_signal_backend_even_when_cgroup_is_available() {
+        let _binder_guard = set_test_binder_available(true);
+        let uid = 10_123;
+        let mut process = process(uid, 123, ControlState::Running);
+        process.cgroup_freeze_path =
+            Some("/sys/fs/cgroup/uid_10123/pid_123/cgroup.freeze".to_owned());
+        let signal_backend_was_used = RefCell::new(false);
+
+        run_control_pass(
+            &mut RuntimeControlState::default(),
+            &[config(uid, 20)],
+            |_, _| Ok(vec![process.clone()]),
+            |candidate| {
+                *signal_backend_was_used.borrow_mut() = candidate.cgroup_freeze_path.is_none();
+                Ok(())
+            },
+            |_| Ok(()),
+            &[],
+            0,
+        )
+        .expect("SIGSTOP control pass");
+
+        assert!(*signal_backend_was_used.borrow());
+    }
+
+    #[test]
+    fn freezer_fallback_to_signal_reports_the_signal_backend() {
+        let _binder_guard = set_test_binder_available(false);
+        let uid = 10_123;
+        let mut runtime_process = process(uid, 123, ControlState::Running);
+        runtime_process.cgroup_freeze_path =
+            Some("/sys/fs/cgroup/uid_10123/pid_123/cgroup.freeze".to_owned());
+
+        let mut state = RuntimeControlState::default();
+        run_control_pass(
+            &mut state,
+            &[config(uid, 30)],
+            |_, _| Ok(vec![runtime_process.clone()]),
+            |candidate| {
+                assert!(candidate.cgroup_freeze_path.is_none());
+                Ok(())
+            },
+            |_| Ok(()),
+            &[],
+            0,
+        )
+        .expect("signal fallback succeeds");
+
+        let json = state.operation_log.to_json();
+        assert!(json.contains("\"backend\":\"signal.stop\""));
+        assert!(!json.contains("\"backend\":\"cgroup.freeze\""));
+    }
+
+    #[test]
+    fn sigstop_break_mode_requests_network_restriction() {
+        let policy = policy_from_record(&config(10_123, 21));
+        let crate::domain::policy::FreezePolicy::Selected {
+            allow_network_restriction,
+            ..
+        } = policy;
+
+        assert!(allow_network_restriction);
+    }
+
+    #[test]
+    fn mode_change_thaws_a_previously_frozen_uid_before_other_control_records_run() {
+        let frozen_uid = 10_001;
+        let active_uid = 10_002;
+        let mut state = RuntimeControlState::default();
+        let frozen_process = process(frozen_uid, 101, ControlState::Running);
+
+        run_control_pass(
+            &mut state,
+            &[config(frozen_uid, 30)],
+            |_, uid| {
+                assert_eq!(uid, frozen_uid);
+                Ok(vec![frozen_process.clone()])
+            },
+            |_| Ok(()),
+            |_| Ok(()),
+            &[],
+            0,
+        )
+        .expect("initial freeze");
+
+        let unfreezes = RefCell::new(Vec::new());
+        run_control_pass(
+            &mut state,
+            &[config(frozen_uid, 40), config(active_uid, 30)],
+            |_, uid| {
+                if uid == frozen_uid {
+                    return Ok(vec![frozen_process.clone()]);
+                }
+                assert_eq!(
+                    uid, active_uid,
+                    "the whitelist uid must not be controlled again"
+                );
+                Ok(Vec::new())
+            },
+            |_| Ok(()),
+            |candidate| {
+                unfreezes.borrow_mut().push(candidate.pid);
+                Ok(())
+            },
+            &[],
+            1_000,
+        )
+        .expect("mode-change cleanup");
+
+        assert_eq!(&*unfreezes.borrow(), &[101]);
+    }
+
+    #[test]
+    fn failed_new_pid_rollback_keeps_the_uid_tracked_for_later_recovery() {
+        let _binder_guard = set_test_binder_available(true);
+        let uid = 10_123;
+        let mut state = RuntimeControlState::default();
+        let mut discovery_count = 0;
+
+        run_control_pass(
+            &mut state,
+            &[config(uid, 30)],
+            |_, _| {
+                discovery_count += 1;
+                let mut original = process(uid, 123, ControlState::Running);
+                original.cgroup_freeze_path =
+                    Some("/sys/fs/cgroup/apps/uid_10123/pid_123/cgroup.freeze".to_owned());
+                if discovery_count == 1 {
+                    return Ok(vec![original]);
+                }
+                let mut new_process = process(uid, 456, ControlState::Running);
+                new_process.cgroup_freeze_path =
+                    Some("/sys/fs/cgroup/apps/uid_10123/pid_456/cgroup.freeze".to_owned());
+                Ok(vec![original, new_process])
+            },
+            |_| Ok(()),
+            |_| Err(DaemonError::system("thaw failed")),
+            &[],
+            0,
+        )
+        .expect("new pid rollback is recorded");
+
+        let rows = state.freeze_status_records(
+            &[config(uid, 30)],
+            &BTreeMap::from([(uid, vec![process(uid, 123, ControlState::Frozen)])]),
+            &[],
+            1,
+        );
+        assert_eq!(rows[0].state, 3, "failed thaw must remain recoverable");
+    }
+
+    #[test]
+    fn periodic_wakeup_thaws_a_frozen_background_uid_after_the_configured_interval() {
+        let uid = 10_123;
+        let mut state = RuntimeControlState::default();
+        let mut settings = vec![0; 256];
+        settings[2] = 0;
+        settings[3] = 1;
+        let mut discovery_count = 0;
+        let unfreezes = RefCell::new(0);
+
+        run_control_pass_with_settings(
+            &mut state,
+            &[config(uid, 30)],
+            &settings,
+            |_, _| {
+                discovery_count += 1;
+                Ok(vec![process(
+                    uid,
+                    123,
+                    if discovery_count == 1 {
+                        ControlState::Running
+                    } else {
+                        ControlState::Frozen
+                    },
+                )])
+            },
+            |_| Ok(()),
+            |_| {
+                *unfreezes.borrow_mut() += 1;
+                Ok(())
+            },
+            &[],
+            0,
+        )
+        .expect("initial freeze");
+        run_control_pass_with_settings(
+            &mut state,
+            &[config(uid, 30)],
+            &settings,
+            |_, _| Ok(vec![process(uid, 123, ControlState::Frozen)]),
+            |_| Ok(()),
+            |_| {
+                *unfreezes.borrow_mut() += 1;
+                Ok(())
+            },
+            &[],
+            5 * 60_000,
+        )
+        .expect("periodic wakeup pass");
+
+        assert_eq!(*unfreezes.borrow(), 1);
+    }
+
+    #[test]
+    fn audit_refreeze_restarts_the_periodic_wakeup_interval() {
+        let uid = 10_123;
+        let mut state = RuntimeControlState::default();
+        let mut settings = vec![0; 256];
+        settings[3] = 1;
+        let unfreezes = RefCell::new(0);
+
+        run_control_pass_with_settings(
+            &mut state,
+            &[config(uid, 30)],
+            &settings,
+            |_, _| Ok(vec![process(uid, 123, ControlState::Running)]),
+            |_| Ok(()),
+            |_| Ok(()),
+            &[],
+            0,
+        )
+        .expect("initial freeze");
+
+        run_control_pass_with_settings(
+            &mut state,
+            &[config(uid, 30)],
+            &settings,
+            |_, _| Ok(vec![process(uid, 123, ControlState::Running)]),
+            |_| Ok(()),
+            |_| Ok(()),
+            &[],
+            60_000,
+        )
+        .expect("audit refreeze");
+
+        run_control_pass_with_settings(
+            &mut state,
+            &[config(uid, 30)],
+            &settings,
+            |_, _| Ok(vec![process(uid, 123, ControlState::Frozen)]),
+            |_| Ok(()),
+            |_| {
+                *unfreezes.borrow_mut() += 1;
+                Ok(())
+            },
+            &[],
+            5 * 60_000,
+        )
+        .expect("periodic wakeup check after an audit refreeze");
+
+        assert_eq!(
+            *unfreezes.borrow(),
+            0,
+            "audit refreeze must reset the next periodic wakeup deadline"
+        );
+    }
+
+    #[test]
+    fn disabled_regular_refreeze_does_not_recreate_an_expired_audit_deadline() {
+        let mut state = RuntimeControlState::default();
+        let settings = vec![0; 256];
+
+        assert!(!refreeze_audit_due(&mut state, &settings, 0));
+        assert!(!refreeze_audit_due(&mut state, &settings, 15 * 60_000));
+        assert!(!refreeze_audit_due(&mut state, &settings, 15 * 60_000 + 1));
+    }
+
+    #[test]
+    fn wakeup_timeout_supports_the_two_hour_spinner_value() {
+        let mut settings = vec![0; 256];
+        settings[3] = 5;
+
+        assert_eq!(manager_wakeup_interval_ms(&settings), Some(120 * 60_000));
+    }
+
+    #[test]
+    fn disabled_control_thaws_every_tracked_process_and_clears_pending_state() {
+        let uid = 10_123;
+        let mut state = RuntimeControlState::default();
+        let runtime_process = process(uid, 123, ControlState::Running);
+        let mut settings = vec![0; 256];
+        settings[2] = 5;
+
+        run_control_pass_with_settings(
+            &mut state,
+            &[config(uid, 30)],
+            &settings,
+            |_, _| Ok(vec![runtime_process.clone()]),
+            |_| Ok(()),
+            |_| Ok(()),
+            &[],
+            0,
+        )
+        .expect("schedule pending freeze");
+        assert_eq!(state.pending_freeze_uids(), vec![uid]);
+
+        run_control_pass(
+            &mut state,
+            &[config(uid, 30)],
+            |_, _| Ok(vec![runtime_process.clone()]),
+            |_| Ok(()),
+            |_| Ok(()),
+            &[],
+            5_000,
+        )
+        .expect("freeze before control is disabled");
+
+        let thawed = RefCell::new(Vec::new());
+        state
+            .thaw_all_frozen(
+                |_, discovered_uid| {
+                    assert_eq!(discovered_uid, uid);
+                    Ok(vec![runtime_process.clone()])
+                },
+                |candidate| {
+                    thawed.borrow_mut().push(candidate.pid);
+                    Ok(())
+                },
+                |_| Ok(true),
+                6_000,
+            )
+            .expect("disabled control thaws tracked app");
+
+        assert_eq!(&*thawed.borrow(), &[123]);
+        assert!(state.pending_freeze_uids().is_empty());
+        let rows = state.freeze_status_records(
+            &[config(uid, 30)],
+            &BTreeMap::from([(uid, vec![runtime_process])]),
+            &[],
+            6_000,
+        );
+        assert_eq!(rows[0].state, 0);
+    }
+
+    #[test]
+    fn successful_break_mode_queues_network_restriction_only_after_freeze() {
+        let uid = 10_123;
+        let mut state = RuntimeControlState::default();
+        let signal_path_was_selected = RefCell::new(false);
+
+        run_control_pass(
+            &mut state,
+            &[config(uid, 21)],
+            |_, _| Ok(vec![process(uid, 123, ControlState::Running)]),
+            |candidate| {
+                *signal_path_was_selected.borrow_mut() = candidate.cgroup_freeze_path.is_none();
+                Ok(())
+            },
+            |_| Ok(()),
+            &[],
+            0,
+        )
+        .expect("SIGSTOP-break freeze succeeds");
+
+        assert!(*signal_path_was_selected.borrow());
+        assert_eq!(state.take_network_restriction_uids(), vec![uid]);
+        assert!(state.take_network_restriction_uids().is_empty());
+    }
+
+    #[test]
+    fn global_sigstop_overrides_freezer_mode_selection() {
+        let mut settings = vec![0; 256];
+        settings[5] = 2;
+
+        assert_eq!(
+            requested_control_backend(&config(10_123, 30), &settings),
+            RequestedControlBackend::Signal
+        );
+    }
+
+    #[test]
+    fn terminate_mode_uses_the_injected_sigkill_backend_after_identity_validation() {
+        let uid = 10_123;
+        let mut state = RuntimeControlState::default();
+        let killed = Rc::new(RefCell::new(Vec::new()));
+        let killed_by_backend = Rc::clone(&killed);
+
+        run_control_pass_with_sampling_and_terminate(
+            &mut state,
+            &[config(uid, 10)],
+            &[],
+            |_, _| Ok(vec![process(uid, 123, ControlState::Running)]),
+            |_| Ok(()),
+            |_| Ok(()),
+            |_| Ok(true),
+            |_, _| Ok(None),
+            move |candidate| {
+                killed_by_backend.borrow_mut().push(candidate.pid);
+                Ok(())
+            },
+            &[],
+            0,
+        )
+        .expect("terminate control pass");
+
+        assert_eq!(&*killed.borrow(), &[123]);
+        assert!(state.operation_log.to_json().contains("signal.kill"));
+    }
+
+    #[test]
+    fn restart_recovery_refuses_sigcont_after_identity_drift() {
+        let runtime_process = process(10_123, 123, ControlState::Frozen);
+        let signals = RefCell::new(Vec::new());
+        let outcome = recover_process_after_restart(
+            &runtime_process,
+            true,
+            &mut |_| Ok(false),
+            &mut |_| -> Result<(), DaemonError> { Ok(()) },
+            &mut |_| -> Result<(), DaemonError> { Ok(()) },
+            &mut |candidate| {
+                signals.borrow_mut().push(candidate.pid);
+                Ok(())
+            },
+        );
+
+        assert!(signals.borrow().is_empty());
+        assert!(outcome
+            .failures
+            .iter()
+            .any(|failure| failure.contains("immediately before SIGCONT")));
+    }
+
+    #[test]
+    fn restart_recovery_thaws_cgroup_and_binder_without_waiting_for_sigstop_state() {
+        let mut runtime_process = process(10_123, 123, ControlState::Frozen);
+        runtime_process.cgroup_freeze_path =
+            Some("/sys/fs/cgroup/uid_10123/pid_123/cgroup.freeze".to_owned());
+        let calls = RefCell::new(Vec::new());
+        let outcome = recover_process_after_restart(
+            &runtime_process,
+            false,
+            &mut |_| Ok(true),
+            &mut |path| {
+                calls.borrow_mut().push(format!("cgroup:{path}"));
+                Ok(())
+            },
+            &mut |candidate| {
+                calls.borrow_mut().push(format!("binder:{}", candidate.pid));
+                Ok(())
+            },
+            &mut |candidate| {
+                calls
+                    .borrow_mut()
+                    .push(format!("sigcont:{}", candidate.pid));
+                Ok(())
+            },
+        );
+
+        assert!(outcome.cgroup_thawed);
+        assert!(!outcome.signal_resumed);
+        assert_eq!(
+            &*calls.borrow(),
+            &[
+                "cgroup:/sys/fs/cgroup/uid_10123/pid_123/cgroup.freeze".to_owned(),
+                "binder:123".to_owned(),
+            ]
+        );
     }
 }

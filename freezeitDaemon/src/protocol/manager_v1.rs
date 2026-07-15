@@ -11,7 +11,9 @@ use crate::app::{
     error::DaemonError,
     logging::{decode_log_view, LogRecord, LogView, ManagerLog, LOG_LEVEL_SETTING_INDEX},
 };
-use crate::config::migration::parse_legacy_policy_line;
+use crate::config::migration::{
+    parse_legacy_policy_line, parse_legacy_policy_target, LegacyPolicyTarget,
+};
 
 pub const MANAGER_LISTEN_HOST: &str = "127.0.0.1";
 pub const MANAGER_LISTEN_PORT: u16 = 60613;
@@ -21,6 +23,11 @@ const CPU_HISTORY_BUCKETS: usize = 32;
 const CPU_CHART_CORES: usize = 8;
 
 static REALTIME_SAMPLER: OnceLock<Mutex<RealtimeSampler>> = OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    static REALTIME_SAMPLE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -112,6 +119,13 @@ pub struct ReadOnlyState {
     pub settings: Vec<u8>,
     pub xp_log: String,
     pub app_config: Vec<ManagerAppConfigRecord>,
+    /// Generation changes whenever the effective persisted settings or app policy
+    /// changes. Socket workers use it to reject stale hook-sync work.
+    pub config_revision: u64,
+    /// The original first token for each resolved app-config record. Keeping this
+    /// lets persistence update the right line without treating discarded package
+    /// rows as loaded records.
+    pub app_config_source_tokens: BTreeMap<u32, String>,
     pub freeze_status: Vec<ManagerFreezeStatusRecord>,
     pub module_env: String,
     pub work_mode: String,
@@ -149,6 +163,8 @@ impl Default for ReadOnlyState {
             settings: legacy_default_settings(),
             xp_log: "hook health unknown\n".to_owned(),
             app_config: Vec::new(),
+            config_revision: 0,
+            app_config_source_tokens: BTreeMap::new(),
             freeze_status: Vec::new(),
             module_env: "Magisk".to_owned(),
             work_mode: "Rust daemon degraded".to_owned(),
@@ -265,42 +281,12 @@ pub fn handle_manager_command(
     mut set_app_config: impl FnMut(&[u8]) -> Result<bool, DaemonError>,
 ) -> Result<Vec<u8>, DaemonError> {
     match frame.command {
-        ManagerCommand::SetAppCfg => {
-            let previous_records = state.app_config.clone();
-            let previous_xposed_payload = encode_xposed_config_payload(
-                &state.settings,
-                &encode_app_config(&previous_records),
-            )?;
-            let requested_records = decode_app_config(&frame.payload)?;
-            let records = merge_app_config_records(&previous_records, &requested_records);
-            let xposed_payload =
-                encode_xposed_config_payload(&state.settings, &encode_app_config(&records))?;
-            let previous_file = read_existing_file(state.app_config_path.as_deref())?;
-            persist_app_config(state, &previous_records, &records, previous_file.as_deref())?;
-            match set_app_config(&xposed_payload) {
-                Ok(true) => {
-                    if let Some(message) = format_config_change_log(&previous_records, &records) {
-                        append_legacy_log_message(state, &message);
-                    }
-                    state.app_config = records;
-                    state.hook_config_synced = true;
-                    Ok(b"success".to_vec())
-                }
-                Ok(false) => {
-                    restore_file(state.app_config_path.as_deref(), previous_file.as_deref())?;
-                    let _ = set_app_config(&previous_xposed_payload);
-                    state.hook_config_synced = false;
-                    append_legacy_log_message(state, "配置更新失败：Xposed拒绝新的应用配置");
-                    Ok(b"failure".to_vec())
-                }
-                Err(error) => {
-                    restore_file(state.app_config_path.as_deref(), previous_file.as_deref())?;
-                    let _ = set_app_config(&previous_xposed_payload);
-                    state.hook_config_synced = false;
-                    Err(error)
-                }
-            }
-        }
+        ManagerCommand::SetAppCfg => set_app_config_with_persistence_writer(
+            state,
+            &frame.payload,
+            &mut set_app_config,
+            |path, payload| atomic_write(path, payload),
+        ),
         ManagerCommand::SetAppLabel => {
             let labels = decode_app_label_payload(&frame.payload);
             let path = state.app_label_path.as_ref().ok_or_else(|| {
@@ -343,6 +329,79 @@ pub fn handle_manager_command(
     }
 }
 
+fn set_app_config_with_persistence_writer(
+    state: &mut ReadOnlyState,
+    payload: &[u8],
+    mut set_app_config: impl FnMut(&[u8]) -> Result<bool, DaemonError>,
+    persist_config: impl FnOnce(&str, &[u8]) -> Result<(), DaemonError>,
+) -> Result<Vec<u8>, DaemonError> {
+    let previous_records = state.app_config.clone();
+    let previous_xposed_payload =
+        encode_xposed_config_payload(&state.settings, &encode_app_config(&previous_records))?;
+    let requested_records = decode_app_config(payload)?;
+    let records = merge_app_config_records(&previous_records, &requested_records);
+    let xposed_payload =
+        encode_xposed_config_payload(&state.settings, &encode_app_config(&records))?;
+    let previous_file = read_existing_file(state.app_config_path.as_deref())?;
+    let source_tokens = match persist_app_config_with_writer(
+        state,
+        &previous_records,
+        &records,
+        previous_file.as_deref(),
+        persist_config,
+    ) {
+        Ok(AppConfigPersistenceOutcome::Durable(source_tokens)) => source_tokens,
+        Ok(AppConfigPersistenceOutcome::CommittedButUnconfirmed(source_tokens)) => {
+            commit_app_config(state, records, source_tokens);
+            state.hook_config_synced = false;
+            append_legacy_log_message(
+                state,
+                "配置写入未确认完成，但磁盘已更新；Xposed配置将在后台重新同步",
+            );
+            return Ok(b"failure".to_vec());
+        }
+        Err(error) => {
+            state.hook_config_synced = false;
+            return Err(error);
+        }
+    };
+
+    match set_app_config(&xposed_payload) {
+        Ok(true) => {
+            if let Some(message) = format_config_change_log(&previous_records, &records) {
+                append_legacy_log_message(state, &message);
+            }
+            commit_app_config(state, records, source_tokens);
+            state.hook_config_synced = true;
+            Ok(b"success".to_vec())
+        }
+        Ok(false) => {
+            if let Err(error) = rollback_failed_app_config_update(
+                state,
+                previous_file.as_deref(),
+                &previous_xposed_payload,
+                &mut set_app_config,
+            ) {
+                append_legacy_log_message(state, &format!("配置更新失败，回滚未完成：{error}"));
+                return Err(error);
+            }
+            append_legacy_log_message(state, "配置更新失败：Xposed拒绝新的应用配置");
+            Ok(b"failure".to_vec())
+        }
+        Err(error) => match rollback_failed_app_config_update(
+            state,
+            previous_file.as_deref(),
+            &previous_xposed_payload,
+            &mut set_app_config,
+        ) {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(DaemonError::system(format!(
+                "xposed config update failed: {error}; rollback failed: {rollback_error}"
+            ))),
+        },
+    }
+}
+
 fn encode_freeze_status(records: &[ManagerFreezeStatusRecord]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(records.len() * 20);
     for record in records {
@@ -356,10 +415,41 @@ fn encode_freeze_status(records: &[ManagerFreezeStatusRecord]) -> Vec<u8> {
 }
 
 fn append_legacy_proc_state_log(state: &mut ReadOnlyState) {
-    append_legacy_log_message(
-        state,
-        "进程冻结状态:\n\n PID | MiB |  状 态  | 进 程\n后台很干净，一个黑名单应用都没有",
-    );
+    let summary = if state.freeze_status.is_empty() {
+        "进程冻结状态:\n\n PID | MiB |  状 态  | 进 程\n后台很干净，一个黑名单应用都没有".to_owned()
+    } else {
+        let rows = state
+            .freeze_status
+            .iter()
+            .map(|record| {
+                format!(
+                    "{} | {} | {} | {} | {}",
+                    record.uid,
+                    if record.foreground {
+                        "前台"
+                    } else {
+                        "后台"
+                    },
+                    legacy_freeze_status_name(record.state),
+                    record.seconds.max(0),
+                    record.process_count.max(0),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("进程冻结状态:\n\n UID | 前台 | 状态 | 秒 | 进程\n{rows}")
+    };
+    append_legacy_log_message(state, &summary);
+}
+
+fn legacy_freeze_status_name(state: i32) -> &'static str {
+    match state {
+        0 => "后台运行",
+        1 => "前台",
+        2 => "等待冻结",
+        3 => "已冻结",
+        _ => "未知",
+    }
 }
 
 fn append_legacy_log_message(state: &mut ReadOnlyState, message: &str) {
@@ -460,8 +550,16 @@ pub fn encode_xposed_config_payload(
     let managed_line = records
         .iter()
         .filter(|record| record.mode != 40 && record.mode != 50)
-        .map(|record| format!("{:05}uid{}", record.uid, record.uid))
-        .collect::<Vec<_>>()
+        .map(|record| {
+            if record.uid > LEGACY_XPOSED_MAX_UID {
+                return Err(DaemonError::protocol(format!(
+                    "uid {} exceeds the legacy hook five-digit UID format",
+                    record.uid
+                )));
+            }
+            Ok(format!("{:05}uid{}", record.uid, record.uid))
+        })
+        .collect::<Result<Vec<_>, _>>()?
         .join(" ");
     let permissive_line = records
         .iter()
@@ -482,6 +580,8 @@ pub fn encode_xposed_config_payload(
 
     Ok(format!("{settings_line}\n{managed_line}\n{permissive_line}").into_bytes())
 }
+
+const LEGACY_XPOSED_MAX_UID: u32 = 99_999;
 
 pub fn encode_app_config(records: &[ManagerAppConfigRecord]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(records.len() * 12);
@@ -523,6 +623,16 @@ pub fn decode_app_config(payload: &[u8]) -> Result<Vec<ManagerAppConfigRecord>, 
 }
 
 fn set_settings_var(state: &mut ReadOnlyState, payload: &[u8]) -> Result<Vec<u8>, DaemonError> {
+    set_settings_var_with_writer(state, payload, |path, settings| {
+        atomic_write(path, settings)
+    })
+}
+
+fn set_settings_var_with_writer(
+    state: &mut ReadOnlyState,
+    payload: &[u8],
+    persist_settings: impl FnOnce(&str, &[u8]) -> Result<(), DaemonError>,
+) -> Result<Vec<u8>, DaemonError> {
     if payload.len() != 2 {
         return Ok(format!("数据长度不正确, 正常:2, 收到:{}", payload.len()).into_bytes());
     }
@@ -544,28 +654,80 @@ fn set_settings_var(state: &mut ReadOnlyState, payload: &[u8]) -> Result<Vec<u8>
         return Ok(error.into_bytes());
     }
 
-    if state.settings.len() != 256 {
-        state.settings = normalize_settings(Some(state.settings.clone()));
-    }
-    state.settings[idx] = val;
-    let Some(path) = &state.settings_path else {
+    let mut updated_settings = if state.settings.len() == 256 {
+        state.settings.clone()
+    } else {
+        normalize_settings(Some(state.settings.clone()))
+    };
+    updated_settings[idx] = val;
+    let Some(path) = state.settings_path.clone() else {
+        state.hook_config_synced = false;
         return Ok(
             format!("写入设置文件失败, [{idx}]:{val}: persistence path missing").into_bytes(),
         );
     };
-    if let Err(error) = atomic_write(path, &state.settings) {
+    if let Err(error) = persist_settings(&path, &updated_settings) {
+        // The write may have failed after the rename or while syncing its parent;
+        // read back the target before deciding whether memory still represents the
+        // persistent config. The manager still receives a failure because the
+        // durability acknowledgement failed, but a later hook sync must use the
+        // bytes that actually reached the target path.
+        if persisted_bytes_match(&path, &updated_settings) {
+            commit_settings(state, updated_settings);
+        }
+        state.hook_config_synced = false;
         return Ok(format!("写入设置文件失败, [{idx}]:{val}: {error}").into_bytes());
     }
+
+    commit_settings(state, updated_settings);
 
     Ok(b"success".to_vec())
 }
 
-fn persist_app_config(
+fn persisted_bytes_match(path: &str, expected: &[u8]) -> bool {
+    fs::read(path)
+        .map(|persisted| persisted == expected)
+        .unwrap_or(false)
+}
+
+fn commit_settings(state: &mut ReadOnlyState, settings: Vec<u8>) {
+    let changed = state.settings != settings;
+    state.settings = settings;
+    if changed {
+        advance_config_revision(state);
+    }
+}
+
+fn commit_app_config(
+    state: &mut ReadOnlyState,
+    records: Vec<ManagerAppConfigRecord>,
+    source_tokens: BTreeMap<u32, String>,
+) {
+    let changed = state.app_config != records;
+    state.app_config = records;
+    state.app_config_source_tokens = source_tokens;
+    if changed {
+        advance_config_revision(state);
+    }
+}
+
+fn advance_config_revision(state: &mut ReadOnlyState) {
+    state.config_revision = state.config_revision.wrapping_add(1);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AppConfigPersistenceOutcome {
+    Durable(BTreeMap<u32, String>),
+    CommittedButUnconfirmed(BTreeMap<u32, String>),
+}
+
+fn persist_app_config_with_writer(
     state: &ReadOnlyState,
     previous_records: &[ManagerAppConfigRecord],
     records: &[ManagerAppConfigRecord],
     previous_file: Option<&[u8]>,
-) -> Result<(), DaemonError> {
+    persist_config: impl FnOnce(&str, &[u8]) -> Result<(), DaemonError>,
+) -> Result<AppConfigPersistenceOutcome, DaemonError> {
     let Some(path) = &state.app_config_path else {
         return Err(DaemonError::config(
             "app config persistence path is not configured",
@@ -581,35 +743,101 @@ fn persist_app_config(
         .filter(|record| record.uid != u32::MAX)
         .map(|record| record.uid)
         .collect::<BTreeSet<_>>();
+    let previous_by_uid = previous_records
+        .iter()
+        .filter(|record| record.uid != u32::MAX)
+        .map(|record| (record.uid, record))
+        .collect::<BTreeMap<_, _>>();
+    let mut source_tokens = state.app_config_source_tokens.clone();
+    source_tokens.retain(|uid, _| previous_uids.contains(uid));
 
     let mut payload = String::new();
+    let mut persisted_uids = BTreeSet::new();
     if let Some(previous_file) = previous_file {
         if records == previous_records {
-            return Ok(());
+            return Ok(AppConfigPersistenceOutcome::Durable(source_tokens));
         }
         let previous_text = std::str::from_utf8(previous_file)
             .map_err(|_| DaemonError::config("existing app config is not valid UTF-8"))?;
-        let previous_records = previous_records
-            .iter()
-            .filter(|record| record.uid != u32::MAX)
+        let lines = previous_text
+            .split_inclusive('\n')
+            .enumerate()
+            .map(|(index, raw_line)| {
+                let (line, line_ending) = split_line_ending(raw_line);
+                (
+                    index,
+                    raw_line,
+                    line,
+                    line_ending,
+                    parse_legacy_policy_line(line),
+                )
+            })
             .collect::<Vec<_>>();
-        let mut record_index = 0;
-        for raw_line in previous_text.split_inclusive('\n') {
-            let (line, line_ending) = split_line_ending(raw_line);
-            let Some(parsed) = parse_legacy_policy_line(line) else {
+
+        let source_uid_by_token = source_tokens
+            .iter()
+            .map(|(uid, token)| (token.clone(), *uid))
+            .collect::<BTreeMap<_, _>>();
+        let mut line_uids = BTreeMap::new();
+        let mut matched_uids = BTreeSet::new();
+        for (index, _raw_line, _line, _line_ending, parsed) in &lines {
+            let Some(parsed) = parsed else {
+                continue;
+            };
+            let uid = source_uid_by_token
+                .get(parsed.package_or_uid.as_str())
+                .copied()
+                .or_else(|| {
+                    parse_legacy_uid_token(&parsed.package_or_uid)
+                        .filter(|uid| previous_by_uid.contains_key(uid))
+                });
+            if let Some(uid) = uid {
+                line_uids.insert(*index, uid);
+                matched_uids.insert(uid);
+                source_tokens.insert(uid, parsed.package_or_uid.clone());
+            }
+        }
+
+        // States created by older daemons did not retain source tokens. Preserve
+        // their legacy positional behavior only for records not anchored by a
+        // canonical UID token; once startup has a source map, unmatched rows are
+        // intentionally left untouched as unavailable/stale package entries.
+        if state.app_config_source_tokens.is_empty() {
+            let remaining_uids = previous_records
+                .iter()
+                .filter(|record| record.uid != u32::MAX && !matched_uids.contains(&record.uid))
+                .map(|record| record.uid)
+                .collect::<Vec<_>>();
+            let mut remaining_uids = remaining_uids.into_iter();
+            for (index, _raw_line, _line, _line_ending, parsed) in &lines {
+                if parsed.is_some() && !line_uids.contains_key(index) {
+                    let Some(uid) = remaining_uids.next() else {
+                        break;
+                    };
+                    line_uids.insert(*index, uid);
+                    matched_uids.insert(uid);
+                    if let Some(parsed) = parsed {
+                        source_tokens.insert(uid, parsed.package_or_uid.clone());
+                    }
+                }
+            }
+        }
+
+        for (index, raw_line, _line, line_ending, parsed) in lines {
+            let Some(parsed) = parsed else {
                 payload.push_str(raw_line);
                 continue;
             };
-            let Some(previous_record) = previous_records.get(record_index).copied() else {
-                return Err(DaemonError::config(
-                    "existing app config has more policy lines than loaded records",
-                ));
+            let Some(uid) = line_uids.get(&index).copied() else {
+                payload.push_str(raw_line);
+                continue;
             };
-            record_index += 1;
-            let record = records_by_uid
-                .get(&previous_record.uid)
-                .copied()
-                .unwrap_or(previous_record);
+            let Some(previous_record) = previous_by_uid.get(&uid).copied() else {
+                payload.push_str(raw_line);
+                continue;
+            };
+            persisted_uids.insert(uid);
+            let record = records_by_uid.get(&uid).copied().unwrap_or(previous_record);
             if record.mode == previous_record.mode
                 && record.permissive == previous_record.permissive
             {
@@ -624,32 +852,99 @@ fn persist_app_config(
                 ));
             }
         }
-        if record_index != previous_records.len() {
-            return Err(DaemonError::config(format!(
-                "existing app config cannot be aligned safely: {} lines, {} records",
-                record_index,
-                previous_records.len()
-            )));
-        }
     }
 
-    let records_to_append = records.iter().filter(|record| {
-        record.uid != u32::MAX && (previous_file.is_none() || !previous_uids.contains(&record.uid))
-    });
+    let records_to_append = records
+        .iter()
+        .filter(|record| record.uid != u32::MAX && !persisted_uids.contains(&record.uid));
     for record in records_to_append {
         if !payload.is_empty() && !payload.ends_with('\n') {
             payload.push('\n');
         }
+        let token = format!("{:05}uid{}", record.uid, record.uid);
         payload.push_str(&format!(
-            "{:05}uid{} {} {}\n",
-            record.uid,
-            record.uid,
+            "{} {} {}\n",
+            token,
             record.mode,
             i32::from(record.permissive)
         ));
+        source_tokens.insert(record.uid, token);
     }
 
-    atomic_write(path, payload.as_bytes())?;
+    let payload = payload.into_bytes();
+    let persistence = match persist_config(path, &payload) {
+        Ok(()) => AppConfigPersistenceOutcome::Durable(source_tokens.clone()),
+        Err(_) if persisted_bytes_match(path, &payload) => {
+            AppConfigPersistenceOutcome::CommittedButUnconfirmed(source_tokens.clone())
+        }
+        Err(error) => return Err(error),
+    };
+    source_tokens.retain(|uid, _| records_by_uid.contains_key(uid));
+    match persistence {
+        AppConfigPersistenceOutcome::Durable(_) => {
+            Ok(AppConfigPersistenceOutcome::Durable(source_tokens))
+        }
+        AppConfigPersistenceOutcome::CommittedButUnconfirmed(_) => Ok(
+            AppConfigPersistenceOutcome::CommittedButUnconfirmed(source_tokens),
+        ),
+    }
+}
+
+pub fn source_tokens_from_legacy_config(
+    app_config: Option<&str>,
+    mut resolve_package_uid: impl FnMut(&str) -> Option<u32>,
+) -> BTreeMap<u32, String> {
+    app_config
+        .into_iter()
+        .flat_map(str::lines)
+        .filter_map(parse_legacy_policy_line)
+        .filter_map(|record| {
+            let uid = resolve_package_uid(&record.package_or_uid)
+                .or_else(|| parse_legacy_uid_token(&record.package_or_uid))?;
+            Some((uid, record.package_or_uid))
+        })
+        .collect()
+}
+
+fn parse_legacy_uid_token(token: &str) -> Option<u32> {
+    match parse_legacy_policy_target(token) {
+        Some(LegacyPolicyTarget::Uid(uid)) => Some(uid),
+        Some(LegacyPolicyTarget::PackageName(_)) | None => None,
+    }
+}
+
+fn rollback_failed_app_config_update(
+    state: &mut ReadOnlyState,
+    previous_file: Option<&[u8]>,
+    previous_xposed_payload: &[u8],
+    set_app_config: &mut impl FnMut(&[u8]) -> Result<bool, DaemonError>,
+) -> Result<(), DaemonError> {
+    // This must happen before either rollback action: a failed restore leaves
+    // disk/hook state uncertain and must never retain a successful sync claim.
+    state.hook_config_synced = false;
+    let disk_result = restore_file(state.app_config_path.as_deref(), previous_file);
+    let hook_result = set_app_config(previous_xposed_payload);
+
+    if let Err(disk_error) = disk_result {
+        let detail = match hook_result {
+            Ok(true) => format!("disk restore failed: {disk_error}"),
+            Ok(false) => format!(
+                "disk restore failed: {disk_error}; hook restore rejected the previous config"
+            ),
+            Err(hook_error) => {
+                format!("disk restore failed: {disk_error}; hook restore failed: {hook_error}")
+            }
+        };
+        return Err(DaemonError::system(detail));
+    }
+
+    if !matches!(hook_result, Ok(true)) {
+        // The persisted state is back to its previous bytes. Preserve the legacy
+        // manager `failure` response and let the normal asynchronous sync retry
+        // the hook, rather than converting a hook rejection into a transport error.
+        append_legacy_log_message(state, "配置回滚：Xposed未确认旧配置，将在后台重试");
+    }
+
     Ok(())
 }
 
@@ -750,6 +1045,10 @@ pub fn encode_realtime_info_with_settings(
     payload: &[u8],
     settings: &[u8],
 ) -> Result<Vec<u8>, DaemonError> {
+    if let Some(response) = realtime_request_validation_response(payload)? {
+        return Ok(response);
+    }
+
     let sample = collect_realtime_sample(settings);
     let sampler = REALTIME_SAMPLER.get_or_init(|| Mutex::new(RealtimeSampler::default()));
     let mut sampler = sampler
@@ -764,24 +1063,19 @@ fn encode_realtime_info_with_sample(
     sampler: &mut RealtimeSampler,
     sample: RealtimeSample,
 ) -> Result<Vec<u8>, DaemonError> {
-    if payload.len() != 12 {
-        return Ok(format!("实时信息需要12字节, 实际收到[{}]", payload.len()).into_bytes());
+    if let Some(response) = realtime_request_validation_response(payload)? {
+        return Ok(response);
     }
 
+    // `realtime_request_validation_response` has already checked the payload
+    // length, dimensions, and response size before any system sampling.
     let height = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
     let width = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
     let available_mib = u32::from_le_bytes(payload[8..12].try_into().unwrap()) as i32;
-    if height < 20 || width < 20 {
-        return Ok(format!("宽高不符合, height[{height}] width[{width}]").into_bytes());
-    }
-
     let image_len = height
         .checked_mul(width)
         .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| DaemonError::protocol("realtime image size overflows"))?;
-    if image_len + 23 * 4 > MAX_PAYLOAD_LEN {
-        return Ok(format!("实时信息响应过大, height[{height}] width[{width}]").into_bytes());
-    }
+        .expect("validated realtime image size fits usize");
 
     let metrics = realtime_metrics_from_sample(available_mib, _settings, sampler, sample);
     let mut response = vec![0; image_len];
@@ -790,6 +1084,37 @@ fn encode_realtime_info_with_sample(
         response.extend_from_slice(&value.to_le_bytes());
     }
     Ok(response)
+}
+
+fn realtime_request_validation_response(payload: &[u8]) -> Result<Option<Vec<u8>>, DaemonError> {
+    if payload.len() != 12 {
+        return Ok(Some(
+            format!("实时信息需要12字节, 实际收到[{}]", payload.len()).into_bytes(),
+        ));
+    }
+
+    let height = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+    let width = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
+    if height < 20 || width < 20 {
+        return Ok(Some(
+            format!("宽高不符合, height[{height}] width[{width}]").into_bytes(),
+        ));
+    }
+
+    let image_len = height
+        .checked_mul(width)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| DaemonError::protocol("realtime image size overflows"))?;
+    if !matches!(
+        image_len.checked_add(23 * 4),
+        Some(response_len) if response_len <= MAX_PAYLOAD_LEN
+    ) {
+        return Ok(Some(
+            format!("实时信息响应过大, height[{height}] width[{width}]").into_bytes(),
+        ));
+    }
+
+    Ok(None)
 }
 
 fn encode_uid_time(state: &mut ReadOnlyState) -> Result<Vec<u8>, DaemonError> {
@@ -1048,6 +1373,9 @@ fn realtime_metrics_from_sample(
 }
 
 fn collect_realtime_sample(settings: &[u8]) -> RealtimeSample {
+    #[cfg(test)]
+    REALTIME_SAMPLE_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     let mut sample = RealtimeSample {
         meminfo: read_meminfo_mib(),
         proc_stat: fs::read_to_string("/proc/stat")
@@ -1610,5 +1938,286 @@ mod tests {
         ];
 
         assert_eq!(select_temperature_milli_celsius(zones), Some(40_300));
+    }
+
+    #[test]
+    fn settings_write_failure_keeps_memory_unchanged_and_marks_hook_unsynced() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut state = ReadOnlyState::default();
+        let previous_settings = state.settings.clone();
+        state.settings_path = Some(temp.path().to_string_lossy().into_owned());
+        state.hook_config_synced = true;
+        let frame = ManagerFrame {
+            command: ManagerCommand::SetSettingsVar,
+            payload: vec![13, 0],
+        };
+
+        let response = handle_manager_command(&frame, &mut state, |_| Ok(true))
+            .expect("persistence failure is returned to the manager");
+
+        assert_ne!(response, b"success");
+        assert_eq!(state.settings, previous_settings);
+        assert!(!state.hook_config_synced);
+    }
+
+    #[test]
+    fn settings_post_commit_write_failure_reconciles_memory_and_advances_revision() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("settings.db");
+        let mut state = ReadOnlyState::default();
+        state.settings_path = Some(path.to_string_lossy().into_owned());
+        state.hook_config_synced = true;
+        let previous_revision = state.config_revision;
+
+        let response = set_settings_var_with_writer(&mut state, &[13, 0], |path, bytes| {
+            fs::write(path, bytes).expect("simulate the completed rename");
+            Err(DaemonError::system("parent directory sync failed"))
+        })
+        .expect("post-commit persistence failure is returned to the manager");
+
+        assert_ne!(response, b"success");
+        assert_eq!(state.settings[13], 0);
+        assert_eq!(
+            fs::read(&path).expect("read committed settings"),
+            state.settings
+        );
+        assert_eq!(state.config_revision, previous_revision + 1);
+        assert!(!state.hook_config_synced);
+    }
+
+    #[test]
+    fn app_config_post_commit_write_failure_reconciles_memory_and_invalidates_hook_sync() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("appcfg.txt");
+        fs::write(&path, "10000uid10000 30 0\n").expect("seed app config");
+        let mut state = ReadOnlyState::default();
+        state.app_config_path = Some(path.to_string_lossy().into_owned());
+        state.app_config = vec![ManagerAppConfigRecord {
+            uid: 10_000,
+            mode: 30,
+            permissive: false,
+        }];
+        state.hook_config_synced = true;
+        let previous_revision = state.config_revision;
+        let requested = encode_app_config(&[ManagerAppConfigRecord {
+            uid: 10_000,
+            mode: 20,
+            permissive: false,
+        }]);
+        let hook_calls = std::cell::Cell::new(0);
+
+        let response = set_app_config_with_persistence_writer(
+            &mut state,
+            &requested,
+            |_| {
+                hook_calls.set(hook_calls.get() + 1);
+                Ok(true)
+            },
+            |path, bytes| {
+                fs::write(path, bytes).expect("simulate the completed rename");
+                Err(DaemonError::system("parent directory sync failed"))
+            },
+        )
+        .expect("post-commit persistence failure keeps the daemon coherent");
+
+        assert_eq!(response, b"failure");
+        assert_eq!(
+            hook_calls.get(),
+            0,
+            "unconfirmed write must not sync the hook"
+        );
+        assert_eq!(
+            state.app_config,
+            vec![ManagerAppConfigRecord {
+                uid: 10_000,
+                mode: 20,
+                permissive: false,
+            }]
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("read committed app config"),
+            "10000uid10000 20 0\n"
+        );
+        assert_eq!(state.config_revision, previous_revision + 1);
+        assert!(!state.hook_config_synced);
+    }
+
+    #[test]
+    fn config_revision_tracks_only_committed_manager_config_mutations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let app_config_path = temp.path().join("appcfg.txt");
+        fs::write(&app_config_path, "10000uid10000 30 0\n").expect("seed app config");
+        let settings_path = temp.path().join("settings.db");
+        let mut state = ReadOnlyState::default();
+        state.app_config_path = Some(app_config_path.to_string_lossy().into_owned());
+        state.settings_path = Some(settings_path.to_string_lossy().into_owned());
+        state.app_config = vec![ManagerAppConfigRecord {
+            uid: 10_000,
+            mode: 30,
+            permissive: false,
+        }];
+        let change = ManagerFrame {
+            command: ManagerCommand::SetAppCfg,
+            payload: encode_app_config(&[ManagerAppConfigRecord {
+                uid: 10_000,
+                mode: 20,
+                permissive: false,
+            }]),
+        };
+
+        let rejected = handle_manager_command(&change, &mut state, |_| Ok(false))
+            .expect("rejected app config has a legacy failure response");
+        assert_eq!(rejected, b"failure");
+        assert_eq!(state.config_revision, 0);
+
+        let applied = handle_manager_command(&change, &mut state, |_| Ok(true))
+            .expect("app config update succeeds");
+        assert_eq!(applied, b"success");
+        assert_eq!(state.config_revision, 1);
+
+        let repeated = handle_manager_command(&change, &mut state, |_| Ok(true))
+            .expect("identical app config update succeeds");
+        assert_eq!(repeated, b"success");
+        assert_eq!(state.config_revision, 1);
+
+        let setting = ManagerFrame {
+            command: ManagerCommand::SetSettingsVar,
+            payload: vec![13, 0],
+        };
+        let setting_applied = handle_manager_command(&setting, &mut state, |_| Ok(true))
+            .expect("settings update succeeds");
+        assert_eq!(setting_applied, b"success");
+        assert_eq!(state.config_revision, 2);
+
+        let setting_repeated = handle_manager_command(&setting, &mut state, |_| Ok(true))
+            .expect("identical settings update succeeds");
+        assert_eq!(setting_repeated, b"success");
+        assert_eq!(state.config_revision, 2);
+    }
+
+    #[test]
+    fn app_config_save_skips_unloaded_policy_lines_when_aligning_known_uid_rows() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("appcfg.txt");
+        fs::write(&path, "com.example.uninstalled 30 0\n10000uid10000 30 0\n")
+            .expect("seed app config");
+        let mut state = ReadOnlyState::default();
+        state.app_config_path = Some(path.to_string_lossy().into_owned());
+        state.app_config = vec![ManagerAppConfigRecord {
+            uid: 10_000,
+            mode: 30,
+            permissive: false,
+        }];
+        let frame = ManagerFrame {
+            command: ManagerCommand::SetAppCfg,
+            payload: encode_app_config(&[ManagerAppConfigRecord {
+                uid: 10_000,
+                mode: 20,
+                permissive: false,
+            }]),
+        };
+
+        let response = handle_manager_command(&frame, &mut state, |_| Ok(true))
+            .expect("valid UID record remains writable despite a stale package line");
+
+        assert_eq!(response, b"success");
+        assert_eq!(
+            fs::read_to_string(path).expect("read persisted config"),
+            "com.example.uninstalled 30 0\n10000uid10000 20 0\n"
+        );
+    }
+
+    #[test]
+    fn app_config_rollback_replays_old_hook_config_even_when_disk_restore_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("appcfg.txt");
+        fs::write(&path, "10000uid10000 30 0\n").expect("seed app config");
+        let mut state = ReadOnlyState::default();
+        state.app_config_path = Some(path.to_string_lossy().into_owned());
+        state.app_config = vec![ManagerAppConfigRecord {
+            uid: 10_000,
+            mode: 30,
+            permissive: false,
+        }];
+        state.hook_config_synced = true;
+        let frame = ManagerFrame {
+            command: ManagerCommand::SetAppCfg,
+            payload: encode_app_config(&[ManagerAppConfigRecord {
+                uid: 10_000,
+                mode: 20,
+                permissive: false,
+            }]),
+        };
+        let mut calls = 0;
+
+        let result = handle_manager_command(&frame, &mut state, |_| {
+            calls += 1;
+            if calls == 1 {
+                fs::remove_file(&path).expect("remove persisted config before rollback");
+                fs::create_dir(&path).expect("replace config path with directory");
+                Ok(false)
+            } else {
+                Ok(true)
+            }
+        });
+
+        assert!(result.is_err(), "failed disk rollback must be surfaced");
+        assert_eq!(calls, 2, "old hook config must still be replayed");
+        assert!(!state.hook_config_synced);
+    }
+
+    #[test]
+    fn proc_state_summary_uses_live_freeze_status_instead_of_a_fixed_clean_message() {
+        let mut state = ReadOnlyState::default();
+        state.freeze_status = vec![ManagerFreezeStatusRecord {
+            uid: 10_042,
+            foreground: false,
+            state: 3,
+            seconds: 12,
+            process_count: 2,
+        }];
+        let frame = ManagerFrame {
+            command: ManagerCommand::GetProcState,
+            payload: Vec::new(),
+        };
+
+        let response = handle_manager_command(&frame, &mut state, |_| Ok(true))
+            .expect("proc-state request succeeds");
+        let text = String::from_utf8(response).expect("proc-state output is UTF-8");
+
+        assert!(text.contains("10042"));
+        assert!(text.contains("冻结"));
+        assert!(!text.contains("后台很干净，一个黑名单应用都没有"));
+    }
+
+    #[test]
+    fn invalid_realtime_request_does_not_collect_system_metrics() {
+        REALTIME_SAMPLE_CALLS.with(|calls| calls.set(0));
+
+        let response = encode_realtime_info_with_settings(&[], &legacy_default_settings())
+            .expect("malformed realtime request receives a legacy error payload");
+
+        assert!(String::from_utf8_lossy(&response).contains("实时信息需要12字节"));
+        REALTIME_SAMPLE_CALLS.with(|calls| {
+            assert_eq!(
+                calls.get(),
+                0,
+                "invalid requests must not sample proc/sysfs data"
+            )
+        });
+    }
+
+    #[test]
+    fn xposed_config_rejects_uid_that_legacy_hook_cannot_parse() {
+        let payload = encode_app_config(&[ManagerAppConfigRecord {
+            uid: 110_000,
+            mode: 30,
+            permissive: false,
+        }]);
+
+        let error = encode_xposed_config_payload(&legacy_default_settings(), &payload)
+            .expect_err("work-profile UID must not be truncated to five digits");
+
+        assert!(error.to_string().contains("five-digit"));
     }
 }

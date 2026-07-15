@@ -63,7 +63,7 @@ fn discovers_uid_processes_with_cgroup_freeze_path() {
     );
     assert_eq!(
         processes[0].binder_state.as_deref(),
-        Some("context_switches voluntary=7 nonvoluntary=3 total=10")
+        Some("binder_queue unknown context_switches voluntary=7 nonvoluntary=3 total=10")
     );
 }
 

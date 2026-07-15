@@ -47,6 +47,9 @@ impl DownloadDeferral {
             return DownloadDeferralAction::Proceed;
         }
         let UidRxSample::Value(rx_bytes) = sample else {
+            // A gap makes the elapsed interval unknown. Keeping the old baseline would dilute a
+            // later burst across the unobserved period and could incorrectly permit freezing.
+            self.samples.remove(&uid);
             return DownloadDeferralAction::Postpone;
         };
         let Some(previous) = self.samples.insert(
@@ -72,16 +75,17 @@ impl DownloadDeferral {
 }
 
 pub fn is_candidate_package(package_name: &str) -> bool {
-    let package_name = package_name.to_ascii_lowercase();
-    [
-        "baidu.netdisk",
-        "quark.clouddrive",
+    const DOWNLOAD_CANDIDATE_PACKAGES: &[&str] = &[
+        "com.baidu.netdisk",
+        "com.quark.clouddrive",
         "com.google.android.apps.docs",
-        "pikpak",
+        "com.pikpak.android",
         "com.trim.app",
-    ]
-    .iter()
-    .any(|pattern| package_name.contains(pattern))
+    ];
+
+    DOWNLOAD_CANDIDATE_PACKAGES
+        .iter()
+        .any(|candidate| package_name.eq_ignore_ascii_case(candidate))
 }
 
 pub fn parse_uid_rx_bytes(netstats: &str) -> Result<BTreeMap<u32, u64>, DaemonError> {
@@ -128,4 +132,36 @@ pub fn sample_uid_rx_bytes_map() -> Result<BTreeMap<u32, u64>, DaemonError> {
         )));
     }
     parse_uid_rx_bytes(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_sample_resets_the_old_rate_baseline() {
+        let mut deferral = DownloadDeferral::default();
+        let uid = 10_123;
+        let package = "com.baidu.netdisk";
+
+        assert_eq!(
+            deferral.evaluate(uid, package, UidRxSample::Value(0), 0),
+            DownloadDeferralAction::Postpone
+        );
+        assert_eq!(
+            deferral.evaluate(uid, package, UidRxSample::Failed, 1_000),
+            DownloadDeferralAction::Postpone
+        );
+        assert_eq!(
+            deferral.evaluate(uid, package, UidRxSample::Value(8 * 1024 * 1024), 31_000,),
+            DownloadDeferralAction::Postpone
+        );
+    }
+
+    #[test]
+    fn candidate_matching_requires_an_explicit_package_identity() {
+        assert!(is_candidate_package("com.baidu.netdisk"));
+        assert!(is_candidate_package("com.pikpak.android"));
+        assert!(!is_candidate_package("com.example.pikpakhelper"));
+    }
 }
