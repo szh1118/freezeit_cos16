@@ -3,7 +3,7 @@ use freezeit_daemon::{
         controller::{
             decide_freeze, decide_freeze_after_reconciliation, mark_frozen, mark_running,
             run_control_pass, run_control_pass_with_settings, run_control_pass_with_validation,
-            RuntimeControlState,
+            set_test_binder_available, RuntimeControlState,
         },
         error::DaemonError,
         freezer_backend::{
@@ -124,6 +124,93 @@ fn runtime_status_snapshot_reports_frozen_and_foreground_rows() {
     assert!(foreground[0].foreground);
     assert_eq!(foreground[0].state, 1);
     assert_eq!(foreground[0].seconds, 0);
+}
+
+#[test]
+fn binderless_signal_fallback_foreground_thaw_refreezes_before_status_reports_frozen() {
+    let _binder_guard = set_test_binder_available(false);
+    let uid = 10_123;
+    let config = vec![ManagerAppConfigRecord {
+        uid,
+        mode: 30,
+        permissive: false,
+    }];
+    let mut runtime_process = process();
+    runtime_process.cgroup_freeze_path =
+        Some("/sys/fs/cgroup/uid_10123/pid_123/cgroup.freeze".to_owned());
+    let mut state = RuntimeControlState::default();
+    let stop_pids = RefCell::new(Vec::new());
+    let foreground_paths = RefCell::new(Vec::new());
+
+    run_control_pass(
+        &mut state,
+        &config,
+        |_, _| Ok(vec![runtime_process.clone()]),
+        |candidate| {
+            assert!(candidate.cgroup_freeze_path.is_none());
+            stop_pids.borrow_mut().push(candidate.pid);
+            Ok(())
+        },
+        |_| Ok(()),
+        &[],
+        0,
+    )
+    .expect("binderless fallback stops the background process");
+
+    run_control_pass(
+        &mut state,
+        &config,
+        |_, _| Ok(vec![runtime_process.clone()]),
+        |_| panic!("foreground process must not be frozen"),
+        |candidate| {
+            foreground_paths
+                .borrow_mut()
+                .push(candidate.cgroup_freeze_path.clone());
+            assert!(candidate.cgroup_freeze_path.is_none());
+            Ok(())
+        },
+        &[uid],
+        1,
+    )
+    .expect("foreground signal thaw succeeds");
+
+    let before_refreeze = state.freeze_status_records(
+        &config,
+        &BTreeMap::from([(uid, vec![runtime_process.clone()])]),
+        &[],
+        1,
+    );
+    assert_eq!(&*stop_pids.borrow(), &[123]);
+    assert_eq!(&*foreground_paths.borrow(), &[None]);
+    assert_eq!(before_refreeze[0].state, 0);
+    assert!(state
+        .operation_log
+        .to_json()
+        .contains("\"backend\":\"signal.cont\""));
+
+    run_control_pass(
+        &mut state,
+        &config,
+        |_, _| Ok(vec![runtime_process.clone()]),
+        |candidate| {
+            assert!(candidate.cgroup_freeze_path.is_none());
+            stop_pids.borrow_mut().push(candidate.pid);
+            Ok(())
+        },
+        |_| Ok(()),
+        &[],
+        2,
+    )
+    .expect("background process can be stopped again immediately");
+
+    let after_refreeze = state.freeze_status_records(
+        &config,
+        &BTreeMap::from([(uid, vec![runtime_process])]),
+        &[],
+        2,
+    );
+    assert_eq!(&*stop_pids.borrow(), &[123, 123]);
+    assert_eq!(after_refreeze[0].state, 3);
 }
 
 #[test]

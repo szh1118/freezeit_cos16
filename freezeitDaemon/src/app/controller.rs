@@ -2352,13 +2352,20 @@ fn restart_identity_is_current(
 fn recover_process_after_restart(
     process: &RuntimeProcess,
     signal_stopped: bool,
+    observed_cgroup_state: Option<cgroup::FreezeState>,
     validate_process: &mut impl FnMut(&RuntimeProcess) -> Result<bool, DaemonError>,
     thaw_cgroup: &mut impl FnMut(&str) -> Result<(), DaemonError>,
     unfreeze_binder: &mut impl FnMut(&RuntimeProcess) -> Result<(), DaemonError>,
     resume_signal: &mut impl FnMut(&RuntimeProcess) -> Result<(), DaemonError>,
 ) -> RestartRecoveryOutcome {
     let mut outcome = RestartRecoveryOutcome::default();
-    if let Some(cgroup_path) = process.cgroup_freeze_path.as_deref() {
+    let signal_only_recovery =
+        signal_stopped && observed_cgroup_state == Some(cgroup::FreezeState::Thawed);
+    if let Some(cgroup_path) = process
+        .cgroup_freeze_path
+        .as_deref()
+        .filter(|_| !signal_only_recovery)
+    {
         if let Err(error) =
             restart_identity_is_current(process, "before cgroup thaw", validate_process)
         {
@@ -2409,8 +2416,9 @@ fn recover_process_after_restart(
 /// 守护进程重启后，上一轮用信号回退（SIGSTOP）冻结的进程仍处于 T 状态：
 /// `frozen_apps` 仅存内存未持久化，新实例不知道哪些进程曾被 SIGSTOP，
 /// discover 又把 control_state 硬编码为 Running，导致前台解冻路径不会发 SIGCONT。
-/// 这里在进入 server 前，逐个重验 PID/UID/start-time，恢复 cgroup/binder 冻结并在
-/// 进程仍处于 T/t 时补发 SIGCONT，让这些应用能被正常使用后再由控制循环决定是否冻结。
+/// 这里在进入 server 前，逐个重验 PID/UID/start-time。若持久 SIGSTOP ledger 命中且
+/// cgroup 实测已 thawed，只补发 SIGCONT；cgroup frozen 或无法观测时仍执行完整的
+/// cgroup/binder 清理，让这些应用能被正常使用后再由控制循环决定是否冻结。
 pub fn recover_stopped_managed_processes_after_restart(state: &mut ReadOnlyState) {
     let managed_uids: BTreeSet<u32> = state
         .app_config
@@ -2445,6 +2453,10 @@ pub fn recover_stopped_managed_processes_after_restart(state: &mut ReadOnlyState
                 fs::read_to_string(format!("{}/{}/stat", procfs::PROC_ROOT, process.pid))
                     .ok()
                     .is_some_and(|stat| procfs::proc_state_is_stopped(&stat));
+            let observed_cgroup_state = process
+                .cgroup_freeze_path
+                .as_deref()
+                .and_then(|path| cgroup::read_freeze_state(path).ok());
             if process.cgroup_freeze_path.is_none() && !signal_stopped {
                 continue;
             }
@@ -2452,6 +2464,7 @@ pub fn recover_stopped_managed_processes_after_restart(state: &mut ReadOnlyState
             let outcome = recover_process_after_restart(
                 process,
                 signal_stopped,
+                observed_cgroup_state,
                 &mut |candidate| procfs::recheck_process_identity(procfs::PROC_ROOT, candidate),
                 &mut |path| cgroup::write_freeze_state(path, cgroup::FreezeState::Thawed),
                 &mut |candidate| {
@@ -3002,6 +3015,81 @@ mod tests {
     }
 
     #[test]
+    fn partial_primary_freezer_failure_signal_fallback_keeps_generic_ownership() {
+        let _binder_guard = set_test_binder_available(true);
+        let uid = 10_123;
+        let mut first = process(uid, 123, ControlState::Running);
+        first.cgroup_freeze_path =
+            Some("/sys/fs/cgroup/uid_10123/pid_123/cgroup.freeze".to_owned());
+        let mut second = process(uid, 456, ControlState::Running);
+        second.cgroup_freeze_path =
+            Some("/sys/fs/cgroup/uid_10123/pid_456/cgroup.freeze".to_owned());
+        let processes = vec![first.clone(), second.clone()];
+        let identity = ("com.example.app".to_owned(), uid);
+        let mut state = RuntimeControlState::default();
+        let signal_fallback_pids = Rc::new(RefCell::new(Vec::new()));
+        let foreground_paths = Rc::new(RefCell::new(Vec::new()));
+
+        run_control_pass(
+            &mut state,
+            &[config(uid, 30)],
+            |_, _| Ok(processes.clone()),
+            {
+                let signal_fallback_pids = Rc::clone(&signal_fallback_pids);
+                move |candidate| match candidate.cgroup_freeze_path.as_deref() {
+                    Some(_) if candidate.pid == first.pid => Ok(()),
+                    Some(_) => Err(DaemonError::system("second generic freezer apply failed")),
+                    None => {
+                        signal_fallback_pids.borrow_mut().push(candidate.pid);
+                        Ok(())
+                    }
+                }
+            },
+            |candidate| {
+                assert_eq!(candidate.pid, first.pid);
+                assert!(candidate.cgroup_freeze_path.is_some());
+                Err(DaemonError::system("primary rollback failed"))
+            },
+            &[],
+            0,
+        )
+        .expect("injected signal fallback succeeds after a partial primary transaction");
+
+        run_control_pass(
+            &mut state,
+            &[config(uid, 30)],
+            |_, _| Ok(processes.clone()),
+            |_| panic!("foreground process must not be refrozen"),
+            {
+                let foreground_paths = Rc::clone(&foreground_paths);
+                move |candidate| {
+                    foreground_paths
+                        .borrow_mut()
+                        .push(candidate.cgroup_freeze_path.clone());
+                    Err(DaemonError::system("generic thaw remains required"))
+                }
+            },
+            &[uid],
+            1,
+        )
+        .expect("foreground generic thaw failure is logged without aborting the pass");
+
+        assert_eq!(&*signal_fallback_pids.borrow(), &[123, 456]);
+        assert_eq!(
+            &*foreground_paths.borrow(),
+            &[
+                Some("/sys/fs/cgroup/uid_10123/pid_123/cgroup.freeze".to_owned()),
+                Some("/sys/fs/cgroup/uid_10123/pid_456/cgroup.freeze".to_owned()),
+            ]
+        );
+        assert!(state.frozen_apps.contains(&identity));
+        assert_eq!(
+            state.frozen_ownership(&identity),
+            FrozenOwnership::ResidualUnknown
+        );
+    }
+
+    #[test]
     fn abnormal_audit_refreeze_retains_conservative_generic_thaw_ownership() {
         let _binder_guard = set_test_binder_available(false);
         let uid = 10_123;
@@ -3430,6 +3518,7 @@ mod tests {
         let outcome = recover_process_after_restart(
             &runtime_process,
             true,
+            None,
             &mut |_| Ok(false),
             &mut |_| -> Result<(), DaemonError> { Ok(()) },
             &mut |_| -> Result<(), DaemonError> { Ok(()) },
@@ -3447,6 +3536,39 @@ mod tests {
     }
 
     #[test]
+    fn restart_signal_stop_with_thawed_cgroup_resumes_without_generic_cleanup() {
+        let mut runtime_process = process(10_123, 123, ControlState::Frozen);
+        runtime_process.cgroup_freeze_path =
+            Some("/sys/fs/cgroup/uid_10123/pid_123/cgroup.freeze".to_owned());
+        let calls = RefCell::new(Vec::new());
+        let outcome = recover_process_after_restart(
+            &runtime_process,
+            true,
+            Some(FreezeState::Thawed),
+            &mut |_| Ok(true),
+            &mut |path| {
+                calls.borrow_mut().push(format!("cgroup:{path}"));
+                Ok(())
+            },
+            &mut |candidate| {
+                calls.borrow_mut().push(format!("binder:{}", candidate.pid));
+                Ok(())
+            },
+            &mut |candidate| {
+                calls
+                    .borrow_mut()
+                    .push(format!("sigcont:{}", candidate.pid));
+                Ok(())
+            },
+        );
+
+        assert!(!outcome.cgroup_thawed);
+        assert!(outcome.signal_resumed);
+        assert!(outcome.failures.is_empty());
+        assert_eq!(&*calls.borrow(), &["sigcont:123".to_owned()]);
+    }
+
+    #[test]
     fn restart_recovery_thaws_cgroup_and_binder_without_waiting_for_sigstop_state() {
         let mut runtime_process = process(10_123, 123, ControlState::Frozen);
         runtime_process.cgroup_freeze_path =
@@ -3455,6 +3577,7 @@ mod tests {
         let outcome = recover_process_after_restart(
             &runtime_process,
             false,
+            Some(FreezeState::Thawed),
             &mut |_| Ok(true),
             &mut |path| {
                 calls.borrow_mut().push(format!("cgroup:{path}"));
