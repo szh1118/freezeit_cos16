@@ -12,7 +12,7 @@
 
 ## 发布门禁
 
-`3.3.4SelfUse`（`303004`）正在按同次构建会话、证书和真机验证门禁生成正式包；在 ZIP 上传并完成 SHA-256 校验前，`freezeitRelease/update.json` 继续指向上一版。
+`3.3.4SelfUse`（`303004`）已由同次构建会话生成、完成证书与 ZIP 校验并上传至 `v3.3.4SelfUse`；`freezeitRelease/update.json` 已指向该正式发布包。
 
 正式更新元数据必须满足：
 

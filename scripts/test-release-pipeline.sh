@@ -10,6 +10,7 @@ expected_version="$(module_prop version)"
 expected_code="$(module_prop versionCode)"
 [[ -n "$expected_version" && -n "$expected_code" ]] || fail "module version metadata is missing"
 original_apksigner="${APKSIGNER-}"
+original_expected_apk_signer_sha="${FREEZEIT_EXPECTED_APK_SIGNER_SHA256-}"
 original_expected_session_manifest_sha="${FREEZEIT_EXPECTED_BUILD_SESSION_MANIFEST_SHA256-}"
 
 make_android_aarch64_elf() {
@@ -113,6 +114,7 @@ printf '%s\n' 'Signer #1 certificate SHA-256 digest: bbbbbbbbbbbbbbbbbbbbbbbbbbb
 EOF
 chmod 0755 "$apksigner_path"
 export APKSIGNER="$apksigner_path"
+export FREEZEIT_EXPECTED_APK_SIGNER_SHA256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 daemon_sha="$(sha256sum "$tmp/freezeit" | awk '{print $1}')"
 apk_sha="$(sha256sum "$tmp/freezeit.apk" | awk '{print $1}')"
 metadata_sha="$(sha256sum "$metadata_path" | awk '{print $1}')"
@@ -643,6 +645,11 @@ if [[ -n "$original_apksigner" ]]; then
   export APKSIGNER="$original_apksigner"
 else
   unset APKSIGNER
+fi
+if [[ -n "$original_expected_apk_signer_sha" ]]; then
+  export FREEZEIT_EXPECTED_APK_SIGNER_SHA256="$original_expected_apk_signer_sha"
+else
+  unset FREEZEIT_EXPECTED_APK_SIGNER_SHA256
 fi
 if [[ -n "$original_expected_session_manifest_sha" ]]; then
   export FREEZEIT_EXPECTED_BUILD_SESSION_MANIFEST_SHA256="$original_expected_session_manifest_sha"
