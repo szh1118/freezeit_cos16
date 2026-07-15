@@ -599,8 +599,10 @@ impl RuntimeControlState {
         timestamp_ms: u128,
         ownership: FrozenOwnership,
     ) {
-        let ownership = if self.frozen_apps.contains(&identity)
-            && self.frozen_ownership(&identity) == FrozenOwnership::ResidualUnknown
+        let ownership = if self.frozen_ownership.get(&identity)
+            == Some(&FrozenOwnership::ResidualUnknown)
+            || (self.frozen_apps.contains(&identity)
+                && !self.frozen_ownership.contains_key(&identity))
         {
             FrozenOwnership::ResidualUnknown
         } else {
@@ -624,6 +626,24 @@ impl RuntimeControlState {
         self.frozen_apps.remove(identity);
         self.frozen_since_ms.remove(identity);
         self.frozen_ownership.remove(identity);
+    }
+
+    fn mark_abnormal_thaw_for_refreeze(&mut self, identity: &RuntimeIdentity) {
+        let ownership = match self.frozen_ownership(identity) {
+            FrozenOwnership::SignalOnly => FrozenOwnership::SignalOnly,
+            FrozenOwnership::CgroupBinder | FrozenOwnership::ResidualUnknown => {
+                FrozenOwnership::ResidualUnknown
+            }
+        };
+        self.frozen_apps.remove(identity);
+        self.frozen_since_ms.remove(identity);
+        self.frozen_ownership.insert(identity.clone(), ownership);
+    }
+
+    fn clear_detached_ownership(&mut self, identity: &RuntimeIdentity) {
+        if !self.frozen_apps.contains(identity) {
+            self.frozen_ownership.remove(identity);
+        }
     }
 
     pub fn pending_freeze_uids(&self) -> Vec<u32> {
@@ -673,6 +693,15 @@ impl RuntimeControlState {
             timestamp_ms,
             "control disabled",
         );
+        let detached_ownership_identities = self
+            .frozen_ownership
+            .keys()
+            .filter(|identity| !self.frozen_apps.contains(*identity))
+            .cloned()
+            .collect::<Vec<_>>();
+        for identity in detached_ownership_identities {
+            self.clear_detached_ownership(&identity);
+        }
         self.pending_freezes.clear();
         self.network_restriction_requests.clear();
         self.blocked_process_signatures.clear();
@@ -1123,6 +1152,7 @@ fn run_control_pass_with_sampling_and_terminate(
         .keys()
         .map(|(_, uid)| *uid)
         .chain(stale_frozen_identities.iter().map(|(_, uid)| *uid))
+        .chain(state.frozen_ownership.keys().map(|(_, uid)| *uid))
         .filter(|uid| !controlled_uids.contains(uid))
         .collect::<BTreeSet<_>>();
     state
@@ -1151,6 +1181,17 @@ fn run_control_pass_with_sampling_and_terminate(
         timestamp_ms,
         "control policy removed",
     );
+    let stale_detached_ownership_identities = state
+        .frozen_ownership
+        .keys()
+        .filter(|identity| {
+            !state.frozen_apps.contains(*identity) && !controlled_uids.contains(&identity.1)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for identity in stale_detached_ownership_identities {
+        state.clear_detached_ownership(&identity);
+    }
 
     let audit_due = refreeze_audit_due(state, settings, timestamp_ms);
     for record in app_config {
@@ -1161,13 +1202,14 @@ fn run_control_pass_with_sampling_and_terminate(
         let processes = discover_processes(&fallback_package_name, record.uid)?;
         if processes.is_empty() {
             state.clear_transient_control_state_for_uid(record.uid);
-            let frozen_identities = state
+            let tracked_identities = state
                 .frozen_apps
                 .iter()
+                .chain(state.frozen_ownership.keys())
                 .filter(|(_, uid)| *uid == record.uid)
                 .cloned()
-                .collect::<Vec<_>>();
-            for identity in frozen_identities {
+                .collect::<BTreeSet<_>>();
+            for identity in tracked_identities {
                 state.clear_frozen(&identity);
             }
             continue;
@@ -1198,6 +1240,17 @@ fn run_control_pass_with_sampling_and_terminate(
                 timestamp_ms,
                 "policy or protected package blocks control",
             );
+            let detached_ownership_identities = state
+                .frozen_ownership
+                .keys()
+                .filter(|identity| {
+                    identity.1 == record.uid && !state.frozen_apps.contains(*identity)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for identity in detached_ownership_identities {
+                state.clear_detached_ownership(&identity);
+            }
             continue;
         }
         let mut process_signature = processes
@@ -1318,7 +1371,7 @@ fn run_control_pass_with_sampling_and_terminate(
             {
                 continue;
             }
-            state.clear_frozen(&identity);
+            state.mark_abnormal_thaw_for_refreeze(&identity);
             abnormal_thaw = true;
         }
 
@@ -1469,16 +1522,12 @@ fn run_control_pass_with_sampling_and_terminate(
                                 &pending_processes,
                                 &mut validate_process,
                                 &mut |process| {
-                                    crate::sys::signal::send_signal(
-                                        process.pid,
-                                        crate::sys::signal::SignalAction::Stop,
-                                    )
+                                    let signal_process = signal_control_process(process);
+                                    freeze_process(&signal_process)
                                 },
                                 &mut |process| {
-                                    crate::sys::signal::send_signal(
-                                        process.pid,
-                                        crate::sys::signal::SignalAction::Continue,
-                                    )
+                                    let signal_process = signal_control_process(process);
+                                    unfreeze_process(&signal_process)
                                 },
                             );
                             if outcome.failure.is_none() {
@@ -2679,6 +2728,71 @@ mod tests {
     }
 
     #[test]
+    fn detached_audit_ownership_is_cleared_when_the_process_exits() {
+        let uid = 10_123;
+        let identity = ("com.example.app".to_owned(), uid);
+        let mut state = RuntimeControlState::default();
+        state
+            .frozen_ownership
+            .insert(identity.clone(), FrozenOwnership::ResidualUnknown);
+
+        run_control_pass(
+            &mut state,
+            &[config(uid, 30)],
+            |_, _| Ok(Vec::new()),
+            |_| panic!("an exited process must not be frozen"),
+            |_| panic!("an exited process must not be thawed"),
+            &[],
+            0,
+        )
+        .expect("process exit cleanup");
+
+        assert!(!state.frozen_ownership.contains_key(&identity));
+    }
+
+    #[test]
+    fn detached_audit_ownership_is_cleared_when_control_is_removed() {
+        let identity = ("com.example.app".to_owned(), 10_123);
+        let mut state = RuntimeControlState::default();
+        state
+            .frozen_ownership
+            .insert(identity.clone(), FrozenOwnership::ResidualUnknown);
+
+        run_control_pass(
+            &mut state,
+            &[],
+            |_, _| panic!("removed control must not rediscover detached ownership"),
+            |_| panic!("removed control must not refreeze detached ownership"),
+            |_| panic!("removed control must not thaw an already-running process"),
+            &[],
+            0,
+        )
+        .expect("removed control cleanup");
+
+        assert!(!state.frozen_ownership.contains_key(&identity));
+    }
+
+    #[test]
+    fn disabling_control_clears_detached_audit_ownership() {
+        let identity = ("com.example.app".to_owned(), 10_123);
+        let mut state = RuntimeControlState::default();
+        state
+            .frozen_ownership
+            .insert(identity.clone(), FrozenOwnership::ResidualUnknown);
+
+        state
+            .thaw_all_frozen(
+                |_, _| panic!("detached ownership has no frozen process to rediscover"),
+                |_| panic!("detached ownership has no frozen process to thaw"),
+                |_| panic!("detached ownership has no frozen process to validate"),
+                0,
+            )
+            .expect("disabled control cleanup");
+
+        assert!(!state.frozen_ownership.contains_key(&identity));
+    }
+
+    #[test]
     fn sigstop_mode_uses_the_signal_backend_even_when_cgroup_is_available() {
         let _binder_guard = set_test_binder_available(true);
         let uid = 10_123;
@@ -2808,6 +2922,158 @@ mod tests {
             .operation_log
             .to_json()
             .contains("\"backend\":\"signal.cont\""));
+    }
+
+    #[test]
+    fn primary_freezer_failure_signal_fallback_retains_generic_thaw_ownership() {
+        let _binder_guard = set_test_binder_available(true);
+        let uid = 10_123;
+        let mut runtime_process = process(uid, 9_999_999, ControlState::Running);
+        runtime_process.cgroup_freeze_path =
+            Some("/sys/fs/cgroup/uid_10123/pid_9999999/cgroup.freeze".to_owned());
+        let identity = ("com.example.app".to_owned(), uid);
+        let mut state = RuntimeControlState::default();
+        let signal_fallback_pids = Rc::new(RefCell::new(Vec::new()));
+        let foreground_paths = Rc::new(RefCell::new(Vec::new()));
+
+        run_control_pass(
+            &mut state,
+            &[config(uid, 30)],
+            |_, _| Ok(vec![runtime_process.clone()]),
+            {
+                let signal_fallback_pids = Rc::clone(&signal_fallback_pids);
+                move |candidate| {
+                    if candidate.cgroup_freeze_path.is_some() {
+                        Err(DaemonError::system("primary cgroup/binder freezer failed"))
+                    } else {
+                        signal_fallback_pids.borrow_mut().push(candidate.pid);
+                        Ok(())
+                    }
+                }
+            },
+            |_| Ok(()),
+            &[],
+            0,
+        )
+        .expect("signal fallback succeeds through the injected signal backend");
+
+        run_control_pass(
+            &mut state,
+            &[config(uid, 30)],
+            |_, _| Ok(vec![runtime_process.clone()]),
+            |_| panic!("foreground process must not be frozen"),
+            {
+                let foreground_paths = Rc::clone(&foreground_paths);
+                move |candidate| {
+                    foreground_paths
+                        .borrow_mut()
+                        .push(candidate.cgroup_freeze_path.clone());
+                    Err(DaemonError::system("binder unfreeze failed after SIGCONT"))
+                }
+            },
+            &[uid],
+            1,
+        )
+        .expect("foreground generic thaw failure is logged without aborting the pass");
+
+        run_control_pass(
+            &mut state,
+            &[config(uid, 30)],
+            |_, _| Ok(vec![runtime_process.clone()]),
+            |_| panic!("retained generic ownership must block immediate refreeze"),
+            |_| Ok(()),
+            &[],
+            2,
+        )
+        .expect("retained ownership blocks immediate refreeze");
+
+        assert_eq!(&*signal_fallback_pids.borrow(), &[9_999_999]);
+        assert_eq!(
+            &*foreground_paths.borrow(),
+            &[Some(
+                "/sys/fs/cgroup/uid_10123/pid_9999999/cgroup.freeze".to_owned()
+            )]
+        );
+        assert!(state.frozen_apps.contains(&identity));
+        assert_eq!(
+            state.frozen_ownership(&identity),
+            FrozenOwnership::ResidualUnknown
+        );
+    }
+
+    #[test]
+    fn abnormal_audit_refreeze_retains_conservative_generic_thaw_ownership() {
+        let _binder_guard = set_test_binder_available(false);
+        let uid = 10_123;
+        let mut runtime_process = process(uid, 123, ControlState::Running);
+        runtime_process.cgroup_freeze_path =
+            Some("/sys/fs/cgroup/uid_10123/pid_123/cgroup.freeze".to_owned());
+        let identity = ("com.example.app".to_owned(), uid);
+        let mut state = RuntimeControlState::default();
+        state.track_frozen(identity.clone(), 0, FrozenOwnership::ResidualUnknown);
+        let refreeze_pids = Rc::new(RefCell::new(Vec::new()));
+        let foreground_paths = Rc::new(RefCell::new(Vec::new()));
+
+        run_control_pass(
+            &mut state,
+            &[config(uid, 30)],
+            |_, _| Ok(vec![process(uid, 123, ControlState::Frozen)]),
+            |_| panic!("initial audit setup must not refreeze"),
+            |_| panic!("initial audit setup must not thaw"),
+            &[],
+            0,
+        )
+        .expect("establish startup audit deadline");
+
+        run_control_pass(
+            &mut state,
+            &[config(uid, 30)],
+            |_, _| Ok(vec![runtime_process.clone()]),
+            {
+                let refreeze_pids = Rc::clone(&refreeze_pids);
+                move |candidate| {
+                    assert!(candidate.cgroup_freeze_path.is_none());
+                    refreeze_pids.borrow_mut().push(candidate.pid);
+                    Ok(())
+                }
+            },
+            |_| panic!("audit refreeze must not thaw"),
+            &[],
+            60_000,
+        )
+        .expect("abnormal audit refreezes through signal fallback");
+
+        run_control_pass(
+            &mut state,
+            &[config(uid, 30)],
+            |_, _| Ok(vec![runtime_process.clone()]),
+            |_| panic!("foreground process must not be refrozen"),
+            {
+                let foreground_paths = Rc::clone(&foreground_paths);
+                move |candidate| {
+                    foreground_paths
+                        .borrow_mut()
+                        .push(candidate.cgroup_freeze_path.clone());
+                    Err(DaemonError::system("binder unfreeze failed after SIGCONT"))
+                }
+            },
+            &[uid],
+            60_001,
+        )
+        .expect("conservative foreground thaw failure is logged without aborting the pass");
+
+        assert_eq!(&*refreeze_pids.borrow(), &[123]);
+        assert_eq!(
+            &*foreground_paths.borrow(),
+            &[Some(
+                "/sys/fs/cgroup/uid_10123/pid_123/cgroup.freeze".to_owned()
+            )]
+        );
+        assert!(state.frozen_apps.contains(&identity));
+        assert_eq!(
+            state.frozen_ownership(&identity),
+            FrozenOwnership::ResidualUnknown
+        );
     }
 
     #[test]
