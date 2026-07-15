@@ -622,6 +622,13 @@ impl RuntimeControlState {
             .unwrap_or(FrozenOwnership::ResidualUnknown)
     }
 
+    fn has_unresolved_freeze_ownership(&self, identity: &RuntimeIdentity) -> bool {
+        matches!(
+            self.frozen_ownership.get(identity),
+            Some(FrozenOwnership::CgroupBinder | FrozenOwnership::ResidualUnknown)
+        ) || (self.frozen_apps.contains(identity) && !self.frozen_ownership.contains_key(identity))
+    }
+
     fn clear_frozen(&mut self, identity: &RuntimeIdentity) {
         self.frozen_apps.remove(identity);
         self.frozen_since_ms.remove(identity);
@@ -1518,17 +1525,13 @@ fn run_control_pass_with_sampling_and_terminate(
                     let (action, result, fallback_backend, fallback_details) = match fallback.action
                     {
                         DecisionAction::Signal => {
-                            let outcome = apply_freeze_transaction(
+                            let outcome = apply_signal_stop_freeze_transaction(
                                 &pending_processes,
                                 &mut validate_process,
-                                &mut |process| {
-                                    let signal_process = signal_control_process(process);
-                                    freeze_process(&signal_process)
-                                },
-                                &mut |process| {
-                                    let signal_process = signal_control_process(process);
-                                    unfreeze_process(&signal_process)
-                                },
+                                &mut freeze_process,
+                                &mut unfreeze_process,
+                                SignalStopLedgerPromotion::Never,
+                                &mut |_| Ok(()),
                             );
                             if outcome.failure.is_none() {
                                 state.track_frozen(
@@ -1703,16 +1706,27 @@ fn run_control_pass_with_sampling_and_terminate(
             DecisionAction::Postpone => (ControlAction::Postpone, OperationResult::Postponed),
             DecisionAction::AlternateFreezer => (ControlAction::Fallback, OperationResult::Failed),
             DecisionAction::Signal => {
-                let outcome = apply_freeze_transaction(
+                let ledger_promotion = signal_stop_ledger_promotion(
+                    state,
+                    &identity,
+                    &pending_processes,
+                    &mut |pid, start_time_ticks| {
+                        procfs::recorded_freezeit_signal_stop_ownership(pid, start_time_ticks)
+                    },
+                );
+                let direct_signal_ownership = ledger_promotion.frozen_ownership();
+                let outcome = apply_signal_stop_freeze_transaction(
                     &pending_processes,
                     &mut validate_process,
-                    &mut |process| {
-                        let signal_process = signal_control_process(process);
-                        freeze_process(&signal_process)
-                    },
-                    &mut |process| {
-                        let signal_process = signal_control_process(process);
-                        unfreeze_process(&signal_process)
+                    &mut freeze_process,
+                    &mut unfreeze_process,
+                    ledger_promotion,
+                    &mut |process| match process.start_time_ticks {
+                        Some(start_time_ticks) => {
+                            procfs::promote_freezeit_signal_stop(process.pid, start_time_ticks)
+                                .map(|_| ())
+                        }
+                        None => Ok(()),
                     },
                 );
                 if let Some(failure) = outcome.failure {
@@ -1761,7 +1775,7 @@ fn run_control_pass_with_sampling_and_terminate(
                     }
                     continue;
                 }
-                state.track_frozen(identity.clone(), timestamp_ms, FrozenOwnership::SignalOnly);
+                state.track_frozen(identity.clone(), timestamp_ms, direct_signal_ownership);
                 if mode_has_network_restriction(record.mode) {
                     state.network_restriction_requests.insert(record.uid);
                 }
@@ -1885,6 +1899,49 @@ struct FreezeTransactionOutcome {
     rollback_failures: usize,
     residual_possible: bool,
     failure: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalStopLedgerPromotion {
+    Never,
+    AfterCompletedDirectTransaction,
+}
+
+impl SignalStopLedgerPromotion {
+    fn frozen_ownership(self) -> FrozenOwnership {
+        match self {
+            Self::Never => FrozenOwnership::ResidualUnknown,
+            Self::AfterCompletedDirectTransaction => FrozenOwnership::SignalOnly,
+        }
+    }
+}
+
+fn signal_stop_ledger_promotion(
+    state: &RuntimeControlState,
+    identity: &RuntimeIdentity,
+    processes: &[RuntimeProcess],
+    recorded_ownership: &mut impl FnMut(
+        i32,
+        u64,
+    ) -> Result<Option<procfs::SignalStopOwnership>, DaemonError>,
+) -> SignalStopLedgerPromotion {
+    if state.has_unresolved_freeze_ownership(identity) {
+        return SignalStopLedgerPromotion::Never;
+    }
+
+    for process in processes {
+        let Some(start_time_ticks) = process.start_time_ticks else {
+            return SignalStopLedgerPromotion::Never;
+        };
+        match recorded_ownership(process.pid, start_time_ticks) {
+            Ok(Some(procfs::SignalStopOwnership::ResidualUnknown)) | Err(_) => {
+                return SignalStopLedgerPromotion::Never;
+            }
+            Ok(None | Some(procfs::SignalStopOwnership::SignalOnly)) => {}
+        }
+    }
+
+    SignalStopLedgerPromotion::AfterCompletedDirectTransaction
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2093,6 +2150,37 @@ fn apply_freeze_transaction(
         residual_possible: true,
         failure,
     }
+}
+
+/// Run a SIGSTOP transaction.  Promotion is allowed only for the direct signal
+/// decision after every process was stopped successfully.  A generic freezer
+/// failure may fall back to the same signal mechanism, but uses `Never` so its
+/// default residual ledger provenance is retained across daemon restarts.
+fn apply_signal_stop_freeze_transaction(
+    processes: &[RuntimeProcess],
+    validate_process: &mut impl FnMut(&RuntimeProcess) -> Result<bool, DaemonError>,
+    freeze_process: &mut impl FnMut(&RuntimeProcess) -> Result<(), DaemonError>,
+    unfreeze_process: &mut impl FnMut(&RuntimeProcess) -> Result<(), DaemonError>,
+    promotion: SignalStopLedgerPromotion,
+    promote_signal_stop: &mut impl FnMut(&RuntimeProcess) -> Result<(), DaemonError>,
+) -> FreezeTransactionOutcome {
+    let outcome = apply_freeze_transaction(
+        processes,
+        validate_process,
+        &mut |process| freeze_process(&signal_control_process(process)),
+        &mut |process| unfreeze_process(&signal_control_process(process)),
+    );
+    if outcome.failure.is_none()
+        && promotion == SignalStopLedgerPromotion::AfterCompletedDirectTransaction
+    {
+        for process in processes {
+            // The live control state is already known to be signal-only.  If the
+            // durable promotion cannot be persisted, leave its default ledger
+            // provenance as ResidualUnknown so restart recovery stays conservative.
+            let _ = promote_signal_stop(process);
+        }
+    }
+    outcome
 }
 
 fn operation_details(processes: &[RuntimeProcess]) -> String {
@@ -2351,7 +2439,7 @@ fn restart_identity_is_current(
 #[allow(clippy::too_many_arguments)]
 fn recover_process_after_restart(
     process: &RuntimeProcess,
-    signal_stopped: bool,
+    signal_stop_ownership: Option<procfs::SignalStopOwnership>,
     observed_cgroup_state: Option<cgroup::FreezeState>,
     validate_process: &mut impl FnMut(&RuntimeProcess) -> Result<bool, DaemonError>,
     thaw_cgroup: &mut impl FnMut(&str) -> Result<(), DaemonError>,
@@ -2359,8 +2447,9 @@ fn recover_process_after_restart(
     resume_signal: &mut impl FnMut(&RuntimeProcess) -> Result<(), DaemonError>,
 ) -> RestartRecoveryOutcome {
     let mut outcome = RestartRecoveryOutcome::default();
-    let signal_only_recovery =
-        signal_stopped && observed_cgroup_state == Some(cgroup::FreezeState::Thawed);
+    let signal_only_recovery = signal_stop_ownership
+        == Some(procfs::SignalStopOwnership::SignalOnly)
+        && observed_cgroup_state == Some(cgroup::FreezeState::Thawed);
     if let Some(cgroup_path) = process
         .cgroup_freeze_path
         .as_deref()
@@ -2392,11 +2481,11 @@ fn recover_process_after_restart(
                 process.pid
             ));
         }
-    } else if !signal_stopped {
+    } else if signal_stop_ownership.is_none() {
         return outcome;
     }
 
-    if signal_stopped {
+    if signal_stop_ownership.is_some() {
         if let Err(error) =
             restart_identity_is_current(process, "immediately before SIGCONT", validate_process)
         {
@@ -2416,9 +2505,10 @@ fn recover_process_after_restart(
 /// 守护进程重启后，上一轮用信号回退（SIGSTOP）冻结的进程仍处于 T 状态：
 /// `frozen_apps` 仅存内存未持久化，新实例不知道哪些进程曾被 SIGSTOP，
 /// discover 又把 control_state 硬编码为 Running，导致前台解冻路径不会发 SIGCONT。
-/// 这里在进入 server 前，逐个重验 PID/UID/start-time。若持久 SIGSTOP ledger 命中且
-/// cgroup 实测已 thawed，只补发 SIGCONT；cgroup frozen 或无法观测时仍执行完整的
-/// cgroup/binder 清理，让这些应用能被正常使用后再由控制循环决定是否冻结。
+/// 这里在进入 server 前，逐个重验 PID/UID/start-time。只有 ledger 明确标为
+/// `SignalOnly` 且 cgroup 实测已 thawed 时才只补发 SIGCONT；旧格式、未知来源、
+/// cgroup frozen 或无法观测时均执行完整的 cgroup/binder 清理，让这些应用能被正常
+/// 使用后再由控制循环决定是否冻结。
 pub fn recover_stopped_managed_processes_after_restart(state: &mut ReadOnlyState) {
     let managed_uids: BTreeSet<u32> = state
         .app_config
@@ -2449,21 +2539,21 @@ pub fn recover_stopped_managed_processes_after_restart(state: &mut ReadOnlyState
     let mut failed = 0u32;
     for (_uid, processes) in &processes_by_uid {
         for process in processes {
-            let signal_stopped =
+            let signal_stop_ownership =
                 fs::read_to_string(format!("{}/{}/stat", procfs::PROC_ROOT, process.pid))
                     .ok()
-                    .is_some_and(|stat| procfs::proc_state_is_stopped(&stat));
+                    .and_then(|stat| procfs::freezeit_signal_stop_ownership(&stat));
             let observed_cgroup_state = process
                 .cgroup_freeze_path
                 .as_deref()
                 .and_then(|path| cgroup::read_freeze_state(path).ok());
-            if process.cgroup_freeze_path.is_none() && !signal_stopped {
+            if process.cgroup_freeze_path.is_none() && signal_stop_ownership.is_none() {
                 continue;
             }
 
             let outcome = recover_process_after_restart(
                 process,
-                signal_stopped,
+                signal_stop_ownership,
                 observed_cgroup_state,
                 &mut |candidate| procfs::recheck_process_identity(procfs::PROC_ROOT, candidate),
                 &mut |path| cgroup::write_freeze_state(path, cgroup::FreezeState::Thawed),
@@ -2511,11 +2601,12 @@ mod tests {
     use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
     use super::{
-        managed_app_from_record, manager_wakeup_interval_ms, parse_legacy_uid_token,
-        policy_from_record, reconcile_live_process_control_states, recover_process_after_restart,
-        refreeze_audit_due, requested_control_backend, run_control_pass,
-        run_control_pass_with_sampling_and_terminate, run_control_pass_with_settings,
-        FrozenOwnership, RequestedControlBackend, RuntimeControlState,
+        apply_signal_stop_freeze_transaction, managed_app_from_record, manager_wakeup_interval_ms,
+        parse_legacy_uid_token, policy_from_record, reconcile_live_process_control_states,
+        recover_process_after_restart, refreeze_audit_due, requested_control_backend,
+        run_control_pass, run_control_pass_with_sampling_and_terminate,
+        run_control_pass_with_settings, signal_stop_ledger_promotion, FrozenOwnership,
+        RequestedControlBackend, RuntimeControlState, SignalStopLedgerPromotion,
     };
     use crate::{
         app::{controller::set_test_binder_available, error::DaemonError},
@@ -2524,7 +2615,7 @@ mod tests {
             runtime::{ControlState, ProcessState, RuntimeProcess},
         },
         protocol::manager_v1::ManagerAppConfigRecord,
-        sys::cgroup::FreezeState,
+        sys::{cgroup::FreezeState, procfs::SignalStopOwnership},
     };
 
     fn process(uid: u32, pid: i32, control_state: ControlState) -> RuntimeProcess {
@@ -3472,6 +3563,189 @@ mod tests {
     }
 
     #[test]
+    fn clean_direct_signal_transaction_promotes_completed_stops_best_effort() {
+        let processes = vec![
+            process(10_123, 123, ControlState::Running),
+            process(10_123, 456, ControlState::Running),
+        ];
+        let stopped = RefCell::new(Vec::new());
+        let promoted = RefCell::new(Vec::new());
+
+        let outcome = apply_signal_stop_freeze_transaction(
+            &processes,
+            &mut |_| Ok(true),
+            &mut |candidate| {
+                assert!(candidate.cgroup_freeze_path.is_none());
+                stopped.borrow_mut().push(candidate.pid);
+                Ok(())
+            },
+            &mut |_| Ok(()),
+            SignalStopLedgerPromotion::AfterCompletedDirectTransaction,
+            &mut |candidate| {
+                promoted.borrow_mut().push(candidate.pid);
+                if candidate.pid == 456 {
+                    Err(DaemonError::system("ledger write unavailable"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        assert!(outcome.failure.is_none());
+        assert_eq!(&*stopped.borrow(), &[123, 456]);
+        assert_eq!(&*promoted.borrow(), &[123, 456]);
+    }
+
+    #[test]
+    fn incomplete_direct_signal_transaction_does_not_promote_stops() {
+        let processes = vec![
+            process(10_123, 123, ControlState::Running),
+            process(10_123, 456, ControlState::Running),
+        ];
+        let promoted = RefCell::new(Vec::new());
+
+        let outcome = apply_signal_stop_freeze_transaction(
+            &processes,
+            &mut |_| Ok(true),
+            &mut |candidate| {
+                if candidate.pid == 456 {
+                    Err(DaemonError::system("second SIGSTOP failed"))
+                } else {
+                    Ok(())
+                }
+            },
+            &mut |_| Ok(()),
+            SignalStopLedgerPromotion::AfterCompletedDirectTransaction,
+            &mut |candidate| {
+                promoted.borrow_mut().push(candidate.pid);
+                Ok(())
+            },
+        );
+
+        assert!(outcome.failure.is_some());
+        assert!(promoted.borrow().is_empty());
+    }
+
+    #[test]
+    fn generic_signal_fallback_transaction_never_promotes_stop_ledger_provenance() {
+        let processes = vec![
+            process(10_123, 123, ControlState::Running),
+            process(10_123, 456, ControlState::Running),
+        ];
+        let stopped = RefCell::new(Vec::new());
+        let promoted = RefCell::new(Vec::new());
+
+        let outcome = apply_signal_stop_freeze_transaction(
+            &processes,
+            &mut |_| Ok(true),
+            &mut |candidate| {
+                assert!(candidate.cgroup_freeze_path.is_none());
+                stopped.borrow_mut().push(candidate.pid);
+                Ok(())
+            },
+            &mut |_| Ok(()),
+            SignalStopLedgerPromotion::Never,
+            &mut |candidate| {
+                promoted.borrow_mut().push(candidate.pid);
+                Ok(())
+            },
+        );
+
+        assert!(outcome.failure.is_none());
+        assert_eq!(&*stopped.borrow(), &[123, 456]);
+        assert!(promoted.borrow().is_empty());
+    }
+
+    #[test]
+    fn residual_ownership_blocks_later_direct_signal_ledger_promotion() {
+        let identity = ("com.example.app".to_owned(), 10_123);
+        let mut state = RuntimeControlState::default();
+        state.track_frozen(identity.clone(), 0, FrozenOwnership::ResidualUnknown);
+        state.mark_abnormal_thaw_for_refreeze(&identity);
+        let promoted = RefCell::new(Vec::new());
+        let processes = vec![process(10_123, 123, ControlState::Running)];
+
+        let outcome = apply_signal_stop_freeze_transaction(
+            &processes,
+            &mut |_| Ok(true),
+            &mut |_| Ok(()),
+            &mut |_| Ok(()),
+            signal_stop_ledger_promotion(&state, &identity, &processes, &mut |_, _| Ok(None)),
+            &mut |candidate| {
+                promoted.borrow_mut().push(candidate.pid);
+                Ok(())
+            },
+        );
+
+        assert!(outcome.failure.is_none());
+        assert!(promoted.borrow().is_empty());
+        assert_eq!(
+            state.frozen_ownership(&identity),
+            FrozenOwnership::ResidualUnknown
+        );
+    }
+
+    #[test]
+    fn persisted_residual_ledger_blocks_direct_signal_promotion_after_restart() {
+        let identity = ("com.example.app".to_owned(), 10_123);
+        let mut state = RuntimeControlState::default();
+        let processes = vec![process(10_123, 123, ControlState::Running)];
+        let promoted = RefCell::new(Vec::new());
+
+        let promotion = signal_stop_ledger_promotion(
+            &state,
+            &identity,
+            &processes,
+            &mut |pid, start_time_ticks| {
+                assert_eq!((pid, start_time_ticks), (123, 1));
+                Ok(Some(SignalStopOwnership::ResidualUnknown))
+            },
+        );
+        let outcome = apply_signal_stop_freeze_transaction(
+            &processes,
+            &mut |_| Ok(true),
+            &mut |_| Ok(()),
+            &mut |_| Ok(()),
+            promotion,
+            &mut |candidate| {
+                promoted.borrow_mut().push(candidate.pid);
+                Ok(())
+            },
+        );
+
+        assert!(outcome.failure.is_none());
+        assert!(promoted.borrow().is_empty());
+
+        state.track_frozen(identity, 0, promotion.frozen_ownership());
+        let mut rediscovered_process = processes[0].clone();
+        rediscovered_process.cgroup_freeze_path =
+            Some("/sys/fs/cgroup/uid_10123/pid_123/cgroup.freeze".to_owned());
+        let thaw_paths = RefCell::new(Vec::new());
+        run_control_pass(
+            &mut state,
+            &[config(10_123, 20)],
+            |_, _| Ok(vec![rediscovered_process.clone()]),
+            |_| panic!("foreground process must not be frozen"),
+            |candidate| {
+                thaw_paths
+                    .borrow_mut()
+                    .push(candidate.cgroup_freeze_path.clone());
+                Ok(())
+            },
+            &[10_123],
+            1,
+        )
+        .expect("residual foreground thaw");
+
+        assert_eq!(
+            &*thaw_paths.borrow(),
+            &[Some(
+                "/sys/fs/cgroup/uid_10123/pid_123/cgroup.freeze".to_owned()
+            )]
+        );
+    }
+
+    #[test]
     fn global_sigstop_overrides_freezer_mode_selection() {
         let mut settings = vec![0; 256];
         settings[5] = 2;
@@ -3517,7 +3791,7 @@ mod tests {
         let signals = RefCell::new(Vec::new());
         let outcome = recover_process_after_restart(
             &runtime_process,
-            true,
+            Some(SignalStopOwnership::SignalOnly),
             None,
             &mut |_| Ok(false),
             &mut |_| -> Result<(), DaemonError> { Ok(()) },
@@ -3536,14 +3810,14 @@ mod tests {
     }
 
     #[test]
-    fn restart_signal_stop_with_thawed_cgroup_resumes_without_generic_cleanup() {
+    fn restart_signal_only_stop_with_thawed_cgroup_resumes_without_generic_cleanup() {
         let mut runtime_process = process(10_123, 123, ControlState::Frozen);
         runtime_process.cgroup_freeze_path =
             Some("/sys/fs/cgroup/uid_10123/pid_123/cgroup.freeze".to_owned());
         let calls = RefCell::new(Vec::new());
         let outcome = recover_process_after_restart(
             &runtime_process,
-            true,
+            Some(SignalStopOwnership::SignalOnly),
             Some(FreezeState::Thawed),
             &mut |_| Ok(true),
             &mut |path| {
@@ -3569,6 +3843,46 @@ mod tests {
     }
 
     #[test]
+    fn restart_residual_unknown_stop_with_thawed_cgroup_keeps_generic_cleanup() {
+        let mut runtime_process = process(10_123, 123, ControlState::Frozen);
+        runtime_process.cgroup_freeze_path =
+            Some("/sys/fs/cgroup/uid_10123/pid_123/cgroup.freeze".to_owned());
+        let calls = RefCell::new(Vec::new());
+        let outcome = recover_process_after_restart(
+            &runtime_process,
+            Some(SignalStopOwnership::ResidualUnknown),
+            Some(FreezeState::Thawed),
+            &mut |_| Ok(true),
+            &mut |path| {
+                calls.borrow_mut().push(format!("cgroup:{path}"));
+                Ok(())
+            },
+            &mut |candidate| {
+                calls.borrow_mut().push(format!("binder:{}", candidate.pid));
+                Ok(())
+            },
+            &mut |candidate| {
+                calls
+                    .borrow_mut()
+                    .push(format!("sigcont:{}", candidate.pid));
+                Ok(())
+            },
+        );
+
+        assert!(outcome.cgroup_thawed);
+        assert!(outcome.signal_resumed);
+        assert!(outcome.failures.is_empty());
+        assert_eq!(
+            &*calls.borrow(),
+            &[
+                "cgroup:/sys/fs/cgroup/uid_10123/pid_123/cgroup.freeze".to_owned(),
+                "binder:123".to_owned(),
+                "sigcont:123".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
     fn restart_recovery_thaws_cgroup_and_binder_without_waiting_for_sigstop_state() {
         let mut runtime_process = process(10_123, 123, ControlState::Frozen);
         runtime_process.cgroup_freeze_path =
@@ -3576,7 +3890,7 @@ mod tests {
         let calls = RefCell::new(Vec::new());
         let outcome = recover_process_after_restart(
             &runtime_process,
-            false,
+            None,
             Some(FreezeState::Thawed),
             &mut |_| Ok(true),
             &mut |path| {

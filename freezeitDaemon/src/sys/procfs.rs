@@ -17,6 +17,37 @@ const SIGNAL_STOP_LEDGER_FILE: &str = ".freezeit-sigstop-ledger";
 
 static SIGNAL_STOP_LEDGER_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+/// Provenance of a Freezeit-owned SIGSTOP recorded in the persistent ledger.
+///
+/// A signal stop starts as `ResidualUnknown`: a generic freezer transaction may
+/// already have changed cgroup or Binder state before it falls back to SIGSTOP.
+/// Only the controller can promote a completed direct signal transaction to
+/// `SignalOnly`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalStopOwnership {
+    SignalOnly,
+    ResidualUnknown,
+}
+
+impl SignalStopOwnership {
+    fn ledger_token(self) -> &'static str {
+        match self {
+            Self::SignalOnly => "SignalOnly",
+            Self::ResidualUnknown => "ResidualUnknown",
+        }
+    }
+
+    fn from_ledger_token(token: Option<&str>) -> Self {
+        match token {
+            Some("SignalOnly") => Self::SignalOnly,
+            // Missing provenance is the legacy two-field format. Unknown values are
+            // intentionally conservative so an interrupted or manually edited ledger
+            // cannot be mistaken for a clean signal-only freeze.
+            Some("ResidualUnknown") | None | Some(_) => Self::ResidualUnknown,
+        }
+    }
+}
+
 pub fn pid_exists(proc_root: impl AsRef<Path>, pid: i32) -> bool {
     proc_root.as_ref().join(pid.to_string()).exists()
 }
@@ -87,7 +118,28 @@ pub fn parse_proc_state_char(stat_text: &str) -> Result<char, DaemonError> {
 /// 覆盖调试器、job-control 或其他 root 工具的决定，因此必须匹配持久化的 PID/start-time
 /// 记录；tracing stop (`t`) 从不视为 Freezeit 所有。
 pub fn proc_state_is_stopped(stat_text: &str) -> bool {
-    is_freezeit_owned_stop_from_ledger(stat_text, &signal_stop_ledger_path())
+    freezeit_signal_stop_ownership(stat_text).is_some()
+}
+
+/// Return the durable provenance for a Freezeit-owned stopped process.
+///
+/// `/proc/<pid>/stat` provides the current PID, state, and start time.  The
+/// entry is owned only when it is a job-control stop (`T`) and the same
+/// `(pid, start_time)` exists in the SIGSTOP ledger; PID reuse and tracing
+/// stops are therefore never recovered as Freezeit-owned stops.
+pub fn freezeit_signal_stop_ownership(stat_text: &str) -> Option<SignalStopOwnership> {
+    signal_stop_ownership_from_ledger(stat_text, &signal_stop_ledger_path())
+}
+
+/// Read the ledger provenance for an exact process identity without treating it
+/// as evidence that the process is currently stopped.  The controller uses this
+/// only before a new direct SIGSTOP transaction: a pre-existing residual record
+/// must never be upgraded after a daemon restart lost its in-memory ownership.
+pub fn recorded_freezeit_signal_stop_ownership(
+    pid: i32,
+    start_time_ticks: u64,
+) -> Result<Option<SignalStopOwnership>, DaemonError> {
+    recorded_signal_stop_ownership_from_ledger(&signal_stop_ledger_path(), pid, start_time_ticks)
 }
 
 pub fn read_proc_state_char(proc_root: impl AsRef<Path>, pid: i32) -> Result<char, DaemonError> {
@@ -97,9 +149,43 @@ pub fn read_proc_state_char(proc_root: impl AsRef<Path>, pid: i32) -> Result<cha
 
 pub fn record_freezeit_signal_stop(pid: i32) -> Result<(), DaemonError> {
     let start_time_ticks = read_process_start_time(PROC_ROOT, pid)?;
-    update_signal_stop_ledger(&signal_stop_ledger_path(), |records| {
-        records.insert((pid, start_time_ticks));
+    record_freezeit_signal_stop_at_path(&signal_stop_ledger_path(), pid, start_time_ticks)
+}
+
+fn record_freezeit_signal_stop_at_path(
+    ledger_path: &Path,
+    pid: i32,
+    start_time_ticks: u64,
+) -> Result<(), DaemonError> {
+    update_signal_stop_ledger(ledger_path, |records| {
+        records.insert(
+            (pid, start_time_ticks),
+            SignalStopOwnership::ResidualUnknown,
+        );
     })
+}
+
+/// Promote an exact SIGSTOP ledger record after a controller-confirmed direct
+/// signal transaction.  This never creates a new record: `SIGSTOP` itself must
+/// have created the default residual record first.  `false` means the process
+/// exited or changed identity before its durable record could be promoted.
+pub fn promote_freezeit_signal_stop(pid: i32, start_time_ticks: u64) -> Result<bool, DaemonError> {
+    promote_freezeit_signal_stop_at_path(&signal_stop_ledger_path(), pid, start_time_ticks)
+}
+
+fn promote_freezeit_signal_stop_at_path(
+    ledger_path: &Path,
+    pid: i32,
+    start_time_ticks: u64,
+) -> Result<bool, DaemonError> {
+    let mut promoted = false;
+    update_signal_stop_ledger(ledger_path, |records| {
+        if let Some(ownership) = records.get_mut(&(pid, start_time_ticks)) {
+            *ownership = SignalStopOwnership::SignalOnly;
+            promoted = true;
+        }
+    })?;
+    Ok(promoted)
 }
 
 pub fn clear_freezeit_signal_stop(pid: i32) -> Result<(), DaemonError> {
@@ -108,10 +194,18 @@ pub fn clear_freezeit_signal_stop(pid: i32) -> Result<(), DaemonError> {
 }
 
 pub fn take_freezeit_signal_stop(pid: i32) -> Result<bool, DaemonError> {
+    let start_time_ticks = read_process_start_time(PROC_ROOT, pid)?;
+    take_freezeit_signal_stop_at_path(&signal_stop_ledger_path(), pid, start_time_ticks)
+}
+
+fn take_freezeit_signal_stop_at_path(
+    ledger_path: &Path,
+    pid: i32,
+    start_time_ticks: u64,
+) -> Result<bool, DaemonError> {
     let mut removed = false;
-    update_signal_stop_ledger(&signal_stop_ledger_path(), |records| {
-        removed = records.iter().any(|(recorded_pid, _)| *recorded_pid == pid);
-        records.retain(|(recorded_pid, _)| *recorded_pid != pid);
+    update_signal_stop_ledger(ledger_path, |records| {
+        removed = records.remove(&(pid, start_time_ticks)).is_some();
     })?;
     Ok(removed)
 }
@@ -436,18 +530,30 @@ fn signal_stop_ledger_path() -> PathBuf {
     PathBuf::from(module_dir).join(SIGNAL_STOP_LEDGER_FILE)
 }
 
-fn is_freezeit_owned_stop_from_ledger(stat_text: &str, ledger_path: &Path) -> bool {
+fn signal_stop_ownership_from_ledger(
+    stat_text: &str,
+    ledger_path: &Path,
+) -> Option<SignalStopOwnership> {
     if !matches!(parse_proc_state_char(stat_text), Ok('T')) {
-        return false;
+        return None;
     }
-    let Some(pid) = parse_process_pid(stat_text) else {
-        return false;
-    };
+    let pid = parse_process_pid(stat_text)?;
     let Ok(start_time_ticks) = parse_process_start_time(stat_text) else {
-        return false;
+        return None;
     };
-    read_signal_stop_ledger(ledger_path)
-        .is_ok_and(|records| records.contains(&(pid, start_time_ticks)))
+    recorded_signal_stop_ownership_from_ledger(ledger_path, pid, start_time_ticks)
+        .ok()
+        .flatten()
+}
+
+fn recorded_signal_stop_ownership_from_ledger(
+    ledger_path: &Path,
+    pid: i32,
+    start_time_ticks: u64,
+) -> Result<Option<SignalStopOwnership>, DaemonError> {
+    Ok(read_signal_stop_ledger(ledger_path)?
+        .get(&(pid, start_time_ticks))
+        .copied())
 }
 
 fn parse_process_pid(stat_text: &str) -> Option<i32> {
@@ -456,7 +562,7 @@ fn parse_process_pid(stat_text: &str) -> Option<i32> {
 
 fn update_signal_stop_ledger(
     ledger_path: &Path,
-    update: impl FnOnce(&mut BTreeSet<(i32, u64)>),
+    update: impl FnOnce(&mut BTreeMap<(i32, u64), SignalStopOwnership>),
 ) -> Result<(), DaemonError> {
     let lock = SIGNAL_STOP_LEDGER_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -465,24 +571,45 @@ fn update_signal_stop_ledger(
     write_signal_stop_ledger(ledger_path, &records)
 }
 
-fn read_signal_stop_ledger(ledger_path: &Path) -> Result<BTreeSet<(i32, u64)>, DaemonError> {
+fn read_signal_stop_ledger(
+    ledger_path: &Path,
+) -> Result<BTreeMap<(i32, u64), SignalStopOwnership>, DaemonError> {
     let text = match fs::read_to_string(ledger_path) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
         Err(error) => return Err(error.into()),
     };
-    Ok(text
-        .lines()
-        .filter_map(|line| {
-            let (pid, start_time_ticks) = line.split_once(' ')?;
-            Some((pid.parse().ok()?, start_time_ticks.parse().ok()?))
-        })
-        .collect())
+    let mut records = BTreeMap::new();
+    for line in text.lines() {
+        let Some((pid, start_time_ticks, ownership)) = (|| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let start_time_ticks = fields.next()?.parse().ok()?;
+            let provenance = fields.next();
+            let ownership = if fields.next().is_some() {
+                SignalStopOwnership::ResidualUnknown
+            } else {
+                SignalStopOwnership::from_ledger_token(provenance)
+            };
+            Some((pid, start_time_ticks, ownership))
+        })() else {
+            continue;
+        };
+        records
+            .entry((pid, start_time_ticks))
+            .and_modify(|current| {
+                if ownership == SignalStopOwnership::ResidualUnknown {
+                    *current = SignalStopOwnership::ResidualUnknown;
+                }
+            })
+            .or_insert(ownership);
+    }
+    Ok(records)
 }
 
 fn write_signal_stop_ledger(
     ledger_path: &Path,
-    records: &BTreeSet<(i32, u64)>,
+    records: &BTreeMap<(i32, u64), SignalStopOwnership>,
 ) -> Result<(), DaemonError> {
     if records.is_empty() {
         match fs::remove_file(ledger_path) {
@@ -499,7 +626,9 @@ fn write_signal_stop_ledger(
     let temporary_path = ledger_path.with_extension(format!("tmp-{}", std::process::id()));
     let text = records
         .iter()
-        .map(|(pid, start_time_ticks)| format!("{pid} {start_time_ticks}"))
+        .map(|((pid, start_time_ticks), ownership)| {
+            format!("{pid} {start_time_ticks} {}", ownership.ledger_token())
+        })
         .collect::<Vec<_>>()
         .join("\n");
     fs::write(&temporary_path, format!("{text}\n"))?;
@@ -586,18 +715,124 @@ mod tests {
         let ledger = temp.path().join("sigstop-ledger");
         fs::write(&ledger, "123 4242\n").expect("ledger");
 
-        assert!(is_freezeit_owned_stop_from_ledger(
-            &stat_with_state('T', 4242),
-            &ledger
-        ));
-        assert!(!is_freezeit_owned_stop_from_ledger(
-            &stat_with_state('t', 4242),
-            &ledger
-        ));
-        assert!(!is_freezeit_owned_stop_from_ledger(
-            &stat_with_state('T', 9999),
-            &ledger
-        ));
+        assert_eq!(
+            signal_stop_ownership_from_ledger(&stat_with_state('T', 4242), &ledger),
+            Some(SignalStopOwnership::ResidualUnknown)
+        );
+        assert_eq!(
+            signal_stop_ownership_from_ledger(&stat_with_state('t', 4242), &ledger),
+            None
+        );
+        assert_eq!(
+            signal_stop_ownership_from_ledger(&stat_with_state('T', 9999), &ledger),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_signal_stop_ledger_entry_is_owned_but_residual_unknown() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = temp.path().join("sigstop-ledger");
+        fs::write(&ledger, "123 4242\n").expect("legacy ledger");
+
+        assert_eq!(
+            signal_stop_ownership_from_ledger(&stat_with_state('T', 4242), &ledger),
+            Some(SignalStopOwnership::ResidualUnknown)
+        );
+    }
+
+    #[test]
+    fn signal_only_signal_stop_ledger_entry_is_recognized() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = temp.path().join("sigstop-ledger");
+        fs::write(&ledger, "123 4242 SignalOnly\n").expect("signal-only ledger");
+
+        assert_eq!(
+            signal_stop_ownership_from_ledger(&stat_with_state('T', 4242), &ledger),
+            Some(SignalStopOwnership::SignalOnly)
+        );
+    }
+
+    #[test]
+    fn duplicate_signal_stop_ledger_entries_retain_residual_unknown_provenance() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = temp.path().join("sigstop-ledger");
+        fs::write(&ledger, "123 4242 ResidualUnknown\n123 4242 SignalOnly\n")
+            .expect("duplicate ledger");
+
+        assert_eq!(
+            signal_stop_ownership_from_ledger(&stat_with_state('T', 4242), &ledger),
+            Some(SignalStopOwnership::ResidualUnknown)
+        );
+    }
+
+    #[test]
+    fn malformed_signal_only_ledger_entry_with_extra_fields_is_residual_unknown() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = temp.path().join("sigstop-ledger");
+        fs::write(&ledger, "123 4242 SignalOnly unexpected\n").expect("malformed ledger");
+
+        assert_eq!(
+            signal_stop_ownership_from_ledger(&stat_with_state('T', 4242), &ledger),
+            Some(SignalStopOwnership::ResidualUnknown)
+        );
+    }
+
+    #[test]
+    fn new_signal_stop_ledger_records_default_to_residual_unknown() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = temp.path().join("sigstop-ledger");
+
+        record_freezeit_signal_stop_at_path(&ledger, 123, 4242).expect("record stop");
+
+        assert_eq!(
+            signal_stop_ownership_from_ledger(&stat_with_state('T', 4242), &ledger),
+            Some(SignalStopOwnership::ResidualUnknown)
+        );
+    }
+
+    #[test]
+    fn promotion_requires_an_exact_existing_signal_stop_ledger_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = temp.path().join("sigstop-ledger");
+        record_freezeit_signal_stop_at_path(&ledger, 123, 4242).expect("record stop");
+
+        assert!(!promote_freezeit_signal_stop_at_path(&ledger, 123, 9999)
+            .expect("non-matching promotion"));
+        assert_eq!(
+            signal_stop_ownership_from_ledger(&stat_with_state('T', 4242), &ledger),
+            Some(SignalStopOwnership::ResidualUnknown)
+        );
+        assert!(
+            promote_freezeit_signal_stop_at_path(&ledger, 123, 4242).expect("matching promotion")
+        );
+        assert_eq!(
+            signal_stop_ownership_from_ledger(&stat_with_state('T', 4242), &ledger),
+            Some(SignalStopOwnership::SignalOnly)
+        );
+    }
+
+    #[test]
+    fn taking_signal_stop_ledger_record_removes_only_the_matching_pid_and_start_time() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = temp.path().join("sigstop-ledger");
+        fs::write(
+            &ledger,
+            "123 4242 ResidualUnknown\n123 9999 ResidualUnknown\n",
+        )
+        .expect("ledger");
+
+        assert!(
+            take_freezeit_signal_stop_at_path(&ledger, 123, 4242).expect("remove matching record")
+        );
+        assert_eq!(
+            signal_stop_ownership_from_ledger(&stat_with_state('T', 4242), &ledger),
+            None
+        );
+        assert_eq!(
+            signal_stop_ownership_from_ledger(&stat_with_state('T', 9999), &ledger),
+            Some(SignalStopOwnership::ResidualUnknown)
+        );
     }
 
     fn stat_with_state(state: char, start_time_ticks: u64) -> String {
