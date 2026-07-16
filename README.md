@@ -5,7 +5,7 @@
 ## 当前版本
 
 - 模块版本：`3.3.5SelfUse`，版本号：`303005`。
-- `freezeitRelease/update.json` 在 `3.3.5SelfUse` ZIP 完成同次构建、完整校验并上传前继续指向已验证的 `v3.3.4SelfUse` 发布包。
+- `freezeitRelease/update.json` 已指向已上传、同次构建并完成 SHA-256 校验的 `v3.3.5SelfUse` 发布包。
 - 新版本仅支持 ARM64，且只包含一个由 `freezeitDaemon/` 为 `aarch64-linux-android` 构建的 Rust 守护进程 `freezeit`。
 - 不提供 C++、x64 或旧守护进程回退。
 - Magisk 源模板位于 `magisk/`，仓库中的模板不保存守护进程、APK 等构建产物。
