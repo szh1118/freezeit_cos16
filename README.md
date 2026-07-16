@@ -4,13 +4,13 @@
 
 ## 当前版本
 
-- 模块版本：`3.3.4SelfUse`，版本号：`303004`。
-- `freezeitRelease/update.json` 已指向已上传、同次构建并完成 SHA-256 校验的 `v3.3.4SelfUse` 发布包。
+- 模块版本：`3.3.5SelfUse`，版本号：`303005`。
+- `freezeitRelease/update.json` 在 `3.3.5SelfUse` ZIP 完成同次构建、完整校验并上传前继续指向已验证的 `v3.3.4SelfUse` 发布包。
 - 新版本仅支持 ARM64，且只包含一个由 `freezeitDaemon/` 为 `aarch64-linux-android` 构建的 Rust 守护进程 `freezeit`。
 - 不提供 C++、x64 或旧守护进程回退。
 - Magisk 源模板位于 `magisk/`，仓库中的模板不保存守护进程、APK 等构建产物。
 
-`3.3.4SelfUse` 修复 Binder 调试信息不可读时把所有候选应用永久卡在等待冻结状态的问题，并保留明确的活跃 Binder 事务阻断；在 Binder freezer 降级时，实际走 SIGSTOP 回退的操作会准确记录为 `signal.stop`。Android 16 上暂未适配的 `BroadcastQueueModernImpl` 广播抑制按可选能力降级，核心冻结控制不会因此关闭。该版本同时收敛守护进程、Xposed bridge、控制状态恢复、配置协议、管理器并发与发布验证链的稳定性修复。
+`3.3.5SelfUse` 修复 SIGSTOP 降级冻结后前台解冻仍被错误保留为冻结状态的问题，并持久化冻结 ownership，避免 X、抖音等应用在后台状态长期失真或重启后被错误恢复。未知、重复或无法完成持久化的 signal 记录保持保守的 `ResidualUnknown`，不会误用纯 SIGCONT 路径；同时保留 3.3.4 的 Binder 降级与发布链修复。
 
 ## 构建与打包
 
@@ -23,7 +23,7 @@ scripts/build-release.sh
 脚本会构建 ARM64 Rust 守护进程与正式版管理器，核对二者版本，随后调用 `scripts/package-release.sh`。打包在临时的 `.release-staging/` 中进行，输出：
 
 ```text
-freezeitRelease/freezeit_oneplus13_android16_selfuse_v3.3.4SelfUse_303004.zip
+freezeitRelease/freezeit_oneplus13_android16_selfuse_v3.3.5SelfUse_303005.zip
 ```
 
 脏工作树测试包可显式提供已构建并核验的文件：
@@ -53,13 +53,13 @@ scripts/package-release.sh
 ```sh
 scripts/test-release-pipeline.sh
 scripts/test-release-metadata.sh planned
-scripts/validate-release-zip.sh /path/to/release.zip 3.3.4SelfUse 303004
+scripts/validate-release-zip.sh /path/to/release.zip 3.3.5SelfUse 303005
 ```
 
 只有待发布 ZIP 通过完整校验后，才能修改 `freezeitRelease/update.json`。发布后再执行：
 
 ```sh
-scripts/test-release-metadata.sh released 3.3.4SelfUse 303004
+scripts/test-release-metadata.sh released 3.3.5SelfUse 303005
 ```
 
 ## 项目来源

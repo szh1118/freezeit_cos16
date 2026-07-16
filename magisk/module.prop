@@ -1,7 +1,7 @@
 id=freezeit
 name=冻它
-version=3.3.4SelfUse
-versionCode=303004
+version=3.3.5SelfUse
+versionCode=303005
 author=JARK006 / @szh1118
 description=仅 Rust 的 ARM64 后台运行控制模块；不包含旧 C++、x64 守护进程
 updateJson=https://mirror.ghproxy.com/https://raw.githubusercontent.com/szh1118/freezeit_cos16/main/freezeitRelease/update.json

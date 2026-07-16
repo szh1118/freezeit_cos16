@@ -1,3 +1,9 @@
+### v3.3.5SelfUse
+
+1. 修复 SIGSTOP 降级冻结后应用回到前台仍被错误保留为冻结状态的问题；前台成功解冻后可立即重新进入后台冻结。
+2. 按实际成功的冻结后端记录 `SignalOnly`、`CgroupBinder` 或保守的 `ResidualUnknown` ownership，避免通过重新发现的 cgroup 路径误选解冻方案。
+3. 持久化 SIGSTOP 的 PID/start-time provenance；旧版、重复、损坏、过期或未完成 promotion 的记录不会在 daemon 重启时被误判为纯 signal 所有。
+
 ### v3.3.4SelfUse
 
 1. 修复 Binder 调试节点不可读时 `binder_queue unknown` 被误判为活动事务，导致所有候选应用永久停在等待冻结状态；未知信息仅保留为诊断，明确 active/busy 事务仍会延迟冻结。

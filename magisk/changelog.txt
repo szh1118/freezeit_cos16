@@ -1,3 +1,8 @@
+### v3.3.5SelfUse
+
+- 修复 SIGSTOP 降级冻结后前台解冻仍被错误保留为冻结状态的问题，按实际冻结后端选择解冻路径。
+- 持久化 signal-stop ownership provenance；未知或未完成 durable promotion 的记录继续保守处理，避免 daemon 重启后错误恢复。
+
 ### v3.3.4SelfUse
 
 - 修复 Binder 调试节点不可读时 `binder_queue unknown` 被误判为活动事务，所有候选应用永久停在等待冻结状态的问题；只有明确的 active/busy Binder 证据才延迟冻结。
