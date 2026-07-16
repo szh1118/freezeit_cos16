@@ -597,11 +597,10 @@ fn read_signal_stop_ledger(
         };
         records
             .entry((pid, start_time_ticks))
-            .and_modify(|current| {
-                if ownership == SignalStopOwnership::ResidualUnknown {
-                    *current = SignalStopOwnership::ResidualUnknown;
-                }
-            })
+            // Duplicated identities mean the ledger no longer proves that the
+            // record came from one completed, durable signal-only transaction.
+            // This includes repeated `SignalOnly` lines: keep recovery generic.
+            .and_modify(|current| *current = SignalStopOwnership::ResidualUnknown)
             .or_insert(ownership);
     }
     Ok(records)
@@ -759,6 +758,19 @@ mod tests {
         let ledger = temp.path().join("sigstop-ledger");
         fs::write(&ledger, "123 4242 ResidualUnknown\n123 4242 SignalOnly\n")
             .expect("duplicate ledger");
+
+        assert_eq!(
+            signal_stop_ownership_from_ledger(&stat_with_state('T', 4242), &ledger),
+            Some(SignalStopOwnership::ResidualUnknown)
+        );
+    }
+
+    #[test]
+    fn duplicate_signal_only_ledger_entries_are_residual_unknown() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = temp.path().join("sigstop-ledger");
+        fs::write(&ledger, "123 4242 SignalOnly\n123 4242 SignalOnly\n")
+            .expect("duplicate signal-only ledger");
 
         assert_eq!(
             signal_stop_ownership_from_ledger(&stat_with_state('T', 4242), &ledger),

@@ -52,9 +52,9 @@ The ownership rules are deliberately conservative:
 
 | Freeze result | Recorded ownership |
 | --- | --- |
-| Direct signal policy, or a Binder-unavailable fallback that reaches only `SIGSTOP` | `SignalOnly` |
+| Direct signal policy, or a Binder-unavailable fallback that reaches only `SIGSTOP`, with durable ownership promotion succeeding | `SignalOnly` |
 | Complete cgroup + Binder freezer transaction | `CgroupBinder` |
-| Any primary freezer attempt that could have changed state before a failure, rollback uncertainty, or primary-then-signal fallback | `ResidualUnknown` |
+| Any primary freezer attempt that could have changed state before a failure, rollback uncertainty, primary-then-signal fallback, or failed durable signal ownership promotion | `ResidualUnknown` |
 
 `ResidualUnknown` has precedence over later signal success.  It must never be
 overwritten as `SignalOnly`, because that would make a partial freezer
@@ -81,11 +81,13 @@ marker immediately.  The next background pass can therefore schedule and
 execute a fresh `SIGSTOP`, without waiting for the 60-second reconciliation
 audit.
 
-Restart recovery will likewise treat a process recorded in the existing
-Freezeit-owned SIGSTOP ledger with a thawed cgroup as signal-owned recovery;
-it must not use mere cgroup-path availability as evidence that a Binder thaw is
-needed.  A cgroup observed as frozen, or uncertain evidence, keeps the
-conservative generic recovery behavior.
+Restart recovery persists SIGSTOP provenance per `(pid, start_time)`.  Only an
+explicit `SignalOnly` ledger entry with an observed thawed cgroup is eligible
+for signal-only recovery.  Legacy two-field ledger entries, malformed or
+duplicate entries, a failed ownership promotion, and `ResidualUnknown` entries
+must use conservative cgroup/Binder cleanup even when the cgroup is thawed.
+This prevents a failed generic freezer transaction followed by SIGSTOP fallback
+from losing a residual Binder freeze across a daemon restart.
 
 ## Operations and diagnostics
 

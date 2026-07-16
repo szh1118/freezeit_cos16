@@ -3,7 +3,7 @@ use freezeit_daemon::{
         controller::{
             decide_freeze, decide_freeze_after_reconciliation, mark_frozen, mark_running,
             run_control_pass, run_control_pass_with_settings, run_control_pass_with_validation,
-            set_test_binder_available, RuntimeControlState,
+            set_test_binder_available, set_test_signal_stop_ledger_available, RuntimeControlState,
         },
         error::DaemonError,
         freezer_backend::{
@@ -129,6 +129,7 @@ fn runtime_status_snapshot_reports_frozen_and_foreground_rows() {
 #[test]
 fn binderless_signal_fallback_foreground_thaw_refreezes_before_status_reports_frozen() {
     let _binder_guard = set_test_binder_available(false);
+    let _ledger_guard = set_test_signal_stop_ledger_available(true);
     let uid = 10_123;
     let config = vec![ManagerAppConfigRecord {
         uid,
