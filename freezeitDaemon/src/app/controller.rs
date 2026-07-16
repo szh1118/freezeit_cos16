@@ -2236,7 +2236,7 @@ thread_local! {
     /// 测试专用：覆盖 binder 可用性检测结果。生产恒为 None。
     static TEST_BINDER_AVAILABLE: std::cell::Cell<Option<bool>> = std::cell::Cell::new(None);
     /// 测试专用：模拟 SIGSTOP ledger 的读取与提升均可用。生产恒为 None。
-    static TEST_SIGNAL_STOP_LEDGER_AVAILABLE: std::cell::Cell<Option<bool>> = std::cell::Cell::new(None);
+    static TEST_SIGNAL_STOP_LEDGER_AVAILABLE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// 测试专用：注入 binder 可用性，返回一个 guard 在 drop 时恢复默认检测。
