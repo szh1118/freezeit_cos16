@@ -6,6 +6,8 @@ import android.content.ContentResolver;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.Matrix;
+import android.net.LocalSocket;
+import android.net.LocalSocketAddress;
 import android.net.Uri;
 import android.util.Log;
 import android.widget.ImageView;
@@ -21,8 +23,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
-import java.net.InetSocketAddress;
-import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.net.URLConnection;
@@ -48,7 +48,6 @@ public class Utils {
 
     private static final String TAG = "Freezeit[Utils]";
     private static final int MAX_FRAME_PAYLOAD_BYTES = 1024 * 1024;
-    private static final int SOCKET_CONNECT_TIMEOUT_MS = 3_000;
     private static final int SOCKET_TOTAL_DEADLINE_MS = 5_000;
     private static final int NETWORK_TIMEOUT_MS = 5_000;
 
@@ -92,9 +91,9 @@ public class Utils {
 
         byte[] dataHeader = {0, 0, 0, 0, command, 0};
         long deadlineNanos = System.nanoTime() + SOCKET_TOTAL_DEADLINE_MS * 1_000_000L;
-        try (Socket socket = new Socket()) {
-            socket.connect(new InetSocketAddress("127.0.0.1", 60613),
-                    Math.min(SOCKET_CONNECT_TIMEOUT_MS, remainingTimeoutMillis(deadlineNanos)));
+        try (LocalSocket socket = new LocalSocket()) {
+            socket.connect(new LocalSocketAddress(
+                    "FreezeitManager", LocalSocketAddress.Namespace.ABSTRACT));
             InputStream is = socket.getInputStream();
             OutputStream os = socket.getOutputStream();
 
@@ -159,7 +158,7 @@ public class Utils {
         return (int) Math.max(1L, (remainingNanos + 999_999L) / 1_000_000L);
     }
 
-    private static boolean readFully(Socket socket, InputStream is, byte[] bytes, int offset, int length,
+    private static boolean readFully(LocalSocket socket, InputStream is, byte[] bytes, int offset, int length,
                                      long deadlineNanos) throws IOException {
         int readCnt = 0;
         while (readCnt < length) {

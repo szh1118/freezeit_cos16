@@ -41,6 +41,27 @@ public class ManagerRequestIsolationContractTest {
         assertTrue(appTime.contains("msg.obj"));
     }
 
+    @Test
+    public void managerTransportUsesAnAuthenticatedAbstractUnixSocket() throws IOException {
+        String utils = readSource(mainJavaRoot().resolve("Utils.java"));
+
+        assertTrue(utils.contains("LocalSocket"));
+        assertTrue(utils.contains("LocalSocketAddress.Namespace.ABSTRACT"));
+        assertTrue(utils.contains("FreezeitManager"));
+        assertFalse(utils.contains("InetSocketAddress"));
+    }
+
+    @Test
+    public void updateDownloadUsesThePublishedArchiveDigestAndBoundedFetcher() throws IOException {
+        String home = readSource(mainJavaRoot().resolve("fragment/Home.java"));
+        String staticData = readSource(mainJavaRoot().resolve("StaticData.java"));
+
+        assertTrue(staticData.contains("zipSha256"));
+        assertTrue(home.contains("zipSha256"));
+        assertTrue(home.contains("ReleaseArchiveVerifier"));
+        assertFalse(home.contains("ByteArrayOutputStream"));
+    }
+
     private static Path mainJavaRoot() {
         Path workingDirectory = Path.of(System.getProperty("user.dir"));
         Path moduleRelative = Path.of("src/main/java/io/github/jark006/freezeit");

@@ -23,13 +23,15 @@ import android.widget.ImageView;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
+import androidx.core.content.FileProvider;
 import androidx.core.view.MenuProvider;
 import androidx.fragment.app.Fragment;
 
 import org.json.JSONException;
 import org.json.JSONObject;
 
-import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
@@ -42,6 +44,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import io.github.jark006.freezeit.BuildConfig;
 import io.github.jark006.freezeit.ManagerCmd;
+import io.github.jark006.freezeit.ReleaseArchiveVerifier;
 import io.github.jark006.freezeit.R;
 import io.github.jark006.freezeit.StaticData;
 import io.github.jark006.freezeit.Utils;
@@ -259,9 +262,13 @@ public class Home extends Fragment implements View.OnClickListener {
             return;
         }
         final String updateJsonLink = context.getString(R.string.update_json_link);
+        if (!isHttpsUrl(updateJsonLink)) {
+            onlineInfoInFlight.set(false);
+            return;
+        }
         new Thread(() -> {
             try {
-                byte[] response = getNetworkDataWithTimeout(updateJsonLink);
+                byte[] response = Utils.getNetworkData(updateJsonLink);
                 if (response == null || response.length == 0)
                     return;
                 try {
@@ -269,6 +276,7 @@ public class Home extends Fragment implements View.OnClickListener {
                     StaticData.onlineVersion = json.getString("version");
                     StaticData.onlineVersionCode = json.getInt("versionCode");
                     StaticData.zipUrl = json.getString("zipUrl");
+                    StaticData.zipSha256 = json.getString("zipSha256");
                     StaticData.changelogUrl = json.getString("changelog");
                     StaticData.hasOnlineInfo = true;
                     handler.sendEmptyMessage(HANDLE_ONLINE_INFO);
@@ -279,34 +287,6 @@ public class Home extends Fragment implements View.OnClickListener {
                 onlineInfoInFlight.set(false);
             }
         }).start();
-    }
-
-    private static byte[] getNetworkDataWithTimeout(String link) {
-        HttpURLConnection connection = null;
-        try {
-            connection = (HttpURLConnection) new URL(link).openConnection();
-            connection.setConnectTimeout(5 * 1000);
-            connection.setReadTimeout(10 * 1000);
-            connection.setRequestMethod("GET");
-            connection.connect();
-            if (connection.getResponseCode() != HttpURLConnection.HTTP_OK)
-                return null;
-
-            try (InputStream input = connection.getInputStream();
-                 ByteArrayOutputStream output = new ByteArrayOutputStream()) {
-                byte[] buffer = new byte[4096];
-                int length;
-                while ((length = input.read(buffer)) != -1)
-                    output.write(buffer, 0, length);
-                return output.toByteArray();
-            }
-        } catch (IOException | ClassCastException e) {
-            Log.e(TAG, "Network request failed", e);
-            return null;
-        } finally {
-            if (connection != null)
-                connection.disconnect();
-        }
     }
 
     void initRealTimeInfoTimer() {
@@ -382,7 +362,7 @@ public class Home extends Fragment implements View.OnClickListener {
                             binding.changelogText.setText(StaticData.onlineChangelog);
                         else if (StaticData.changelogUrl.length() > 0)
                             new Thread(() -> {
-                                var response = getNetworkDataWithTimeout(StaticData.changelogUrl);
+                                var response = Utils.getNetworkData(StaticData.changelogUrl);
                                 if (response == null || response.length == 0)
                                     return;
 
@@ -634,21 +614,96 @@ public class Home extends Fragment implements View.OnClickListener {
             return;
 
         try {
-            Uri uri = Uri.parse(StaticData.zipUrl);
-            String scheme = uri.getScheme();
-            if (uri.getHost() == null || (!"https".equalsIgnoreCase(scheme) &&
-                    !"http".equalsIgnoreCase(scheme))) {
+            if (!isHttpsUrl(StaticData.zipUrl) ||
+                    !ReleaseArchiveVerifier.isValidSha256(StaticData.zipSha256)) {
                 Toast.makeText(context, R.string.update_fail, Toast.LENGTH_LONG).show();
                 return;
             }
-            Intent intent = new Intent(Intent.ACTION_VIEW, uri);
-            if (intent.resolveActivity(context.getPackageManager()) == null) {
-                Toast.makeText(context, R.string.update_fail, Toast.LENGTH_LONG).show();
-                return;
-            }
-            startActivity(intent);
-        } catch (ActivityNotFoundException | SecurityException | IllegalArgumentException e) {
+            final String downloadUrl = StaticData.zipUrl;
+            final String expectedSha256 = StaticData.zipSha256;
+            final Context appContext = context.getApplicationContext();
+            new Thread(() -> downloadVerifiedArchive(appContext, downloadUrl, expectedSha256)).start();
+        } catch (SecurityException | IllegalArgumentException e) {
             Toast.makeText(context, R.string.update_fail, Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private static boolean isHttpsUrl(String link) {
+        if (link == null)
+            return false;
+        try {
+            Uri uri = Uri.parse(link);
+            return uri.getHost() != null && "https".equalsIgnoreCase(uri.getScheme());
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
+    }
+
+    private void downloadVerifiedArchive(Context context, String link, String expectedSha256) {
+        HttpURLConnection connection = null;
+        File archive = null;
+        try {
+            connection = (HttpURLConnection) new URL(link).openConnection();
+            connection.setConnectTimeout(5 * 1000);
+            connection.setReadTimeout(10 * 1000);
+            connection.setRequestMethod("GET");
+            connection.connect();
+            if (connection.getResponseCode() != HttpURLConnection.HTTP_OK)
+                throw new IOException("update download returned HTTP " + connection.getResponseCode());
+            if (connection.getContentLengthLong() > ReleaseArchiveVerifier.MAX_ARCHIVE_BYTES)
+                throw new IOException("update archive is too large");
+
+            File updateDirectory = new File(context.getCacheDir(), "updates");
+            if (!updateDirectory.isDirectory() && !updateDirectory.mkdirs())
+                throw new IOException("cannot create update staging directory");
+            archive = File.createTempFile("freezeit-update-", ".zip", updateDirectory);
+            try (InputStream input = connection.getInputStream();
+                 FileOutputStream output = new FileOutputStream(archive)) {
+                if (!ReleaseArchiveVerifier.copyAndVerify(input, output, expectedSha256))
+                    throw new IOException("update archive digest mismatch");
+            }
+
+            final File verifiedArchive = archive;
+            boolean posted = handler.post(() -> {
+                if (!isAdded()) {
+                    // The Fragment no longer owns an installer handoff; discard the
+                    // verified cache file rather than leaving it behind.
+                    //noinspection ResultOfMethodCallIgnored
+                    verifiedArchive.delete();
+                    return;
+                }
+                try {
+                    Uri contentUri = FileProvider.getUriForFile(
+                            context, BuildConfig.APPLICATION_ID + ".fileprovider", verifiedArchive);
+                    Intent intent = new Intent(Intent.ACTION_VIEW);
+                    intent.setDataAndType(contentUri, "application/zip");
+                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    if (intent.resolveActivity(context.getPackageManager()) == null)
+                        throw new ActivityNotFoundException("no archive installer");
+                    startActivity(intent);
+                } catch (ActivityNotFoundException | SecurityException | IllegalArgumentException |
+                         IllegalStateException e) {
+                    //noinspection ResultOfMethodCallIgnored
+                    verifiedArchive.delete();
+                    Toast.makeText(context, R.string.update_fail, Toast.LENGTH_LONG).show();
+                }
+            });
+            if (posted)
+                archive = null;
+        } catch (IOException | ClassCastException | SecurityException e) {
+            Log.e(TAG, "Verified update download failed", e);
+            handler.post(() -> {
+                if (isAdded())
+                    Toast.makeText(context, R.string.update_fail, Toast.LENGTH_LONG).show();
+            });
+        } finally {
+            if (connection != null)
+                connection.disconnect();
+            if (archive != null)
+                // Do not leave a partial or digest-mismatched archive in the app cache.
+                // A verified archive is retained only for the installer handoff above.
+                //noinspection ResultOfMethodCallIgnored
+                archive.delete();
         }
     }
 
