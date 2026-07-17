@@ -12,6 +12,7 @@ use crate::{
 };
 
 pub const LOG_LEVEL_SETTING_INDEX: usize = 30;
+pub const MAX_RETAINED_LOG_BYTES: usize = 1_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogView {
@@ -123,6 +124,7 @@ impl LogRecord {
 pub struct ManagerLog {
     capacity: usize,
     records: VecDeque<LogRecord>,
+    retained_bytes: usize,
     highest_operation_id: u64,
     operation_timestamp_cutoff_ms: Option<u128>,
     content_version: u64,
@@ -133,6 +135,7 @@ impl ManagerLog {
         Self {
             capacity: capacity.max(1),
             records: VecDeque::new(),
+            retained_bytes: 0,
             highest_operation_id: 0,
             operation_timestamp_cutoff_ms: None,
             content_version: 0,
@@ -151,7 +154,6 @@ impl ManagerLog {
                 if operation.operation_id <= self.highest_operation_id {
                     return;
                 }
-                self.highest_operation_id = operation.operation_id;
             } else {
                 let duplicate = self.records.iter().any(|existing| {
                     matches!(
@@ -166,9 +168,26 @@ impl ManagerLog {
             }
         }
 
-        if self.records.len() == self.capacity {
-            self.records.pop_front();
+        let record_bytes = retained_record_bytes(&record);
+        if record_bytes > MAX_RETAINED_LOG_BYTES {
+            return;
         }
+        while self.records.len() >= self.capacity
+            || self.retained_bytes.saturating_add(record_bytes) > MAX_RETAINED_LOG_BYTES
+        {
+            let Some(evicted) = self.records.pop_front() else {
+                break;
+            };
+            self.retained_bytes = self
+                .retained_bytes
+                .saturating_sub(retained_record_bytes(&evicted));
+        }
+        if let LogPayload::Operation(operation) = &record.payload {
+            if operation.operation_id != 0 {
+                self.highest_operation_id = operation.operation_id;
+            }
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(record_bytes);
         self.records.push_back(record);
         self.bump_content_version();
     }
@@ -188,6 +207,7 @@ impl ManagerLog {
         self.operation_timestamp_cutoff_ms = Some(now_ms());
         let had_records = !self.records.is_empty();
         self.records.clear();
+        self.retained_bytes = 0;
         if had_records {
             self.bump_content_version();
         }
@@ -241,6 +261,21 @@ fn record_is_visible(record: &LogRecord, view: LogView) -> bool {
         LogView::Critical => record.level == LogLevel::Critical,
         LogView::Debug => true,
     }
+}
+
+fn retained_record_bytes(record: &LogRecord) -> usize {
+    const RECORD_OVERHEAD: usize = 128;
+    let payload_bytes = match &record.payload {
+        LogPayload::Text(message) | LogPayload::VerifiedLegacyLine(message) => message.capacity(),
+        LogPayload::Operation(operation) => operation
+            .package_name
+            .capacity()
+            .saturating_add(operation.backend.capacity())
+            .saturating_add(operation.reason.capacity())
+            .saturating_add(operation.details.capacity())
+            .saturating_add(operation.pid_list.capacity() * std::mem::size_of::<i32>()),
+    };
+    RECORD_OVERHEAD.saturating_add(payload_bytes)
 }
 
 fn operation_log_level(operation: &ControlOperation) -> LogLevel {
@@ -430,5 +465,28 @@ mod tests {
         assert!(!log.render(LogView::Error).contains("com.example.partial"));
         assert!(log.render(LogView::Error).contains("com.example.failed"));
         assert!(!log.render(LogView::Critical).contains("com.example.failed"));
+    }
+
+    #[test]
+    fn aggregate_log_bytes_are_bounded_even_when_record_count_is_not() {
+        let mut log = ManagerLog::new(8);
+        log.push(LogRecord::legacy_text(1_000, "a".repeat(900_000)));
+        log.push(LogRecord::legacy_text(2_000, "b".repeat(900_000)));
+
+        assert!(
+            log.render(LogView::Debug).len() <= 1_000_000,
+            "retained log text must have an aggregate byte bound"
+        );
+    }
+
+    #[test]
+    fn an_oversized_log_record_is_rejected() {
+        let mut log = ManagerLog::new(8);
+        log.push(LogRecord::legacy_text(1_000, "x".repeat(1_100_000)));
+
+        assert!(
+            log.is_empty(),
+            "a single oversized record must not be retained"
+        );
     }
 }
