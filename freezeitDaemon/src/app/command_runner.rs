@@ -85,12 +85,14 @@ fn run_command_with_limits(
             }
         }
 
-        if status.is_some() && !stdout_open && !stderr_open {
-            return Ok(CommandOutput {
-                status: status.expect("child status is checked above"),
-                stdout: stdout_bytes,
-                stderr: stderr_bytes,
-            });
+        if !stdout_open && !stderr_open {
+            if let Some(status) = status.take() {
+                return Ok(CommandOutput {
+                    status,
+                    stdout: stdout_bytes,
+                    stderr: stderr_bytes,
+                });
+            }
         }
 
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -169,7 +171,7 @@ fn run_command_with_limits(
 
 fn poll_descriptor(stream: &impl AsRawFd, open: bool) -> libc::pollfd {
     libc::pollfd {
-        fd: open.then(|| stream.as_raw_fd()).unwrap_or(-1),
+        fd: if open { stream.as_raw_fd() } else { -1 },
         events: libc::POLLIN,
         revents: 0,
     }
@@ -231,7 +233,7 @@ fn stop_child(child: &mut Child) {
 fn daemon_error_to_io(error: DaemonError) -> io::Error {
     match error {
         DaemonError::Io(error) => error,
-        error => io::Error::new(io::ErrorKind::Other, error),
+        error => io::Error::other(error),
     }
 }
 

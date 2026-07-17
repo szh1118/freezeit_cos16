@@ -136,6 +136,11 @@ pub fn startup_read_only_state_from_paths(paths: &DaemonPaths) -> ReadOnlyState 
     let policy_ready = policy.is_available();
     state.settings = normalize_settings(policy.settings);
     let package_records = load_package_records();
+    state.authorized_manager_uids = package_records
+        .iter()
+        .filter(|record| record.package_name == "io.github.jark006.freezeit")
+        .map(|record| record.uid)
+        .collect();
     state.app_config =
         load_manager_app_config_records(policy.app_config.as_deref(), &package_records);
     state.app_config_source_tokens =
@@ -2234,7 +2239,7 @@ fn backend_environment(processes: &[RuntimeProcess]) -> BackendEnvironment {
 
 thread_local! {
     /// 测试专用：覆盖 binder 可用性检测结果。生产恒为 None。
-    static TEST_BINDER_AVAILABLE: std::cell::Cell<Option<bool>> = std::cell::Cell::new(None);
+    static TEST_BINDER_AVAILABLE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     /// 测试专用：模拟 SIGSTOP ledger 的读取与提升均可用。生产恒为 None。
     static TEST_SIGNAL_STOP_LEDGER_AVAILABLE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
@@ -2375,9 +2380,12 @@ fn operation_from_fallback(action: DecisionAction) -> (ControlAction, OperationR
 
 pub fn run_manager_server_once(state: &ReadOnlyState) -> Result<(), DaemonError> {
     let listener = socket::bind_manager_listener()?;
-    let (stream, _) = listener.accept()?;
-    let mut state = state.clone();
-    socket::handle_single_manager_stream(stream, &mut state)
+    loop {
+        if let Some(stream) = listener.accept(&state.authorized_manager_uids)? {
+            let mut state = state.clone();
+            return socket::handle_single_manager_stream(stream, &mut state);
+        }
+    }
 }
 
 pub fn load_policy_with_retries(
@@ -2579,7 +2587,7 @@ pub fn recover_stopped_managed_processes_after_restart(state: &mut ReadOnlyState
     let mut cgroup_thawed = 0u32;
     let mut signal_resumed = 0u32;
     let mut failed = 0u32;
-    for (_uid, processes) in &processes_by_uid {
+    for processes in processes_by_uid.values() {
         for process in processes {
             let signal_stop_ownership =
                 fs::read_to_string(format!("{}/{}/stat", procfs::PROC_ROOT, process.pid))

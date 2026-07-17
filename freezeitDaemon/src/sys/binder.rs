@@ -188,9 +188,10 @@ mod tests {
         fs::write(&binder, "").expect("binder device placeholder");
 
         for errno in [libc::EINVAL, libc::EPERM] {
-            let capability = detect_binder_freezer_capability_with_probe(&[binder.clone()], |_| {
-                Err(io::Error::from_raw_os_error(errno))
-            });
+            let capability =
+                detect_binder_freezer_capability_with_probe(std::slice::from_ref(&binder), |_| {
+                    Err(io::Error::from_raw_os_error(errno))
+                });
             assert_ne!(capability.status, CapabilityStatus::Available);
         }
     }

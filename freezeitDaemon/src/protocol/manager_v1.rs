@@ -15,8 +15,7 @@ use crate::config::migration::{
     parse_legacy_policy_line, parse_legacy_policy_target, LegacyPolicyTarget,
 };
 
-pub const MANAGER_LISTEN_HOST: &str = "127.0.0.1";
-pub const MANAGER_LISTEN_PORT: u16 = 60613;
+pub const MANAGER_SOCKET_ABSTRACT_NAME: &str = "FreezeitManager";
 pub const HEADER_LEN: usize = 6;
 pub const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
 const CPU_HISTORY_BUCKETS: usize = 32;
@@ -147,6 +146,9 @@ pub struct ReadOnlyState {
     pub app_label_path: Option<String>,
     pub uid_time_path: String,
     pub uid_time_totals: BTreeMap<u32, i32>,
+    /// Package UIDs allowed to use the privileged manager socket. Empty means
+    /// fail closed until the Android package inventory has identified Freezeit.
+    pub authorized_manager_uids: BTreeSet<u32>,
 }
 
 impl Default for ReadOnlyState {
@@ -186,6 +188,7 @@ impl Default for ReadOnlyState {
             app_label_path: None,
             uid_time_path: "/proc/uid_cputime/show_uid_stat".to_owned(),
             uid_time_totals: BTreeMap::new(),
+            authorized_manager_uids: BTreeSet::new(),
         }
     }
 }
@@ -1964,9 +1967,11 @@ mod tests {
     fn settings_post_commit_write_failure_reconciles_memory_and_advances_revision() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("settings.db");
-        let mut state = ReadOnlyState::default();
-        state.settings_path = Some(path.to_string_lossy().into_owned());
-        state.hook_config_synced = true;
+        let mut state = ReadOnlyState {
+            settings_path: Some(path.to_string_lossy().into_owned()),
+            hook_config_synced: true,
+            ..ReadOnlyState::default()
+        };
         let previous_revision = state.config_revision;
 
         let response = set_settings_var_with_writer(&mut state, &[13, 0], |path, bytes| {
@@ -1990,14 +1995,16 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("appcfg.txt");
         fs::write(&path, "10000uid10000 30 0\n").expect("seed app config");
-        let mut state = ReadOnlyState::default();
-        state.app_config_path = Some(path.to_string_lossy().into_owned());
-        state.app_config = vec![ManagerAppConfigRecord {
-            uid: 10_000,
-            mode: 30,
-            permissive: false,
-        }];
-        state.hook_config_synced = true;
+        let mut state = ReadOnlyState {
+            app_config_path: Some(path.to_string_lossy().into_owned()),
+            app_config: vec![ManagerAppConfigRecord {
+                uid: 10_000,
+                mode: 30,
+                permissive: false,
+            }],
+            hook_config_synced: true,
+            ..ReadOnlyState::default()
+        };
         let previous_revision = state.config_revision;
         let requested = encode_app_config(&[ManagerAppConfigRecord {
             uid: 10_000,
@@ -2048,14 +2055,16 @@ mod tests {
         let app_config_path = temp.path().join("appcfg.txt");
         fs::write(&app_config_path, "10000uid10000 30 0\n").expect("seed app config");
         let settings_path = temp.path().join("settings.db");
-        let mut state = ReadOnlyState::default();
-        state.app_config_path = Some(app_config_path.to_string_lossy().into_owned());
-        state.settings_path = Some(settings_path.to_string_lossy().into_owned());
-        state.app_config = vec![ManagerAppConfigRecord {
-            uid: 10_000,
-            mode: 30,
-            permissive: false,
-        }];
+        let mut state = ReadOnlyState {
+            app_config_path: Some(app_config_path.to_string_lossy().into_owned()),
+            settings_path: Some(settings_path.to_string_lossy().into_owned()),
+            app_config: vec![ManagerAppConfigRecord {
+                uid: 10_000,
+                mode: 30,
+                permissive: false,
+            }],
+            ..ReadOnlyState::default()
+        };
         let change = ManagerFrame {
             command: ManagerCommand::SetAppCfg,
             payload: encode_app_config(&[ManagerAppConfigRecord {
@@ -2101,13 +2110,15 @@ mod tests {
         let path = temp.path().join("appcfg.txt");
         fs::write(&path, "com.example.uninstalled 30 0\n10000uid10000 30 0\n")
             .expect("seed app config");
-        let mut state = ReadOnlyState::default();
-        state.app_config_path = Some(path.to_string_lossy().into_owned());
-        state.app_config = vec![ManagerAppConfigRecord {
-            uid: 10_000,
-            mode: 30,
-            permissive: false,
-        }];
+        let mut state = ReadOnlyState {
+            app_config_path: Some(path.to_string_lossy().into_owned()),
+            app_config: vec![ManagerAppConfigRecord {
+                uid: 10_000,
+                mode: 30,
+                permissive: false,
+            }],
+            ..ReadOnlyState::default()
+        };
         let frame = ManagerFrame {
             command: ManagerCommand::SetAppCfg,
             payload: encode_app_config(&[ManagerAppConfigRecord {
@@ -2132,14 +2143,16 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("appcfg.txt");
         fs::write(&path, "10000uid10000 30 0\n").expect("seed app config");
-        let mut state = ReadOnlyState::default();
-        state.app_config_path = Some(path.to_string_lossy().into_owned());
-        state.app_config = vec![ManagerAppConfigRecord {
-            uid: 10_000,
-            mode: 30,
-            permissive: false,
-        }];
-        state.hook_config_synced = true;
+        let mut state = ReadOnlyState {
+            app_config_path: Some(path.to_string_lossy().into_owned()),
+            app_config: vec![ManagerAppConfigRecord {
+                uid: 10_000,
+                mode: 30,
+                permissive: false,
+            }],
+            hook_config_synced: true,
+            ..ReadOnlyState::default()
+        };
         let frame = ManagerFrame {
             command: ManagerCommand::SetAppCfg,
             payload: encode_app_config(&[ManagerAppConfigRecord {

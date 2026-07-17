@@ -1,7 +1,9 @@
 use std::{
     collections::BTreeSet,
     io::{self, Read, Write},
-    net::{TcpListener, TcpStream},
+    mem,
+    os::fd::{AsRawFd, FromRawFd, RawFd},
+    os::unix::net::UnixStream,
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -20,7 +22,7 @@ use crate::{
         manager_v1::{
             encode_app_config, encode_frame, encode_xposed_config_payload, handle_manager_command,
             parse_frame, ManagerCommand, ManagerFrame, ReadOnlyState, HEADER_LEN,
-            MANAGER_LISTEN_HOST, MANAGER_LISTEN_PORT, MAX_PAYLOAD_LEN,
+            MANAGER_SOCKET_ABSTRACT_NAME, MAX_PAYLOAD_LEN,
         },
         xposed::{classify_bridge_error, classify_hook_health_payload, XposedCommand},
     },
@@ -37,18 +39,127 @@ fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
-pub fn bind_manager_listener() -> Result<TcpListener, DaemonError> {
-    Ok(TcpListener::bind((
-        MANAGER_LISTEN_HOST,
-        MANAGER_LISTEN_PORT,
-    ))?)
+pub fn bind_manager_listener() -> Result<ManagerListener, DaemonError> {
+    ManagerListener::bind()
+}
+
+pub struct ManagerListener {
+    fd: RawFd,
+}
+
+impl ManagerListener {
+    fn bind() -> Result<Self, DaemonError> {
+        let name = MANAGER_SOCKET_ABSTRACT_NAME.as_bytes();
+        let max_name_len =
+            mem::size_of::<libc::sockaddr_un>() - mem::size_of::<libc::sa_family_t>() - 1;
+        if name.len() > max_name_len {
+            return Err(DaemonError::system("manager socket name is too long"));
+        }
+
+        // SAFETY: the address is zero-initialized, the abstract name is bounded by
+        // sockaddr_un, and ownership of the returned fd is transferred to ManagerListener.
+        unsafe {
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            if fd < 0 {
+                return Err(DaemonError::from(io::Error::last_os_error()));
+            }
+
+            let mut address: libc::sockaddr_un = mem::zeroed();
+            address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            address.sun_path[0] = 0;
+            for (index, byte) in name.iter().enumerate() {
+                address.sun_path[index + 1] = *byte as libc::c_char;
+            }
+            let address_len =
+                (mem::size_of::<libc::sa_family_t>() + 1 + name.len()) as libc::socklen_t;
+
+            if libc::bind(
+                fd,
+                &address as *const _ as *const libc::sockaddr,
+                address_len,
+            ) < 0
+            {
+                let error = io::Error::last_os_error();
+                libc::close(fd);
+                return Err(DaemonError::from(error));
+            }
+            if libc::listen(fd, 8) < 0 {
+                let error = io::Error::last_os_error();
+                libc::close(fd);
+                return Err(DaemonError::from(error));
+            }
+            Ok(Self { fd })
+        }
+    }
+
+    pub fn accept(
+        &self,
+        authorized_uids: &BTreeSet<u32>,
+    ) -> Result<Option<UnixStream>, DaemonError> {
+        // SAFETY: accept returns a new owned descriptor; no peer address is needed.
+        let fd = unsafe { libc::accept(self.fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+        if fd < 0 {
+            return Err(DaemonError::from(io::Error::last_os_error()));
+        }
+        // SAFETY: fd is the one descriptor returned by accept and is transferred exactly once.
+        let stream = unsafe { UnixStream::from_raw_fd(fd) };
+        let uid = match manager_peer_uid(stream.as_raw_fd()) {
+            Ok(uid) => uid,
+            Err(error) => {
+                eprintln!("refusing manager socket peer with unreadable credentials: {error}");
+                return Ok(None);
+            }
+        };
+        if !is_authorized_manager_peer_uid(uid, authorized_uids) {
+            eprintln!("refusing manager socket peer with uid {uid}");
+            return Ok(None);
+        }
+        Ok(Some(stream))
+    }
+}
+
+impl Drop for ManagerListener {
+    fn drop(&mut self) {
+        // SAFETY: ManagerListener owns this descriptor until drop.
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+fn manager_peer_uid(fd: RawFd) -> Result<libc::uid_t, DaemonError> {
+    let mut credentials: libc::ucred = unsafe { mem::zeroed() };
+    let mut credentials_len = mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: credentials points to a writable ucred buffer with its size supplied.
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut credentials as *mut _ as *mut libc::c_void,
+            &mut credentials_len,
+        )
+    };
+    if result < 0 {
+        return Err(DaemonError::from(io::Error::last_os_error()));
+    }
+    if credentials_len != mem::size_of::<libc::ucred>() as libc::socklen_t {
+        return Err(DaemonError::system(
+            "manager peer credential response is incomplete",
+        ));
+    }
+    Ok(credentials.uid)
+}
+
+fn is_authorized_manager_peer_uid(uid: libc::uid_t, authorized_uids: &BTreeSet<u32>) -> bool {
+    uid == 0 || authorized_uids.contains(&uid)
 }
 
 fn deadline_exceeded() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "manager frame deadline exceeded")
 }
 
-/// `TcpStream` timeouts apply to each individual read. Recompute the
+/// `UnixStream` timeouts apply to each individual read. Recompute the
 /// remaining duration before every read to enforce one deadline for the whole
 /// frame, including a client that sends a byte just before every timeout.
 fn read_exact_with_deadline<R: Read>(
@@ -137,7 +248,7 @@ fn write_all_with_deadline<W: Write>(
     Ok(())
 }
 
-fn read_manager_request(stream: &mut TcpStream) -> Result<ManagerFrame, DaemonError> {
+fn read_manager_request(stream: &mut UnixStream) -> Result<ManagerFrame, DaemonError> {
     let deadline = Instant::now() + MANAGER_STREAM_TIMEOUT;
     let mut header = [0_u8; HEADER_LEN];
     read_exact_with_deadline(stream, &mut header, deadline, |stream, timeout| {
@@ -160,7 +271,7 @@ fn read_manager_request(stream: &mut TcpStream) -> Result<ManagerFrame, DaemonEr
     parse_frame(&bytes)
 }
 
-fn write_manager_response(stream: &mut TcpStream, response: &[u8]) -> Result<(), DaemonError> {
+fn write_manager_response(stream: &mut UnixStream, response: &[u8]) -> Result<(), DaemonError> {
     let deadline = Instant::now() + MANAGER_STREAM_TIMEOUT;
     write_all_with_deadline(stream, response, deadline, |stream, timeout| {
         stream.set_write_timeout(timeout)
@@ -181,7 +292,7 @@ fn handle_manager_request(
 /// Compatibility entry point for the controller's one-shot helper. The
 /// long-running server reads first through `serve_manager_connection`.
 pub fn handle_single_manager_stream(
-    mut stream: TcpStream,
+    mut stream: UnixStream,
     state: &mut ReadOnlyState,
 ) -> Result<(), DaemonError> {
     let request = read_manager_request(&mut stream)?;
@@ -191,11 +302,11 @@ pub fn handle_single_manager_stream(
 }
 
 fn serve_manager_connection(
-    mut stream: TcpStream,
+    mut stream: UnixStream,
     state: &Arc<Mutex<ReadOnlyState>>,
     policy_action_gate: &Arc<Mutex<()>>,
 ) -> Result<(), DaemonError> {
-    // Read untrusted TCP bytes before either shared mutex. A policy mutation
+    // Read untrusted manager-socket bytes before either shared mutex. A policy mutation
     // then holds the action gate through its Xposed work and state commit so a
     // concurrently scheduled control pass cannot use an older policy snapshot.
     let request = read_manager_request(&mut stream)?;
@@ -374,7 +485,7 @@ struct HookRuntimeSyncOutcome {
 }
 
 fn encode_uid_payload(uids: &[u32]) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(uids.len() * std::mem::size_of::<u32>());
+    let mut payload = Vec::with_capacity(std::mem::size_of_val(uids));
     for uid in uids {
         payload.extend_from_slice(&uid.to_le_bytes());
     }
@@ -650,6 +761,7 @@ fn apply_hook_health_result(
 
 pub fn run_manager_server_forever(state: ReadOnlyState) -> Result<(), DaemonError> {
     let listener = bind_manager_listener()?;
+    let authorized_manager_uids = state.authorized_manager_uids.clone();
     let state = Arc::new(Mutex::new(state));
     let control_state = Arc::new(Mutex::new(RuntimeControlState::default()));
     let policy_action_gate = Arc::new(Mutex::new(()));
@@ -659,34 +771,27 @@ pub fn run_manager_server_forever(state: ReadOnlyState) -> Result<(), DaemonErro
         policy_action_gate.clone(),
     );
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                // 单个请求的 panic 不得拖垮整个守护进程——daemon 退出会让所有经
-                // SIGSTOP 冻结的应用无人恢复。捕获后记日志继续服务下一条连接。
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    serve_manager_connection(stream, &state, &policy_action_gate)
-                }));
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => eprintln!("manager request failed: {error}"),
-                    Err(panic) => eprintln!(
-                        "manager request panicked: {}",
-                        panic
-                            .downcast_ref::<String>()
-                            .map(|s| s.clone())
-                            .or_else(|| {
-                                panic.downcast_ref::<&'static str>().map(|s| s.to_string())
-                            })
-                            .unwrap_or_else(|| "unknown panic".to_string())
-                    ),
-                }
+    loop {
+        if let Some(stream) = listener.accept(&authorized_manager_uids)? {
+            // 单个请求的 panic 不得拖垮整个守护进程——daemon 退出会让所有经
+            // SIGSTOP 冻结的应用无人恢复。捕获后记日志继续服务下一条连接。
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                serve_manager_connection(stream, &state, &policy_action_gate)
+            }));
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("manager request failed: {error}"),
+                Err(panic) => eprintln!(
+                    "manager request panicked: {}",
+                    panic
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| { panic.downcast_ref::<&'static str>().map(|s| s.to_string()) })
+                        .unwrap_or_else(|| "unknown panic".to_string())
+                ),
             }
-            Err(error) => return Err(DaemonError::from(error)),
         }
     }
-
-    Ok(())
 }
 
 fn spawn_control_loop(
@@ -804,10 +909,10 @@ fn spawn_control_loop(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_hook_health_result, prepare_hook_health_work, read_exact_with_deadline,
-        run_unfreeze_sequence, should_run_control_pass, sync_hook_runtime_state,
-        thaw_disabled_control_state, with_manager_state_after_request_read,
-        with_policy_action_gate, HookHealthResult,
+        apply_hook_health_result, is_authorized_manager_peer_uid, prepare_hook_health_work,
+        read_exact_with_deadline, run_unfreeze_sequence, should_run_control_pass,
+        sync_hook_runtime_state, thaw_disabled_control_state,
+        with_manager_state_after_request_read, with_policy_action_gate, HookHealthResult,
     };
     use crate::{
         app::{controller::run_control_pass, error::DaemonError},
@@ -819,6 +924,7 @@ mod tests {
     };
     use std::{
         cell::RefCell,
+        collections::BTreeSet,
         io::{self, Read},
         sync::mpsc,
         sync::{Arc, Mutex},
@@ -987,6 +1093,16 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn manager_peer_authentication_requires_the_discovered_manager_uid() {
+        let authorized = BTreeSet::from([10_123_u32]);
+
+        assert!(is_authorized_manager_peer_uid(0, &authorized));
+        assert!(is_authorized_manager_peer_uid(10_123, &authorized));
+        assert!(!is_authorized_manager_peer_uid(10_124, &authorized));
+        assert!(!is_authorized_manager_peer_uid(10_123, &BTreeSet::new()));
     }
 
     #[test]
