@@ -3,7 +3,6 @@
 .codebase-memory/
 .specify/
 specs/
-AGENTS.md
 
 # Build outputs
 **/target/
