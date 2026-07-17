@@ -47,16 +47,17 @@ try:
         data = json.load(stream)
 except (OSError, json.JSONDecodeError) as error:
     raise SystemExit(f"invalid update metadata JSON: {error}")
-for key in ("version", "versionCode", "zipUrl", "changelog"):
+for key in ("version", "versionCode", "zipUrl", "zipSha256", "changelog"):
     if key not in data:
         raise SystemExit(f"missing update metadata key: {key}")
 print(data["version"])
 print(data["versionCode"])
 print(data["zipUrl"])
-print(data.get("zipSha256", ""))
+print(data["zipSha256"])
 PY
 )
 [[ ${#published[@]} -eq 4 ]] || fail "cannot parse update metadata"
+[[ "${published[3]}" =~ ^[0-9A-Fa-f]{64}$ ]] || fail "invalid published zipSha256"
 
 if [[ "$mode" == planned ]]; then
   [[ "${published[0]}" != "$planned_version" && "${published[1]}" != "$planned_code" ]] \

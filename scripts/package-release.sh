@@ -333,19 +333,23 @@ if [[ -n "$dirty_status" ]]; then
   dirty=true
   git -C "$ROOT" diff --binary HEAD >"$stage/source.patch"
   printf '%s\n' "$dirty_status" >"$stage/source-state.txt"
-  mapfile -t snapshot_files < <(
-    git -C "$ROOT" ls-files -co --exclude-standard \
-      | while IFS= read -r path; do
-          [[ -e "$ROOT/$path" || -L "$ROOT/$path" ]] && printf '%s\n' "$path"
+  mapfile -d '' -t snapshot_files < <(
+    git -C "$ROOT" ls-files -co --exclude-standard -z \
+      | while IFS= read -r -d '' path; do
+          [[ -e "$ROOT/$path" || -L "$ROOT/$path" ]] && printf '%s\0' "$path"
         done \
-      | LC_ALL=C sort
+      | LC_ALL=C sort -z
   )
   [[ ${#snapshot_files[@]} -gt 0 ]] || fail "dirty candidate source snapshot is empty"
-  tar -C "$ROOT" -czf "$stage/source-snapshot.tar.gz" "${snapshot_files[@]}"
+  printf '%s\0' "${snapshot_files[@]}" \
+    | tar -C "$ROOT" --null --files-from=- -czf "$stage/source-snapshot.tar.gz"
 fi
 assert_packaging_source_unchanged
 daemon_sha="$(sha256sum "$stage/freezeit" | awk '{print $1}')"
 apk_sha="$(sha256sum "$stage/freezeit.apk" | awk '{print $1}')"
+customize_sha="$(sha256sum "$stage/customize.sh" | awk '{print $1}')"
+service_sha="$(sha256sum "$stage/service.sh" | awk '{print $1}')"
+uninstall_sha="$(sha256sum "$stage/uninstall.sh" | awk '{print $1}')"
 if [[ "$build_session_id" != none ]]; then
   [[ "$daemon_sha" == "$session_daemon_sha" ]] || fail "staged daemon differs from the verified build session"
   [[ "$apk_sha" == "$session_apk_sha" ]] || fail "staged APK differs from the verified build session"
@@ -360,7 +364,7 @@ if [[ "$dirty" == true ]]; then
 fi
 assert_packaging_source_unchanged
 cat >"$stage/provenance.txt" <<PROVENANCE
-format=freezeit-release-provenance-v2
+format=freezeit-release-provenance-v3
 version=$EXPECTED_VERSION
 versionCode=$EXPECTED_VERSION_CODE
 gitCommit=$commit
@@ -373,6 +377,9 @@ managerSource=freezeitApp
 daemonTarget=aarch64-linux-android
 daemonSha256=$daemon_sha
 apkSha256=$apk_sha
+customizeSha256=$customize_sha
+serviceSha256=$service_sha
+uninstallSha256=$uninstall_sha
 apkSignerSha256=$apk_signer_sha
 sourcePatchSha256=$patch_sha
 sourceSnapshotSha256=$snapshot_sha

@@ -88,6 +88,10 @@ grep -F 'FREEZEIT_EXPECTED_APK_SIGNER_SHA256 is required' "$ROOT/scripts/package
 grep -F 'source-snapshot.tar.gz' "$ROOT/scripts/package-release.sh" >/dev/null || fail "dirty candidate source snapshot is missing"
 grep -F '[[ -e "$ROOT/$path" || -L "$ROOT/$path" ]]' "$ROOT/scripts/package-release.sh" >/dev/null || fail "dirty candidate snapshot does not skip deleted paths"
 grep -F 'sourcePatchSha256' "$ROOT/scripts/package-release.sh" >/dev/null || fail "dirty candidate patch digest is missing"
+grep -F 'git -C "$ROOT" ls-files -co --exclude-standard -z' \
+  "$ROOT/scripts/package-release.sh" >/dev/null || fail "snapshot file discovery is not NUL-safe"
+grep -F 'tar -C "$ROOT" --null --files-from=- -czf "$stage/source-snapshot.tar.gz"' \
+  "$ROOT/scripts/package-release.sh" >/dev/null || fail "snapshot tar input is not NUL-safe"
 if "$ROOT/scripts/validate-release-zip.sh" /nonexistent/freezeit.zip >/dev/null 2>&1; then
   fail "validator accepted a missing zip"
 fi
@@ -98,8 +102,9 @@ apksigner_path="$tmp-apksigner"
 metadata_root="${tmp}-metadata-root"
 relative_out_invocation="${tmp}-relative-out-invocation"
 relative_out_stage="${tmp}-relative-out-stage"
+legacy_tmp="${tmp}-legacy-v2"
 dirty_marker="$ROOT/.release-pipeline-dirty-test.$$"
-trap 'rm -rf "$tmp" "$metadata_root" "$relative_out_invocation" "$relative_out_stage"; rm -f "$metadata_path" "$apksigner_path" "$dirty_marker"' EXIT
+trap 'rm -rf "$tmp" "$metadata_root" "$relative_out_invocation" "$relative_out_stage" "$legacy_tmp"; rm -f "$metadata_path" "$apksigner_path" "$dirty_marker"' EXIT
 cp -a "$ROOT/magisk/." "$tmp/"
 make_android_aarch64_elf "$tmp/freezeit"
 printf 'test apk\n' >"$tmp/freezeit.apk"
@@ -173,7 +178,7 @@ mkdir -p "$relative_out_invocation"
 [[ -f "$relative_out_invocation/dist/freezeit_oneplus13_android16_selfuse_v${expected_version}_${expected_code}.zip" ]] \
   || fail "packager did not write a relative OUT_DIR beneath the invocation directory"
 cat >"$tmp/provenance.txt" <<EOF
-format=freezeit-release-provenance-v2
+format=freezeit-release-provenance-v3
 version=$expected_version
 versionCode=$expected_code
 gitCommit=0000000000000000000000000000000000000000
@@ -187,6 +192,9 @@ daemonTarget=aarch64-linux-android
 daemonSha256=$daemon_sha
 apkSha256=$apk_sha
 apkSignerSha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+customizeSha256=$(sha256sum "$tmp/customize.sh" | awk '{print $1}')
+serviceSha256=$(sha256sum "$tmp/service.sh" | awk '{print $1}')
+uninstallSha256=$(sha256sum "$tmp/uninstall.sh" | awk '{print $1}')
 sourcePatchSha256=none
 sourceSnapshotSha256=none
 sourceStateSha256=none
@@ -202,6 +210,50 @@ EOF
   bsdtar --format zip -cf "$tmp/release.zip" $(find . -mindepth 1 -maxdepth 1 ! -name release.zip -printf '%P\n' | LC_ALL=C sort)
 )
 "$ROOT/scripts/validate-release-zip.sh" "$tmp/release.zip" >/dev/null
+
+# Published v2 packages predate privileged-template provenance digests and must
+# remain verifiable; newly generated packages use the stricter v3 format below.
+cp -a "$tmp/." "$legacy_tmp/"
+rm -f "$legacy_tmp"/*.zip
+sed -i \
+  "s/^format=freezeit-release-provenance-v3$/format=freezeit-release-provenance-v2/; /^customizeSha256=/d; /^serviceSha256=/d; /^uninstallSha256=/d" \
+  "$legacy_tmp/provenance.txt"
+(
+  cd "$legacy_tmp"
+  find . -mindepth 1 -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\0' \
+    | LC_ALL=C sort -z | xargs -0 sha256sum >SHA256SUMS
+  bsdtar --format zip -cf "$legacy_tmp/legacy-v2.zip" \
+    $(find . -mindepth 1 -maxdepth 1 -type f ! -name '*.zip' -printf '%P\n' | LC_ALL=C sort)
+)
+"$ROOT/scripts/validate-release-zip.sh" "$legacy_tmp/legacy-v2.zip" >/dev/null
+
+service_backup="${tmp}-service.sh"
+sums_backup="${tmp}-service-sums"
+provenance_backup="${tmp}-service-provenance"
+cp "$tmp/service.sh" "$service_backup"
+cp "$tmp/SHA256SUMS" "$sums_backup"
+cp "$tmp/provenance.txt" "$provenance_backup"
+printf '\n# tampered archive member\n' >>"$tmp/service.sh"
+tampered_service_sha="$(sha256sum "$tmp/service.sh" | awk '{print $1}')"
+sed -i "s/^serviceSha256=.*/serviceSha256=$tampered_service_sha/" "$tmp/provenance.txt"
+(
+  cd "$tmp"
+  find . -mindepth 1 -maxdepth 1 -type f ! -name SHA256SUMS ! -name '*.zip' -printf '%P\0' \
+    | LC_ALL=C sort -z | xargs -0 sha256sum >SHA256SUMS
+  bsdtar --format zip -cf "$tmp/tampered-service.zip" \
+    $(find . -mindepth 1 -maxdepth 1 -type f ! -name '*.zip' -printf '%P\n' | LC_ALL=C sort)
+)
+cp "$service_backup" "$tmp/service.sh"
+cp "$sums_backup" "$tmp/SHA256SUMS"
+cp "$provenance_backup" "$tmp/provenance.txt"
+rm -f "$service_backup" "$sums_backup" "$provenance_backup"
+if tampered_service_output="$(FREEZEIT_EXPECTED_BUILD_SESSION_MANIFEST_SHA256="$trusted_session_sha" \
+  "$ROOT/scripts/validate-release-zip.sh" "$tmp/tampered-service.zip" 2>&1)"; then
+  fail "validator accepted a tampered privileged script with regenerated archive sums"
+fi
+grep -F 'service.sh does not match trusted release template' <<<"$tampered_service_output" >/dev/null \
+  || fail "tampered service script was rejected for the wrong reason"
+
 if no_session_pin_output="$(env -u FREEZEIT_EXPECTED_BUILD_SESSION_MANIFEST_SHA256 "$ROOT/scripts/validate-release-zip.sh" "$tmp/release.zip" 2>&1)"; then
   fail "validator accepted a released ZIP without a trusted build-session manifest digest"
 fi
@@ -544,6 +596,7 @@ release_sha="$(sha256sum "$tmp/freezeit_oneplus13_android16_selfuse_v${expected_
 sed -i "s/PLACEHOLDER/$release_sha/" "$tmp/released-update.json"
 mkdir -p "$metadata_root/magisk" "$metadata_root/scripts" "$metadata_root/freezeitRelease"
 cp "$ROOT/magisk/module.prop" "$metadata_root/magisk/module.prop"
+cp "$ROOT/magisk/customize.sh" "$ROOT/magisk/service.sh" "$ROOT/magisk/uninstall.sh" "$metadata_root/magisk/"
 cp "$ROOT/scripts/test-release-metadata.sh" "$metadata_root/scripts/test-release-metadata.sh"
 cp "$ROOT/scripts/validate-release-zip.sh" "$metadata_root/scripts/validate-release-zip.sh"
 printf '`%s` `%s` GPL-3.0-or-later\n' "$expected_version" "$expected_code" >"$metadata_root/README.md"
@@ -615,7 +668,7 @@ cat >"$tmp/planned-version-only.json" <<EOF
   "version": "$expected_version",
   "versionCode": $((expected_code - 1)),
   "zipUrl": "https://example.invalid/old.zip",
-  "zipSha256": "",
+  "zipSha256": "0000000000000000000000000000000000000000000000000000000000000000",
   "changelog": "https://example.invalid/changelog.txt"
 }
 EOF
@@ -627,7 +680,7 @@ cat >"$tmp/planned-code-only.json" <<EOF
   "version": "${expected_version}-previous",
   "versionCode": $expected_code,
   "zipUrl": "https://example.invalid/old.zip",
-  "zipSha256": "",
+  "zipSha256": "0000000000000000000000000000000000000000000000000000000000000000",
   "changelog": "https://example.invalid/changelog.txt"
 }
 EOF

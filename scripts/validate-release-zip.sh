@@ -222,13 +222,39 @@ mapfile -t expected_hashed_entries < <(printf '%s\n' "${entries[@]}" | grep -Fxv
 
 grep -Fx "version=$EXPECTED_VERSION" "$stage/provenance.txt" >/dev/null || fail "provenance version mismatch"
 grep -Fx "versionCode=$EXPECTED_VERSION_CODE" "$stage/provenance.txt" >/dev/null || fail "provenance versionCode mismatch"
-[[ "$(unique_prop format "$stage/provenance.txt")" == freezeit-release-provenance-v2 ]] \
-  || fail "unsupported provenance format"
+provenance_format="$(unique_prop format "$stage/provenance.txt")"
+case "$provenance_format" in
+  freezeit-release-provenance-v2|freezeit-release-provenance-v3) ;;
+  *) fail "unsupported provenance format" ;;
+esac
 release_kind="$(unique_prop releaseKind "$stage/provenance.txt")"
 [[ "$release_kind" == released || "$release_kind" == candidate ]] || fail "invalid release kind"
 dirty_value="$(unique_prop dirty "$stage/provenance.txt")"
 grep -Fx 'daemonSource=freezeitDaemon' "$stage/provenance.txt" >/dev/null || fail "missing Rust daemon provenance"
 grep -Fx 'daemonTarget=aarch64-linux-android' "$stage/provenance.txt" >/dev/null || fail "missing ARM64 target provenance"
+if [[ "$provenance_format" == freezeit-release-provenance-v3 ]]; then
+  for member in customize.sh service.sh uninstall.sh; do
+    member_key="${member%.sh}Sha256"
+    member_sha="$(sha256sum -- "$stage/$member" | awk '{print $1}')"
+    grep -Fx "$member_key=$member_sha" "$stage/provenance.txt" >/dev/null \
+      || fail "$member provenance digest mismatch"
+    if [[ "$release_kind" == released ]]; then
+      trusted_root="${FREEZEIT_TRUSTED_RELEASE_ROOT:-$ROOT}"
+      if git -C "$trusted_root" rev-parse --git-dir >/dev/null 2>&1; then
+        trusted_member_sha="$(git -C "$trusted_root" show "HEAD:magisk/$member" | sha256sum | awk '{print $1}')" \
+          || fail "cannot read trusted release template: $member"
+      else
+        [[ -f "$trusted_root/magisk/$member" ]] \
+          || fail "cannot read trusted release template: $member"
+        trusted_member_sha="$(sha256sum -- "$trusted_root/magisk/$member" | awk '{print $1}')"
+      fi
+    else
+      trusted_member_sha="$(sha256sum -- "$ROOT/magisk/$member" | awk '{print $1}')"
+    fi
+    [[ "$member_sha" == "$trusted_member_sha" ]] \
+      || fail "$member does not match trusted release template"
+  done
+fi
 daemon_sha="$(sha256sum "$stage/freezeit" | awk '{print $1}')"
 apk_sha="$(sha256sum "$stage/freezeit.apk" | awk '{print $1}')"
 grep -Fx "daemonSha256=$daemon_sha" "$stage/provenance.txt" >/dev/null || fail "daemon provenance digest mismatch"

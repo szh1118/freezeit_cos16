@@ -142,7 +142,7 @@ echo "freezeit freeze/unfreeze validation"
 echo "timestamp=$(date '+%Y-%m-%d %H:%M:%S')"
 echo "packages=$PACKAGE_LIST"
 
-if [ "$(run_device "su -c 'ss -ltn 2>/dev/null | grep -q 60613 && echo reachable || echo unreachable'")" != "reachable" ]; then
+if [ "$(run_device "su -c 'ss -xl 2>/dev/null | grep -q FreezeitManager && echo reachable || echo unreachable'")" != "reachable" ]; then
     echo "daemon_socket=unreachable"
     exit 1
 fi

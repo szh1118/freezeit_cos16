@@ -4,8 +4,6 @@ set -eu
 SERIAL_ARG="${1:-}"
 ADB="${ADB:-adb}"
 MODDIR="${MODDIR:-/data/adb/modules/freezeit}"
-HOST="${FREEZEIT_HOST:-127.0.0.1}"
-PORT="${FREEZEIT_PORT:-60613}"
 
 if [ -n "$SERIAL_ARG" ] && command -v "$ADB" >/dev/null 2>&1; then
     USE_ADB=1
@@ -69,14 +67,7 @@ else
     exit 1
 fi
 
-if [ "$(run_device 'command -v nc >/dev/null 2>&1 && echo present || echo missing')" != "present" ]; then
-    echo "daemon_socket=check_failed_nc_missing"
-    exit 1
-fi
-
-remote_host="$(shell_quote "$HOST")"
-remote_port="$(shell_quote "$PORT")"
-if [ "$(run_device "nc -z $remote_host $remote_port >/dev/null 2>&1 && echo reachable || echo unreachable")" = "reachable" ]; then
+if [ "$(run_device "ss -xl 2>/dev/null | grep -q 'FreezeitManager' && echo reachable || echo unreachable")" = "reachable" ]; then
     echo "daemon_socket=reachable"
 else
     echo "daemon_socket=unreachable"

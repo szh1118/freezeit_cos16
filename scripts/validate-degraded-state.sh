@@ -16,7 +16,7 @@ echo "== freezeit degraded-state read-only validation =="
 run_shell 'getprop sys.boot_completed'
 run_shell 'su -c "id -u"'
 run_shell 'su -c "pidof freezeit || true"'
-run_shell 'su -c "ss -ltnp | grep 60613 || true"'
+run_shell 'su -c "ss -xl | grep FreezeitManager || true"'
 run_shell 'pm list packages -U | head -5'
 run_shell 'su -c "test -e /data/adb/modules/freezeit/appcfg.txt && echo policy-ready || echo policy-missing"'
 run_shell 'su -c "find /sys/fs/cgroup/apps /sys/fs/cgroup/system -name cgroup.freeze -type f 2>/dev/null | head -1 | grep -q . && echo cgroup-freezer-present || echo cgroup-freezer-missing"'
